@@ -38,9 +38,34 @@ impl Doc {
     /// 编辑落盘后重新打开：索引只补扫新增的那一段（毫秒级），缓存作废。
     pub fn reload(&mut self) -> Result<(), String> {
         self.sc = Sidecar::open_for(&self.path)?;
-        self.cache.clear();
-        self.order.clear();
+        self.clear_cache();
         Ok(())
+    }
+
+    /// 释放节点缓存（离开文件 / 切视图 / 空闲时调用）。
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+        self.cache.shrink_to_fit();
+        self.order.clear();
+        self.order.shrink_to_fit();
+    }
+
+    /// 只保留最近 `keep` 个节点（空闲时把缓存压小，内存及时还回去）。
+    pub fn trim_cache(&mut self, keep: usize) {
+        while self.order.len() > keep {
+            if let Some(old) = self.order.pop_front() {
+                self.cache.remove(&old);
+            }
+        }
+        if keep == 0 {
+            self.cache.shrink_to_fit();
+            self.order.shrink_to_fit();
+        }
+    }
+
+    /// 节点缓存的估算占用（每节点约 320 字节：UUID + 名字 + 值 + HashMap 开销）。
+    pub fn cache_bytes(&self) -> usize {
+        self.cache.len() * 320
     }
 
     pub fn path(&self) -> &Path {

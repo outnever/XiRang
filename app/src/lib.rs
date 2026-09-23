@@ -3,5 +3,6 @@
 //! 拆成 lib 是为了能在没有窗口的情况下测试（`cargo test -p xirang-app`）。
 
 pub mod edit;
+pub mod graph;
 pub mod lazy;
 pub mod view;

@@ -1,6 +1,14 @@
 # 息壤（XiRang）
 
-格式 v1.0
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/图/横幅_深色.svg">
+  <img alt="息壤 XiRang —— 一种极小的节点语言格式" src="docs/图/横幅_浅色.svg">
+</picture>
+
+![许可](https://img.shields.io/badge/许可-MIT-2da44e)
+![格式](https://img.shields.io/badge/格式-v1.0-0969da)
+![Rust](https://img.shields.io/badge/Rust-xirang--core%20%2B%20CLI-dea584)
+![测试](https://img.shields.io/github/actions/workflow/status/outnever/XiRang/ci.yml?branch=main&label=测试)
 
 **English:** [README](https://github.com/outnever/XiRang/blob/main/README.en.md) · [Template](https://github.com/outnever/XiRang/blob/main/spec/模板.en.md) · [Version Specification](https://github.com/outnever/XiRang/blob/main/spec/版本规范.en.md) · [Error List](https://github.com/outnever/XiRang/blob/main/errors/错误列表.en.md)
 
@@ -10,6 +18,8 @@
 
 > **定位**：底层基础节点格式，不是上层应用，是承载网状 / 树形关联数据的基石。
 > **未来计划**：CiBase 词库将是它第一个正式示范项目，未来计划用于开发与大模型配套的记忆系统。
+
+![核心概念图：一个节点 → 父边成树 → 引用成图 → 跨文件 + 磁盘索引](docs/图/概念图.svg)
 
 ### 核心设计
 
@@ -59,6 +69,25 @@
 换句话说，换用息壤并不需要先备好一套工具。
 
 需要提前知道的情况：**网页版的 AI 助手（ChatGPT、Claude 网页版等）无法上传二进制文件**，无法直接解析息壤文件，只能通过 Agent 工具调用 API 解析。
+
+---
+
+## 快速上手
+
+![终端演示：xr tree 与 xr cat 的实际输出](docs/图/终端演示.svg)
+
+```bash
+# 1）编译命令行工具（需要 Rust）
+cargo build --manifest-path rust/Cargo.toml -p xirang-cli
+
+# 2）看一眼文件结构；文件很大时加 --head 200 或 --depth 2
+./rust/target/debug/xr tree 你的文件.xirang --head 50
+
+# 3）像看文本一样逐行浏览
+./rust/target/debug/xr cat 你的文件.xirang --head 50
+```
+
+完整命令见 [CLI 文档](https://github.com/outnever/XiRang/blob/main/docs/CLI.md)。
 
 ---
 

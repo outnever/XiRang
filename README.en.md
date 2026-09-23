@@ -1,6 +1,14 @@
 # XiRang (息壤)
 
-Format v1.0
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/图/横幅_深色.svg">
+  <img alt="XiRang — a minimal node-language format" src="docs/图/横幅_浅色.svg">
+</picture>
+
+![License](https://img.shields.io/badge/license-MIT-2da44e)
+![Format](https://img.shields.io/badge/format-v1.0-0969da)
+![Rust](https://img.shields.io/badge/Rust-xirang--core%20%2B%20CLI-dea584)
+![Tests](https://img.shields.io/github/actions/workflow/status/outnever/XiRang/ci.yml?branch=main&label=tests)
 
 > [中文版](README.md)
 
@@ -10,6 +18,8 @@ Format v1.0
 
 > **Positioning**: a low-level base node format, not an upper-layer application — the foundation for carrying network / tree-shaped relational data.
 > **What's next**: the CiBase lexicon will be its first official showcase project; later it is planned for building a memory system that works alongside large models.
+
+![Core idea: one node → a tree via parent edges → a graph via references → across files, with an on-disk index](docs/图/概念图.svg)
 
 ### Core design
 
@@ -59,6 +69,25 @@ We once ran a controlled comparison on real lexicons (see [Format comparison](ht
 In other words, switching to XiRang does not require having a toolchain ready first.
 
 One thing to know up front: **web-based AI assistants (ChatGPT, Claude on the web, etc.) cannot upload binary files**, so they cannot parse a XiRang file directly; only agents that can call the API through tools can parse it.
+
+---
+
+## Quick start
+
+![Terminal demo: real output of xr tree and xr cat](docs/图/终端演示.svg)
+
+```bash
+# 1) Build the CLI (needs Rust)
+cargo build --manifest-path rust/Cargo.toml -p xirang-cli
+
+# 2) Look at the shape of a file; add --head 200 or --depth 2 for large files
+./rust/target/debug/xr tree yourfile.xirang --head 50
+
+# 3) Browse it line by line, like a text file
+./rust/target/debug/xr cat yourfile.xirang --head 50
+```
+
+Full command reference: [CLI docs](https://github.com/outnever/XiRang/blob/main/docs/CLI.en.md).
 
 ---
 

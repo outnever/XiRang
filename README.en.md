@@ -8,28 +8,59 @@ Format v1.0
 
 ## What XiRang is
 
-XiRang is a minimal node-language format for storing data as files. A file holds only nodes, and a node has just four things: an id, a parent, a name, and a value. That is the whole convention — a reader does not have to learn a grammar first to parse it.
+> **Positioning**: a low-level base node format, not an upper-layer application — the foundation for carrying network / tree-shaped relational data.
+> **What's next**: the CiBase lexicon will be its first official showcase project; later it is planned for building a memory system that works alongside large models.
 
-**Why use it.** Common formats usually lock you into one shape: tables bind columns, JSON binds nesting, XML binds tags — or they pile on grammar to stay "general". XiRang goes the other way: the format itself dictates almost nothing, leaving the organization entirely to you. With so few conventions, it serves a thousand uses without changing the format itself.
+### Core design
 
-**Where it fits.** Anywhere you want to keep "a tree that keeps growing, without being boxed in by the format": dictionaries, glossaries, knowledge entries, taxonomies, document structure, configuration, experiment logs, and so on. The same data can be walked as a tree or as a graph — nodes link by reference — and exported to JSON, XML, YAML, or Markdown.
+1. **The smallest unit: a node**
 
-**How it differs from the alternatives.** Versus JSON / XML / YAML: those are text formats, pleasant to write by hand, but they carry no type semantics and have no cross-file node identity; XiRang is binary, with type tags and globally unique ids, so cross-file references and large trees come naturally. Versus a database: databases excel at querying and managing, but data has to go "into the database"; XiRang is the file itself, so it travels with the repo and ships directly. Versus a hand-rolled binary format: XiRang adds a self-describing header and node types, so you can parse it without reading any code.
+   Every node has four attributes: node id / parent / node name / node value. The node value has 7 value types: empty / integer / float / boolean / text / reference / blob. Tree relationships are built from the parent id; a node can also reference any other node, forming a network (graph).
 
-**One more thing.** The header is a plain-English self-describing text. Any reader, an LLM included, reads the header first and knows "this is XiRang, how nodes are laid out, how to read the type tags".
+2. **Cross-file references**
 
-**Isn't binary hard to read or write?** On the surface, yes: you cannot open it in a text editor like JSON, and it is awkward to type by hand. But those two drawbacks are largely avoidable — to read it, let an LLM act as your assistant, or call the CLI or a visual tool; to write it, the CLI is just as handy.
+   > Requires implementation-layer support, such as the CLI tool in this project and the GUI tool on the roadmap.
 
-We ran a controlled comparison on real lexicons (see [Format comparison](https://github.com/outnever/XiRang/blob/main/docs/格式对比.md), in Chinese). Two different things have to be kept apart:
+   A node can reference nodes kept in other files. Data can be split across several files instead of being crammed into one, which makes it easy to divide by library or by module.
 
-- **Not even letting it run code** (handing over the raw bytes and making it work out every byte by itself): only the strongest large model manages it, and only up to a few tens of KB.
-- **Merely not giving it a XiRang-specific tool**: then it can simply write a few lines of code to parse the file — even a 9B model scores full marks on small files, and the cost and time barely grow with file size (it looks things up on demand instead of reading everything). The official CLI does just as well.
+3. **Indexing**
+
+   All node UUIDs are sorted into a local dictionary, and that dictionary supports global cross-file lookup. Lookups can be served straight from disk without loading everything into memory.
+
+   - Measured (local SSD): for a 30,000-node file, fetching one node by id takes under 10 ms; for a 3.47-million-node (179 MB) file it takes about **28 ms** — throughout, only the on-disk index is read, never the whole file (by comparison, reading the entire 179 MB into memory takes 590 ms);
+   - Size: for the same data, XiRang is about **1/4 to 1/5 of JSON** (measured: 179 MB of XiRang ≈ 800 MB of JSON).
+
+### Characteristics
+
+- schema-free: add nodes whenever you like, with no need to define fixed fields up front. For a CiBase entry, wanting to add etymology, era or register later is just a matter of adding child nodes — no parser changes, which is the biggest advantage over traditional formats;
+- graph support, which makes it a natural fit for knowledge networks and memory associations;
+- IO-friendly: no need to load the whole set into memory; lookups go through a UUID-sorted on-disk index, which suits cold starts on large datasets.
+
+### Open-source plans
+
+- The CiBase lexicon project will be open-sourced soon, as XiRang's showcase project.
+- This project also ships documents written in XiRang itself (self-hosting), which you can read to see how XiRang is used.
+
+**Why use it** Common formats usually lock you into one shape: tables bind columns, JSON binds nesting, XML binds tags — or they pile on a lot of grammar to stay "general". XiRang goes the other way: the format itself dictates almost nothing, and how to organize things is left entirely to the people or the models using it. With so few conventions, it can serve a great many different uses without changing the format itself, and nodes can be added or removed flexibly to suit a specific purpose.
+
+**Where it fits** Data that is tree- or network-shaped: dictionaries, glossaries, knowledge entries, taxonomies, document structure, configuration, experiment logs, and so on. The same data can be walked as a tree or as a graph — nodes link by reference — and exported to JSON, XML, YAML, or Markdown.
+
+**How it differs from other formats** Versus JSON / XML / YAML: those are text formats, read and edited with text tools, and almost every system has something that opens them out of the box. You can write and read them directly — but they carry no type semantics and no cross-file node identity. XiRang is binary, with type tags and globally unique ids; it naturally supports cross-file references and large trees, but it needs companion software to parse and edit, and no system ships such a tool by default. For a large model, though, the header text is enough to quickly write a tool that reads and edits XiRang files. Versus a database: databases excel at querying and managing, but data has to go "into the database" and needs a running service to read and write; with XiRang, the data is the file itself and can be handed out directly.
+
+**Friendly to model parsing** The XiRang header is a plain-English self-describing text. Any reader, an LLM included, reads the header first and knows "this is XiRang, how nodes are laid out, how to read the type tags", and can build a parser from that. Because the node design is tiny, the parser can be tiny too — yet it can read a file holding an enormous number of nodes.
+
+**Convenience of reading and writing** It cannot be opened in a plain text editor the way JSON can, and it is awkward to type by hand. You need a parsing tool: the CLI tool in this project, the GUI tool, or a parser you have a model write for you.
+
+We once ran a controlled comparison on real lexicons (see [Format comparison](https://github.com/outnever/XiRang/blob/main/docs/格式对比.md)).
+
+- **When the model is not allowed to write code** (you just hand it the bytes and it works out every byte by itself): only the strongest large model can parse it directly, and only for files of a few tens of KB.
+- **When the model is allowed to write code**: it can quickly write a parsing tool for XiRang files. Even a 9B model can produce a working parser — in our measurements it scored full marks on both a 6-node and a 30,000-node file — and cost and time barely grow with file size (the model looks things up on demand instead of reading everything). The official CLI has some purpose-built optimizations of its own, such as cross-file lookup.
 
 In other words, switching to XiRang does not require having a toolchain ready first.
 
-One limitation worth knowing up front: **web-based AI assistants (ChatGPT, Claude on the web, etc.) cannot accept binary files**, so a `.xirang` file cannot simply be dropped into them. To use it in such an interface you must convert it to base64 text first — and that measurably hurts: in our tests the model recovered only about half the facts on a large file, and none at all on a small one. XiRang is a better fit for API access, or for setups where the model can read and write files directly.
+One thing to know up front: **web-based AI assistants (ChatGPT, Claude on the web, etc.) cannot upload binary files**, so they cannot parse a XiRang file directly; only agents that can call the API through tools can parse it.
 
-So XiRang's real strength is being **small and stable**: the same data is roughly a quarter the size of JSON, and it carries structural abilities text formats do not have, such as cross-file references. "Open it and read it directly", on the other hand, is where text formats genuinely win.
+**File size**: for the same data, it is roughly a quarter the size of JSON.
 
 ---
 

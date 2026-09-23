@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>XiRang</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>息壤 XiRang</h1>
+    <div class="toolbar">
+      <input type="text" id="path" placeholder=".xirang 路径（多文件用逗号分隔）" />
+      <button id="open">打开</button>
+      <button id="browse">浏览…</button>
+      <button id="viewToggle">图视图</button>
+      <button id="themeToggle" title="切换暗色/亮色">🌙</button>
+      <button id="helpBtn">帮助</button>
+      <button id="langToggle">EN</button>
+      <label class="aux-toggle"><input type="checkbox" id="showAux" checked /> <span id="showAuxLabel">显示辅助节点</span></label>
+      <label class="aux-toggle"><input type="checkbox" id="readonly" /> <span>只读</span></label>
+      <button id="addBtn" disabled>＋新增子节点</button>
+      <button id="undoBtn" disabled>撤销</button>
+      <button id="redoBtn" disabled>重做</button>
+      <input type="text" id="newName" placeholder="名" />
+      <input type="text" id="newValue" placeholder="值(可空)" />
+      <span id="count" class="count"></span>
+    </div>
+  </header>
+  <div class="views">
+    <main id="tree"></main>
+    <svg id="graph" style="display:none"></svg>
+  </div>
+  <div id="errors" class="errors"></div>
+  <script>
+    // Tauri 2：withGlobalTauri=true 时暴露 window.__TAURI__
+    window.invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
+  </script>
+  <script src="main.js"></script>
+</body>
+</html>

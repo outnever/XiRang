@@ -1,0 +1,23 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.obsidian/
+
+# 构建产物与本地工具链
+.cargo/
+.rustup/
+target/
+app/src-tauri/gen/
+
+# 内部材料：留在本地，不随仓库公开
+archive/
+旧git历史/
+
+# 实现层缓存（sidecar 索引，随 .xirang 自动重建）
+*.idx
+
+# 本地实验与临时目录
+.exp/
+测试/
+.worktrees/

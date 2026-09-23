@@ -1,0 +1,55 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --aux: #8b5e3c;
+  --accent: #0969da;
+  --border: #d0d7de;
+}
+body.dark {
+  --bg: #1f2328;
+  --fg: #e6edf3;
+  --aux: #c98a5e;
+  --accent: #58a6ff;
+  --border: #30363d;
+}
+body.dark #graph { background: #161b22; }
+body.dark button { background: #2d333b; color: var(--fg); }
+body.dark #path { background: #0d1117; color: var(--fg); }
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 14px;
+}
+header {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+h1 { font-size: 16px; margin: 0 0 8px; }
+.toolbar { display: flex; gap: 8px; align-items: center; }
+#path { flex: 1; padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; }
+button { padding: 5px 12px; border: 1px solid var(--border); border-radius: 4px; background: #f6f8fa; cursor: pointer; }
+.count { color: #666; font-size: 12px; }
+.views { display: flex; }
+#tree { padding: 12px 16px; overflow: auto; height: calc(100vh - 70px); flex: 1; }
+#graph { width: 100%; height: calc(100vh - 70px); background: #fafbfc; }
+.views.split #tree { flex: 1; width: 50%; border-right: 1px solid var(--border); }
+.views.split #graph { width: 50%; flex: 1; }
+.node { margin-left: 0; }
+.file-header { font-weight: 600; margin: 8px 0 4px; color: var(--accent); font-size: 12px; }
+.head { display: flex; align-items: center; padding: 1px 0; cursor: default; }
+.name, .value { padding: 0 2px; border-radius: 3px; }
+.value { white-space: pre-wrap; word-break: break-word; }
+.name[contenteditable="true"]:hover, .value[contenteditable="true"]:hover { background: #fff8c5; outline: 1px dashed var(--border); }
+.name[contenteditable="true"]:focus, .value[contenteditable="true"]:focus { background: #fff8c5; outline: 1px solid var(--accent); }
+.head.selected { background: #eef6ff; border-radius: 4px; }
+.head.aux .label { color: var(--aux); }
+.del { visibility: hidden; margin-left: 8px; padding: 0 6px; font-size: 11px; }
+.head:hover .del { visibility: visible; }
+.toggle { width: 16px; color: #666; cursor: pointer; user-select: none; }
+.children { margin-left: 16px; border-left: 1px dotted var(--border); padding-left: 4px; }
+.error { color: #c00; padding: 12px; }
+.errors { padding: 8px 16px; color: #b00; font-size: 12px; border-top: 1px solid var(--border); }
+.errors ul { margin: 4px 0 0 0; padding-left: 18px; }

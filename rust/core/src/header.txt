@@ -1,0 +1,46 @@
+XiRang Tree v1.0
+
+This file stores a XiRang node tree in binary. All multi-byte integers are big-endian
+(most significant byte first; e.g. the bytes 00 00 00 2A represent the integer 42).
+
+FILE LAYOUT:
+  - The file begins with a fixed 5-byte prefix: magic "XRNG" (4 ASCII bytes) + a 1-byte
+    format version (currently 1).
+  - After the prefix: 4 bytes = the byte-length L of this text header (big-endian),
+    then L bytes of UTF-8 text (this documentation, NOT node data).
+  - The nodes begin at offset (5 + 4 + L).
+
+HOW TO PARSE A NODE:
+Each node = 4 fields, read in this exact order:
+  1. node_id:   read 16 bytes = a UUID (unique id of this node)
+  2. parent_id: read 16 bytes = a UUID (id of this node's parent; all 0x00 = a root node)
+  3. name:      read 1 byte = length N (in bytes), then read N bytes = UTF-8 text (the name)
+  4. value:     read 1 byte = type tag T, then read the content as listed below
+
+VALUE CONTENT BY TYPE TAG T:
+  T=0 empty:     read nothing = a container node (no value, children only)
+  T=1 integer:   read 8 bytes = signed 64-bit integer (big-endian)
+  T=2 float:     read 8 bytes = IEEE 754 double (big-endian)
+  T=3 boolean:   read 1 byte = 0x00 is false, 0x01 is true
+  T=4 text:      read 4 bytes = length M (big-endian), then read M bytes = UTF-8 text
+  T=5 reference: read 16 bytes = a UUID that points to another node's node_id (a link/edge)
+  T=6 blob:      read 8 bytes = length N (big-endian), then read N bytes = raw content
+
+EXAMPLES (hex; big-endian):
+  ENCODE (value -> bytes):
+    empty (T=0)                    -> 00
+    integer 2046 (T=1)             -> 01 00 00 00 00 00 00 07 fe
+    float 1.5 (T=2)                -> 02 3f f8 00 00 00 00 00 00
+    boolean true (T=3)             -> 03 01
+    text "灯" (T=4)                -> 04 00 00 00 03 e7 81 af
+    reference to a node_id (T=5)   -> 05 <16 bytes of the target node_id>
+    blob of 3 raw bytes (T=6)      -> 06 00 00 00 00 00 00 00 03 <3 bytes>
+  DECODE (bytes -> value), reverse of the above:
+    00                              -> empty
+    01 00 00 00 00 00 00 07 fe      -> integer 2046
+    04 00 00 00 03 e7 81 af         -> text "灯"
+    05 <16 bytes>                   -> reference to that node_id
+  A name field "灯" (UTF-8 e7 81 af) -> 03 e7 81 af   (1-byte length, then UTF-8)
+
+After reading a node's value, the node is complete; the next node (if any) starts
+immediately at the next byte. Read nodes until end of file.

@@ -5,10 +5,10 @@
   <img alt="息壤 XiRang —— 一种极小的节点语言格式" src="docs/图/横幅_浅色.svg">
 </picture>
 
-![许可](https://img.shields.io/badge/许可-MIT-2da44e)
-![格式](https://img.shields.io/badge/格式-v1.0-0969da)
+![许可](https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF-MIT-2da44e)
+![格式](https://img.shields.io/badge/%E6%A0%BC%E5%BC%8F-v1.0-0969da)
 ![Rust](https://img.shields.io/badge/Rust-xirang--core%20%2B%20CLI-dea584)
-![测试](https://img.shields.io/github/actions/workflow/status/outnever/XiRang/ci.yml?branch=main&label=测试)
+![测试](https://img.shields.io/github/actions/workflow/status/outnever/XiRang/ci.yml?branch=main&label=%E6%B5%8B%E8%AF%95)
 
 **English:** [README](https://github.com/outnever/XiRang/blob/main/README.en.md) · [Template](https://github.com/outnever/XiRang/blob/main/spec/模板.en.md) · [Version Specification](https://github.com/outnever/XiRang/blob/main/spec/版本规范.en.md) · [Error List](https://github.com/outnever/XiRang/blob/main/errors/错误列表.en.md)
 

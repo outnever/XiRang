@@ -60,8 +60,6 @@ In other words, switching to XiRang does not require having a toolchain ready fi
 
 One thing to know up front: **web-based AI assistants (ChatGPT, Claude on the web, etc.) cannot upload binary files**, so they cannot parse a XiRang file directly; only agents that can call the API through tools can parse it.
 
-**File size**: for the same data, it is roughly a quarter the size of JSON.
-
 ---
 
 ## XiRang docs (self-hosting file)

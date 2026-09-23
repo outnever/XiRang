@@ -1,58 +1,100 @@
-//! 息壤桌面端（Rust + egui）：单一画布，树 / 网络共存，读走懒加载，写走追加。
+//! 息壤桌面端（Rust + egui，依赖内核 v1.0）。
 //!
-//! 当前版本（v1 · 第一步）：树的浏览（两种布局、展开徽标、辅助节点开关）+
-//! 编辑闭环（改名 / 改值 / 新增 / 删除 + 完整撤销栈，全部即时追加落盘）。
-//! 力导向图与背景淡出按方案排在下一步。
+//! 多文件工作区 · 懒加载树视图（两种布局）· 引用图（Obsidian 参数 + 聚焦树布局）·
+//! 自由编辑（追加落盘 + 撤销重做）· 搜索 · `@history` 时间线与回滚 · 流式校验 ·
+//! 导出 · 合并 · blob 预览 · 视图态持久化 · 内存及时释放。
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui;
 use xirang_core::codec::{parse_value, Node, Uuid, Value};
-use xirang_core::validator;
+use xirang_core::convert;
+use xirang_core::index::compact_file;
+use xirang_core::tree::Store;
 
 use xirang_app::edit;
 use xirang_app::graph::{Graph, Settings as GraphSettings};
-use xirang_app::lazy::Doc;
+use xirang_app::lazy::{plain_value, Doc};
+use xirang_app::scan::{self, Query};
+use xirang_app::state::{FileView, ViewState};
 use xirang_app::view::{flatten, Layout, Row, MAX_ROWS};
 
 const ROW_HEIGHT: f32 = 24.0;
-/// 空闲多久之后把节点缓存压小（内存及时还回去）。
 const IDLE_TRIM_SECS: f32 = 6.0;
-/// 空闲后保留的节点缓存条数。
 const IDLE_KEEP: usize = 2_000;
-/// 自动展开根的孩子数上限（超过就折叠着，避免一次摊出几十万行）。
 const AUTO_EXPAND_MAX_CHILDREN: usize = 2_000;
-/// 一次摊平的行数上限（配合虚拟化列表，够铺满很多屏）。
 const ROW_BUDGET: usize = 50_000;
 
-/// 画布模式：树列表 / 引用图（同一块画布，两种布局策略）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Tree,
     Graph,
 }
 
-fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([720.0, 480.0])
-            .with_title("息壤 XiRang"),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "息壤 XiRang",
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+/// 一个打开的文件。
+struct Tab {
+    path: PathBuf,
+    doc: Doc,
+    editor: Option<edit::Editor>,
+    expanded: HashSet<Uuid>,
+    layout: Layout,
+    selected: Option<Uuid>,
+}
+
+impl Tab {
+    fn label(&self) -> String {
+        self.path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.path.display().to_string())
+    }
+
+    fn view(&self) -> FileView {
+        FileView {
+            layout: match self.layout {
+                Layout::Indent => "indent".into(),
+                Layout::Layered => "layered".into(),
+            },
+            expanded: self.expanded.iter().copied().collect(),
+            focus: self.selected,
+        }
+    }
+
+    fn apply_view(&mut self, v: &FileView, doc_roots: &[Uuid]) {
+        if v.layout == "layered" {
+            self.layout = Layout::Layered;
+        }
+        if !v.expanded.is_empty() {
+            self.expanded = v.expanded.iter().copied().collect();
+        } else {
+            self.expanded = doc_roots.iter().copied().collect();
+        }
+        if let Some(f) = v.focus {
+            self.selected = Some(f);
+        } else {
+            self.selected = doc_roots.first().copied();
+        }
+    }
+}
+
+enum JobDone {
+    Search(Result<Vec<scan::Hit>, String>),
+    Validate(Result<Vec<scan::Issue>, String>),
+}
+
+struct Job {
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<JobDone>,
 }
 
 struct App {
-    doc: Option<Doc>,
-    editor: Option<edit::Editor>,
+    tabs: Vec<Tab>,
+    active: usize,
     mode: ViewMode,
     graph: Option<Graph>,
     graph_dirty: bool,
@@ -62,20 +104,13 @@ struct App {
     zoom: f32,
     pan: egui::Vec2,
     dragging: Option<Uuid>,
-    hovered: Option<Uuid>,
     focus: Option<Uuid>,
-    /// 最近一次摊平出来的节点（建图时的候选集合，避免全库扫描）。
-    known: Vec<Uuid>,
-    last_interaction: Instant,
-    idle_trimmed: bool,
-    expanded: HashSet<Uuid>,
+    known: Vec<(Uuid, String)>,
     rows: Vec<Row>,
     rows_dirty: bool,
     show_aux: bool,
     readonly: bool,
-    layout: Layout,
     selected: Option<Uuid>,
-    path_input: String,
     name_input: String,
     value_input: String,
     new_name: String,
@@ -84,14 +119,24 @@ struct App {
     error: Option<String>,
     font_note: String,
     validation: Vec<String>,
+    query: String,
+    query_kind: usize,
+    results: Vec<scan::Hit>,
+    history: Vec<(Uuid, String, String)>,
+    state: ViewState,
+    last_interaction: Instant,
+    idle_trimmed: bool,
+    job: Option<Job>,
+    show_export: bool,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let font_note = install_cjk_font(&cc.egui_ctx).unwrap_or_else(|| "未找到中文字体".to_string());
+        let font_note =
+            install_cjk_font(&cc.egui_ctx).unwrap_or_else(|| "未找到中文字体".to_string());
         let mut app = App {
-            doc: None,
-            editor: None,
+            tabs: Vec::new(),
+            active: 0,
             mode: ViewMode::Tree,
             graph: None,
             graph_dirty: true,
@@ -101,19 +146,13 @@ impl App {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             dragging: None,
-            hovered: None,
             focus: None,
             known: Vec::new(),
-            last_interaction: Instant::now(),
-            idle_trimmed: false,
-            expanded: HashSet::new(),
             rows: Vec::new(),
             rows_dirty: true,
             show_aux: true,
             readonly: false,
-            layout: Layout::default(),
             selected: None,
-            path_input: String::new(),
             name_input: String::new(),
             value_input: String::new(),
             new_name: String::new(),
@@ -122,84 +161,129 @@ impl App {
             error: None,
             font_note,
             validation: Vec::new(),
+            query: String::new(),
+            query_kind: 0,
+            results: Vec::new(),
+            history: Vec::new(),
+            state: ViewState::load(),
+            last_interaction: Instant::now(),
+            idle_trimmed: false,
+            job: None,
+            show_export: false,
         };
-        // 命令行给路径就直接打开（也方便双击文件关联后续接）
-        if let Some(path) = std::env::args().nth(1) {
-            let p = Path::new(&path).to_path_buf();
-            if p.exists() {
-                app.open_path(&p);
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.is_empty() {
+            // 没有给路径就打开最近一个（双击 / 重开都顺手）
+            if let Some(last) = app.state.recent.first().cloned() {
+                let p = PathBuf::from(last);
+                if p.exists() {
+                    app.open_path(&p);
+                }
+            }
+        } else {
+            for a in args {
+                let p = PathBuf::from(a);
+                if p.exists() {
+                    app.open_path(&p);
+                }
             }
         }
+        app.state.prune(20);
         app
+    }
+
+    // —— 文件 / 标签 ——
+
+    fn tab(&mut self) -> Option<&mut Tab> {
+        self.tabs.get_mut(self.active)
     }
 
     fn open_path(&mut self, path: &Path) {
         self.error = None;
+        if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
+            self.active = i;
+            self.rows_dirty = true;
+            self.graph_dirty = true;
+            self.sync_inputs();
+            self.status = format!("已切到 {}", path.display());
+            return;
+        }
         match Doc::open(path) {
             Ok(mut doc) => {
                 let roots = doc.roots();
-                // 自动展开根，但孩子特别多的根先折叠着（大文件里一展开就是几十万行）
-                self.expanded = roots
-                    .iter()
-                    .copied()
-                    .filter(|id| doc.child_count(*id) <= AUTO_EXPAND_MAX_CHILDREN)
-                    .collect();
-                self.selected = roots.first().copied();
-                self.doc = Some(doc);
-                self.editor = match edit::Editor::open(path) {
-                    Ok(e) => Some(e),
-                    Err(e) => {
-                        self.error = Some(format!("编辑层不可用：{e}"));
-                        None
-                    }
+                let saved = self.state.view_of(path).cloned().unwrap_or_default();
+                let editor = edit::Editor::open(path).ok();
+                if editor.is_none() {
+                    self.error = Some("编辑层不可用（只能浏览）".into());
+                }
+                let mut tab = Tab {
+                    path: path.to_path_buf(),
+                    doc,
+                    editor,
+                    expanded: HashSet::new(),
+                    layout: Layout::Indent,
+                    selected: None,
                 };
-                self.path_input = path.display().to_string();
+                tab.apply_view(&saved, &roots);
+                if saved.expanded.is_empty() {
+                    // 首次打开：自动展开根，但孩子太多的根先折叠着
+                    tab.expanded = roots
+                        .iter()
+                        .copied()
+                        .filter(|id| tab.doc.child_count(*id) <= AUTO_EXPAND_MAX_CHILDREN)
+                        .collect();
+                }
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
                 self.rows_dirty = true;
-                self.status = format!("已打开 {}", path.display());
+                self.graph_dirty = true;
+                self.state.touch_recent(path);
+                let _ = self.state.save();
                 self.sync_inputs();
-                self.validation.clear();
+                self.status = format!("已打开 {}", path.display());
             }
             Err(e) => self.error = Some(e),
         }
     }
 
-    /// 折叠视图校验（E/R 错误）：先折叠再校验，`append-v1` 的修订不算冲突。
-    fn validate(&mut self) {
-        self.validation.clear();
-        let Some(doc) = self.doc.as_ref() else { return };
-        let path = doc.path().to_path_buf();
-        let store = match xirang_core::tree::Store::load_view(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                self.error = Some(e);
-                return;
-            }
-        };
-        let errs = validator::validate_view(&store);
-        if errs.is_empty() {
-            self.status = format!("校验通过：0 错误（{} 个节点）", store.len());
-        } else {
-            self.validation = errs
-                .iter()
-                .map(|e| format!("{} <{}> {}", e.code, &e.node_id.to_string()[..8], e.message))
-                .collect();
-            self.status = format!("{} 个校验错误", errs.len());
-        }
-    }
-
-    fn pick_file(&mut self) {
-        if let Some(p) = rfd::FileDialog::new()
+    fn pick_files(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new()
             .add_filter("息壤文件", &["xirang"])
-            .pick_file()
+            .pick_files()
         {
-            self.open_path(&p);
+            for p in paths {
+                self.open_path(&p);
+            }
         }
     }
 
-    /// 编辑落盘后：索引只补扫新增的那一段，缓存作废，行重算。
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let mut tab = self.tabs.remove(idx);
+        let view = tab.view();
+        let path = tab.path.clone();
+        tab.doc.clear_cache();
+        self.state.set_view(&path, view);
+        self.state.prune(20);
+        let _ = self.state.save();
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        self.rows_dirty = true;
+        self.graph_dirty = true;
+        self.release_graph();
+        self.history.clear();
+        self.validation.clear();
+        self.results.clear();
+        self.status = "已关闭文件（缓存已释放）".to_string();
+        self.sync_inputs();
+    }
+
+    // —— 编辑 ——
+
     fn after_edit(&mut self, what: &str) {
-        if let Some(doc) = self.doc.as_mut() {
-            if let Err(e) = doc.reload() {
+        if let Some(tab) = self.tab() {
+            if let Err(e) = tab.doc.reload() {
                 self.error = Some(e);
                 return;
             }
@@ -210,103 +294,62 @@ impl App {
         self.sync_inputs();
     }
 
-    /// 释放一切与文件相关的大块内存（关闭文件 / 切换视图时用）。
-    fn release_view_state(&mut self) {
-        self.rows.clear();
-        self.rows.shrink_to_fit();
-        self.known.clear();
-        self.known.shrink_to_fit();
-        if let Some(doc) = self.doc.as_mut() {
-            // 树上已渲染的节点缓存不再需要 → 压到最小值
-            doc.trim_cache(IDLE_KEEP);
-        }
+    fn selected_id(&self) -> Option<Uuid> {
+        self.tabs
+            .get(self.active)
+            .and_then(|t| t.selected)
+            .or(self.selected)
     }
 
-    fn release_graph(&mut self) {
-        self.graph = None;
-        self.graph_dirty = true;
-        self.dragging = None;
-        self.hovered = None;
-    }
-
-    fn close_file(&mut self) {
-        if let Some(doc) = self.doc.as_mut() {
-            doc.clear_cache();
-        }
-        self.doc = None;
-        self.editor = None;
-        self.expanded.clear();
-        self.expanded.shrink_to_fit();
-        self.selected = None;
-        self.validation.clear();
-        self.validation.shrink_to_fit();
-        self.focus = None;
-        self.release_graph();
-        self.release_view_state();
-        self.status = "已关闭文件（缓存已释放）".to_string();
-    }
-
-    /// 空闲时把节点缓存压小：不需要内存时及时还回去。
-    fn maybe_idle_trim(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.pointer.any_down() || i.raw_scroll_delta != egui::Vec2::ZERO) {
-            self.last_interaction = Instant::now();
-            self.idle_trimmed = false;
-            return;
-        }
-        let idle = self.last_interaction.elapsed().as_secs_f32();
-        if idle > IDLE_TRIM_SECS && !self.idle_trimmed {
-            if let Some(doc) = self.doc.as_mut() {
-                let before = doc.cache_len();
-                doc.trim_cache(IDLE_KEEP);
-                if before > IDLE_KEEP {
-                    self.status = format!(
-                        "空闲 {} 秒：节点缓存 {before} → {}（已释放）",
-                        IDLE_TRIM_SECS as i64,
-                        doc.cache_len()
-                    );
-                }
-            }
-            self.idle_trimmed = true;
-        }
-    }
-
-    fn sync_inputs(&mut self) {
-        let Some(id) = self.selected else { return };
-        let Some(doc) = self.doc.as_mut() else { return };
-        if let Some(n) = doc.node(id) {
-            self.name_input = n.name.clone();
-            self.value_input = plain_value(&n.value);
+    fn set_selected(&mut self, id: Option<Uuid>) {
+        self.selected = id;
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.selected = id;
         }
     }
 
     fn current_node(&mut self) -> Option<Node> {
-        let id = self.selected?;
-        self.doc.as_mut()?.node(id)
+        let id = self.selected_id()?;
+        self.tab()?.doc.node(id)
     }
 
-    /// 选中节点所属的根（首次编辑时要在根下挂 `@protocol`）。
     fn root_of(&mut self, id: Uuid) -> Option<Uuid> {
-        let doc = self.doc.as_mut()?;
+        let tab = self.tab()?;
         let mut cur = id;
-        let mut guard = 0;
-        loop {
-            let n = doc.node(cur)?;
+        for _ in 0..4096 {
+            let n = tab.doc.node(cur)?;
             match n.parent {
                 None => return Some(n.id),
-                Some(p) => {
-                    guard += 1;
-                    if guard > 4096 {
-                        return Some(n.id);
-                    }
-                    cur = p;
-                }
+                Some(p) => cur = p,
             }
         }
+        Some(id)
+    }
+
+    fn sync_inputs(&mut self) {
+        let Some(id) = self.selected_id() else {
+            self.history.clear();
+            return;
+        };
+        let mut name = String::new();
+        let mut value = String::new();
+        if let Some(tab) = self.tab() {
+            if let Some(n) = tab.doc.node(id) {
+                name = n.name.clone();
+                value = plain_value(&n.value);
+            }
+        }
+        self.name_input = name;
+        self.value_input = value;
+        self.load_history();
     }
 
     fn apply_edit(&mut self, e: edit::Edit) {
-        let Some(editor) = self.editor.as_mut() else {
-            self.error = Some("只读模式：没有编辑会话".into());
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Some(editor) = tab.editor.as_mut() else {
+            self.error = Some("编辑层不可用（只读）".into());
             return;
         };
         match editor.apply(e) {
@@ -314,22 +357,328 @@ impl App {
             Err(err) => self.error = Some(err),
         }
     }
-}
 
-/// 把值还原成可编辑的文本（引用显示目标编号，blob 显示字节数）。
-fn plain_value(v: &Value) -> String {
-    match v {
-        Value::Empty => String::new(),
-        Value::Int(n) => n.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
-        Value::Text(s) => s.clone(),
-        Value::Reference(t) => t.to_string(),
-        Value::Blob(b) => format!("[blob {} 字节]", b.len()),
+    /// `@history` 快照（编号 + 名字 + 值），点一下可回滚。
+    fn load_history(&mut self) {
+        self.history.clear();
+        let Some(id) = self.selected_id() else { return };
+        let Some(tab) = self.tab() else { return };
+        let mut out = Vec::new();
+        for kid in tab.doc.children(id) {
+            let Some(kn) = tab.doc.node(kid) else { continue };
+            if kn.name != "@history" {
+                continue;
+            }
+            for snap in tab.doc.children(kid) {
+                if let Some(sn) = tab.doc.node(snap) {
+                    out.push((snap, sn.name.clone(), plain_value(&sn.value)));
+                }
+            }
+        }
+        self.history = out;
+    }
+
+    // —— 内存释放 ——
+
+    fn release_graph(&mut self) {
+        self.graph = None;
+        self.graph_dirty = true;
+        self.dragging = None;
+    }
+
+    fn release_view_state(&mut self) {
+        self.rows.clear();
+        self.rows.shrink_to_fit();
+        self.known.clear();
+        self.known.shrink_to_fit();
+        if let Some(tab) = self.tab() {
+            tab.doc.trim_cache(IDLE_KEEP);
+        }
+    }
+
+    fn maybe_idle_trim(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.pointer.any_down() || i.raw_scroll_delta != egui::Vec2::ZERO) {
+            self.last_interaction = Instant::now();
+            self.idle_trimmed = false;
+            return;
+        }
+        if self.last_interaction.elapsed().as_secs_f32() > IDLE_TRIM_SECS && !self.idle_trimmed {
+            if let Some(tab) = self.tab() {
+                let before = tab.doc.cache_len();
+                tab.doc.trim_cache(IDLE_KEEP);
+                if before > IDLE_KEEP {
+                    self.status = format!(
+                        "空闲 {} 秒：节点缓存 {before} → {}（已释放）",
+                        IDLE_TRIM_SECS as i64,
+                        tab.doc.cache_len()
+                    );
+                }
+            }
+            self.idle_trimmed = true;
+        }
+    }
+
+    // —— 后台任务 ——
+
+    fn start_search(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let path = tab.path.clone();
+        let q = self.query.clone();
+        let query = match self.query_kind {
+            0 => Query::Name(q.clone()),
+            1 => Query::Value(q.clone()),
+            _ => Query::Kind(q.clone()),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let c = cancel.clone();
+        std::thread::spawn(move || {
+            let r = scan::search(&path, &query, &c);
+            let _ = tx.send(JobDone::Search(r));
+        });
+        self.job = Some(Job { cancel, rx });
+        self.status = format!(
+            "搜索「{q}」（{}）：扫描中…",
+            ["名字", "值", "类型"][self.query_kind.min(2)]
+        );
+    }
+
+    fn start_validate(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let path = tab.path.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let c = cancel.clone();
+        std::thread::spawn(move || {
+            let mut done = 0u64;
+            let r = scan::validate_stream(&path, &c, &mut |n| done = n);
+            let _ = tx.send(JobDone::Validate(r));
+        });
+        self.job = Some(Job { cancel, rx });
+        self.status = "校验中（流式扫描，不整份载入）…".to_string();
+    }
+
+    fn poll_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.job.as_ref() else { return };
+        match job.rx.try_recv() {
+            Ok(JobDone::Search(Ok(hits))) => {
+                self.status = format!("搜索完成：{} 个节点", hits.len());
+                self.results = hits;
+                self.job = None;
+            }
+            Ok(JobDone::Search(Err(e))) => {
+                self.error = Some(e);
+                self.job = None;
+            }
+            Ok(JobDone::Validate(Ok(issues))) => {
+                self.status = if issues.is_empty() {
+                    "校验通过：0 错误".to_string()
+                } else {
+                    format!("{} 个校验错误", issues.len())
+                };
+                self.validation = issues
+                    .iter()
+                    .map(|i| format!("{} <{}> {}", i.code, &i.node_id.to_string()[..8], i.message))
+                    .collect();
+                self.job = None;
+            }
+            Ok(JobDone::Validate(Err(e))) => {
+                self.error = Some(e);
+                self.job = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+            Err(mpsc::TryRecvError::Disconnected) => self.job = None,
+        }
+    }
+
+    fn cancel_job(&mut self) {
+        if let Some(job) = self.job.as_ref() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.job = None;
+        self.status = "已取消".to_string();
+    }
+
+    // —— 导出 / 合并 / 定位 ——
+
+    fn export(&mut self, fmt: &str) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let path = tab.path.clone();
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "export".into());
+        let ext = match fmt {
+            "json" => "json",
+            "xml" => "xml",
+            "yaml" => "yaml",
+            _ => "md",
+        };
+        let Some(target) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}.{ext}"))
+            .add_filter(fmt, &[ext])
+            .save_file()
+        else {
+            return;
+        };
+        match Store::load_view(&path) {
+            Ok(store) => {
+                let text = match fmt {
+                    "json" => convert::to_json(&store),
+                    "xml" => convert::to_xml(&store),
+                    "yaml" => convert::to_yaml(&store),
+                    _ => convert::to_md(&store),
+                };
+                match std::fs::write(&target, text) {
+                    Ok(()) => self.status = format!("已导出 {fmt} → {}", target.display()),
+                    Err(e) => self.error = Some(e.to_string()),
+                }
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn compact_active(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let path = tab.path.clone();
+        match compact_file(&path) {
+            Ok((raw, folded)) => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    let _ = tab.doc.reload();
+                }
+                self.rows_dirty = true;
+                self.graph_dirty = true;
+                self.status = format!(
+                    "已合并：记录 {raw} → {folded}（折叠掉 {} 条历史记录）",
+                    raw.saturating_sub(folded)
+                );
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn reveal(&mut self, id: Uuid) {
+        let mut chain = Vec::new();
+        if let Some(tab) = self.tab() {
+            let mut cur = id;
+            for _ in 0..4096 {
+                let Some(n) = tab.doc.node(cur) else { break };
+                chain.push(cur);
+                match n.parent {
+                    Some(p) => cur = p,
+                    None => break,
+                }
+            }
+        }
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            for c in chain {
+                tab.expanded.insert(c);
+            }
+        }
+        self.set_selected(Some(id));
+        self.rows_dirty = true;
+        self.sync_inputs();
+        self.status = format!("已定位到 <{}>", &id.to_string()[..8]);
+    }
+
+    // —— 图 ——
+
+    fn graph_candidates(&mut self) -> Vec<(Uuid, String)> {
+        let mut out: Vec<(Uuid, String)> = Vec::new();
+        for i in 0..self.tabs.len() {
+            let label = self.tabs[i].path.display().to_string();
+            if i == self.active && !self.known.is_empty() {
+                out.extend(self.known.iter().cloned());
+                continue;
+            }
+            let roots = self.tabs[i].doc.roots();
+            let mut ids = roots.clone();
+            for r in roots {
+                ids.extend(self.tabs[i].doc.children(r));
+            }
+            out.extend(ids.into_iter().map(|id| (id, label.clone())));
+        }
+        out
+    }
+
+    fn ensure_graph(&mut self) {
+        if !self.graph_dirty {
+            return;
+        }
+        let candidates = self.graph_candidates();
+        let show_aux = self.show_aux;
+        let mut g = Graph::new(self.graph_settings.clone());
+        {
+            let tabs = &mut self.tabs;
+            let mut resolve = |id: Uuid| -> Option<(Node, String)> {
+                for tab in tabs.iter_mut() {
+                    if let Some(n) = tab.doc.node(id) {
+                        return Some((n, tab.path.display().to_string()));
+                    }
+                }
+                None
+            };
+            g.build(&candidates, show_aux, &mut resolve);
+        }
+        self.graph = Some(g);
+        self.graph_dirty = false;
+        self.graph_built_orphans = self.graph_settings.show_orphans;
+    }
+
+    fn graph_settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        egui::Window::new("图设置")
+            .open(&mut open)
+            .default_width(330.0)
+            .show(ctx, |ui| {
+                let s = &mut self.graph_settings;
+                ui.heading("力");
+                ui.add(egui::Slider::new(&mut s.center_strength, 0.0..=1.0).step_by(0.01).text("图谱向心力"));
+                ui.add(egui::Slider::new(&mut s.repel_strength, 1.0..=30.0).text("节点间的排斥力"));
+                ui.add(egui::Slider::new(&mut s.link_strength, 0.0..=1.0).step_by(0.01).text("相连节点间的吸引力"));
+                ui.add(egui::Slider::new(&mut s.link_distance, 0.0..=500.0).text("连线长度"));
+                ui.separator();
+                ui.heading("显示");
+                ui.add(egui::Slider::new(&mut s.text_fade_multiplier, -3.0..=3.0).step_by(0.1).text("文字淡入阈值"));
+                ui.add(egui::Slider::new(&mut s.node_size_multiplier, 0.5..=3.0).text("节点大小"));
+                ui.add(egui::Slider::new(&mut s.line_size_multiplier, 0.5..=3.0).text("连线粗细"));
+                ui.checkbox(&mut s.show_arrow, "显示箭头（放大后）");
+                ui.checkbox(&mut s.animate, "生长动画");
+                ui.checkbox(&mut s.show_orphans, "显示孤立节点");
+                ui.separator();
+                if ui.button("重置为默认").clicked() {
+                    s.reset();
+                    self.graph_dirty = true;
+                }
+                ui.weak("默认值照搬 Obsidian：向心力 0.1 · 排斥力 10 · 连线力 1 · 连线长度 250");
+            });
+        self.show_settings = open;
+        if self.graph_settings.show_orphans != self.graph_built_orphans {
+            self.graph_dirty = true;
+        } else if let Some(g) = self.graph.as_mut() {
+            if g.settings != self.graph_settings {
+                g.settings = self.graph_settings.clone();
+                g.wake();
+            }
+        }
     }
 }
 
-/// 中文字体：按候选清单探测系统字体（macOS 先行），失败则回退内置字体。
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([760.0, 480.0])
+            .with_title("息壤 XiRang"),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "息壤 XiRang",
+        options,
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+    )
+}
+
 fn install_cjk_font(ctx: &egui::Context) -> Option<String> {
     const CANDIDATES: &[&str] = &[
         "/System/Library/Fonts/PingFang.ttc",
@@ -361,50 +710,88 @@ fn install_cjk_font(ctx: &egui::Context) -> Option<String> {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ⌘O 打开文件
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
-            self.pick_file();
+            self.pick_files();
         }
+        self.poll_job(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("打开…").clicked() {
-                    self.pick_file();
+                    self.pick_files();
                 }
-                ui.separator();
-                if ui
-                    .selectable_label(self.layout == Layout::Indent, "横向缩进")
-                    .clicked()
-                {
-                    self.layout = Layout::Indent;
-                    self.rows_dirty = true;
+                if !self.tabs.is_empty() {
+                    let labels: Vec<String> = self
+                        .tabs
+                        .iter()
+                        .map(|t| {
+                            let revs = t.doc.rev_count();
+                            if revs > 0 {
+                                format!("{}（+{revs}）", t.label())
+                            } else {
+                                t.label()
+                            }
+                        })
+                        .collect();
+                    let mut active = self.active;
+                    egui::ComboBox::from_id_salt("tabs")
+                        .selected_text(labels.get(active).cloned().unwrap_or_default())
+                        .show_ui(ui, |ui| {
+                            for (i, l) in labels.iter().enumerate() {
+                                ui.selectable_value(&mut active, i, l);
+                            }
+                        });
+                    if active != self.active {
+                        self.active = active;
+                        self.rows_dirty = true;
+                        self.graph_dirty = true;
+                        self.results.clear();
+                        self.validation.clear();
+                        self.sync_inputs();
+                    }
+                    if ui.button("关闭").clicked() {
+                        let a = self.active;
+                        self.close_tab(a);
+                    }
+                    ui.separator();
                 }
-                if ui
-                    .selectable_label(self.layout == Layout::Layered, "纵向分层")
-                    .clicked()
-                {
-                    self.layout = Layout::Layered;
-                    self.rows_dirty = true;
-                }
-                ui.separator();
-                if ui
-                    .selectable_label(self.mode == ViewMode::Tree, "树")
-                    .clicked()
+                if ui.selectable_label(self.mode == ViewMode::Tree, "树").clicked()
                     && self.mode != ViewMode::Tree
                 {
                     self.mode = ViewMode::Tree;
-                    // 离开图视图：图数据与位置一次性释放
                     self.release_graph();
                 }
-                if ui
-                    .selectable_label(self.mode == ViewMode::Graph, "引用图")
-                    .clicked()
+                if ui.selectable_label(self.mode == ViewMode::Graph, "引用图").clicked()
                     && self.mode != ViewMode::Graph
                 {
                     self.mode = ViewMode::Graph;
                     self.graph_dirty = true;
-                    // 进图视图：不再需要整棵树的骨架行，释放掉（重建图时按需取数）
                     self.release_view_state();
+                }
+                let layout = self.tabs.get(self.active).map(|t| t.layout);
+                if ui
+                    .add_enabled(
+                        layout.is_some(),
+                        egui::Button::selectable(layout == Some(Layout::Indent), "横向缩进"),
+                    )
+                    .clicked()
+                {
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.layout = Layout::Indent;
+                    }
+                    self.rows_dirty = true;
+                }
+                if ui
+                    .add_enabled(
+                        layout.is_some(),
+                        egui::Button::selectable(layout == Some(Layout::Layered), "纵向分层"),
+                    )
+                    .clicked()
+                {
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.layout = Layout::Layered;
+                    }
+                    self.rows_dirty = true;
                 }
                 if self.mode == ViewMode::Graph && ui.button("图设置").clicked() {
                     self.show_settings = !self.show_settings;
@@ -416,53 +803,92 @@ impl eframe::App for App {
                 }
                 ui.checkbox(&mut self.readonly, "只读");
                 ui.separator();
-                let can_undo = self.editor.as_ref().map(|e| e.can_undo()).unwrap_or(false);
-                let can_redo = self.editor.as_ref().map(|e| e.can_redo()).unwrap_or(false);
+                let (can_undo, can_redo) = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|t| t.editor.as_ref())
+                    .map(|e| (e.can_undo(), e.can_redo()))
+                    .unwrap_or((false, false));
                 if ui.add_enabled(can_undo, egui::Button::new("撤销")).clicked() {
-                    if let Some(e) = self.editor.as_mut() {
-                        if let Err(err) = e.undo() {
-                            self.error = Some(err);
-                        } else {
-                            self.after_edit("已撤销");
-                        }
+                    let r = self
+                        .tabs
+                        .get_mut(self.active)
+                        .and_then(|t| t.editor.as_mut())
+                        .map(|e| e.undo());
+                    match r {
+                        Some(Ok(true)) => self.after_edit("已撤销"),
+                        Some(Err(e)) => self.error = Some(e),
+                        _ => {}
                     }
                 }
                 if ui.add_enabled(can_redo, egui::Button::new("重做")).clicked() {
-                    if let Some(e) = self.editor.as_mut() {
-                        if let Err(err) = e.redo() {
-                            self.error = Some(err);
-                        } else {
-                            self.after_edit("已重做");
-                        }
+                    let r = self
+                        .tabs
+                        .get_mut(self.active)
+                        .and_then(|t| t.editor.as_mut())
+                        .map(|e| e.redo());
+                    match r {
+                        Some(Ok(true)) => self.after_edit("已重做"),
+                        Some(Err(e)) => self.error = Some(e),
+                        _ => {}
                     }
                 }
+            });
+            ui.horizontal_wrapped(|ui| {
+                let busy = self.job.is_some();
+                let has_file = !self.tabs.is_empty();
+                ui.add_enabled(
+                    !busy && has_file,
+                    egui::TextEdit::singleline(&mut self.query)
+                        .hint_text("搜索节点")
+                        .desired_width(170.0),
+                );
+                egui::ComboBox::from_id_salt("query_kind")
+                    .selected_text(["名字", "值", "类型"][self.query_kind.min(2)])
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        for (i, k) in ["名字", "值", "类型"].iter().enumerate() {
+                            ui.selectable_value(&mut self.query_kind, i, *k);
+                        }
+                    });
+                if ui.add_enabled(!busy && has_file, egui::Button::new("搜索")).clicked() {
+                    self.start_search();
+                }
+                if ui.add_enabled(!busy && has_file, egui::Button::new("校验")).clicked() {
+                    self.start_validate();
+                }
+                if busy && ui.button("取消").clicked() {
+                    self.cancel_job();
+                }
                 ui.separator();
-                if ui.button("校验").clicked() {
-                    self.validate();
+                if ui
+                    .add_enabled(has_file, egui::Button::new("导出 ▾"))
+                    .clicked()
+                {
+                    self.show_export = true;
+                }
+                if ui
+                    .add_enabled(has_file, egui::Button::new("合并"))
+                    .on_hover_text("折叠掉同一编号的历史记录（整份重写，大文件要十几秒）")
+                    .clicked()
+                {
+                    self.compact_active();
                 }
                 if ui
                     .add_enabled(
-                        self.doc
-                            .as_ref()
-                            .map(|d| d.cache_len() > 0)
+                        self.tabs
+                            .get(self.active)
+                            .map(|t| t.doc.cache_len() > 0)
                             .unwrap_or(false),
                         egui::Button::new("释放缓存"),
                     )
-                    .on_hover_text("把已读过的节点缓存还回系统（需要时会重新按索引读取）")
                     .clicked()
                 {
-                    if let Some(doc) = self.doc.as_mut() {
-                        let n = doc.cache_len();
-                        doc.clear_cache();
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        let n = tab.doc.cache_len();
+                        tab.doc.clear_cache();
                         self.status = format!("已释放 {n} 个节点的缓存");
                     }
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(self.doc.is_some(), egui::Button::new("关闭"))
-                    .clicked()
-                {
-                    self.close_file();
                 }
             });
         });
@@ -470,26 +896,24 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(&self.status);
-                if let Some(doc) = self.doc.as_ref() {
+                if let Some(tab) = self.tabs.get(self.active) {
                     ui.separator();
-                    let total = doc.node_count();
-                    let revs = doc.rev_count();
-                    let hits = doc.hits;
-                    let reads = doc.reads;
-                    let cache = doc.cache_len();
-                    let bytes = doc.cache_bytes() / 1024;
                     ui.label(format!(
-                        "节点 {total}（含修订 {revs}）· 缓存 {cache} 个 / 约 {bytes} KB · 命中 {hits} / 直读 {reads}"
+                        "节点 {}（含修订 {}）· 缓存 {} 个 / 约 {} KB · 命中 {} / 直读 {}",
+                        tab.doc.node_count(),
+                        tab.doc.rev_count(),
+                        tab.doc.cache_len(),
+                        tab.doc.cache_bytes() / 1024,
+                        tab.doc.hits,
+                        tab.doc.reads
                     ));
                 }
                 if let Some(g) = self.graph.as_ref() {
                     ui.separator();
                     ui.label(format!("图 {} 节点 / {} 边", g.len(), g.edges.len()));
                 }
-                if !self.font_note.is_empty() {
-                    ui.separator();
-                    ui.weak(self.font_note.clone());
-                }
+                ui.separator();
+                ui.weak(self.font_note.clone());
             });
             if !self.validation.is_empty() {
                 ui.horizontal_wrapped(|ui| {
@@ -497,43 +921,99 @@ impl eframe::App for App {
                         egui::Color32::from_rgb(200, 60, 60),
                         format!("⚠ {} 个校验错误：", self.validation.len()),
                     );
-                    for line in self.validation.iter().take(3) {
+                    for line in self.validation.iter().take(4) {
                         ui.label(line);
                     }
                 });
             }
+            if !self.results.is_empty() {
+                let mut goto = None;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("命中 {} 个：", self.results.len()));
+                    for hit in self.results.iter().take(10) {
+                        let text = if hit.value.is_empty() {
+                            hit.name.clone()
+                        } else {
+                            format!("{} = {}", hit.name, hit.value)
+                        };
+                        if ui.small_button(text).clicked() {
+                            goto = Some(hit.id);
+                        }
+                    }
+                });
+                if let Some(id) = goto {
+                    self.reveal(id);
+                }
+            }
+            if !self.history.is_empty() {
+                let mut revert = None;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("@history {} 条：", self.history.len()));
+                    for (id, name, value) in self.history.iter().rev().take(6) {
+                        let label = if name.is_empty() {
+                            format!("(空) = {value}")
+                        } else {
+                            format!("{name} = {value}")
+                        };
+                        if ui
+                            .small_button(label)
+                            .on_hover_text("回滚到这个快照（追加一条记录）")
+                            .clicked()
+                        {
+                            revert = Some((*id, name.clone(), value.clone()));
+                        }
+                    }
+                });
+                if let Some((_id, name, value)) = revert {
+                    if let Some(node) = self.current_node() {
+                        let root = self.root_of(node.id);
+                        let e = edit::Edit {
+                            id: node.id,
+                            parent: node.parent,
+                            before_name: node.name.clone(),
+                            before_value: node.value.clone(),
+                            after_name: name,
+                            after_value: parse_value(&value),
+                            created: false,
+                            root,
+                        };
+                        self.apply_edit(e);
+                    }
+                }
+            }
         });
 
         egui::SidePanel::right("inspector")
-            .default_width(320.0)
+            .default_width(340.0)
             .show(ctx, |ui| {
                 ui.heading("节点");
                 let Some(node) = self.current_node() else {
                     ui.label("未选中节点");
+                    ui.separator();
+                    ui.label("最近打开");
+                    let recent = self.state.recent.clone();
+                    for r in recent.iter().take(8) {
+                        if ui.small_button(r).clicked() {
+                            self.open_path(Path::new(r));
+                        }
+                    }
                     return;
                 };
                 ui.label(format!("编号 {}", node.id));
-                ui.label(format!("类型 {}", value_kind(&node.value)));
-                ui.add_space(6.0);
+                ui.label(format!("类型 {}", scan::kind_name(&node.value)));
+                ui.add_space(4.0);
                 ui.label("名字");
                 ui.text_edit_singleline(&mut self.name_input);
                 ui.label("值");
                 ui.text_edit_multiline(&mut self.value_input);
-                ui.add_space(6.0);
                 let editable = !self.readonly;
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(editable, egui::Button::new("保存改值"))
-                        .clicked()
-                    {
+                    if ui.add_enabled(editable, egui::Button::new("保存改值")).clicked() {
                         let root = self.root_of(node.id);
                         let e = edit::set_value(&node, parse_value(&self.value_input), root);
                         self.apply_edit(e);
                     }
-                    if ui
-                        .add_enabled(editable, egui::Button::new("保存改名"))
-                        .clicked()
-                    {
+                    if ui.add_enabled(editable, egui::Button::new("保存改名")).clicked() {
                         let root = self.root_of(node.id);
                         let e = edit::rename(&node, self.name_input.trim().to_string(), root);
                         self.apply_edit(e);
@@ -546,10 +1026,7 @@ impl eframe::App for App {
                     ui.text_edit_singleline(&mut self.new_value);
                 });
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(editable, egui::Button::new("＋ 新增子节点"))
-                        .clicked()
-                    {
+                    if ui.add_enabled(editable, egui::Button::new("＋ 新增子节点")).clicked() {
                         let root = self.root_of(node.id);
                         let e = edit::create(
                             Some(node.id),
@@ -561,25 +1038,38 @@ impl eframe::App for App {
                         self.new_value.clear();
                         self.apply_edit(e);
                     }
-                    if ui
-                        .add_enabled(editable, egui::Button::new("删除（置空）"))
-                        .clicked()
-                    {
+                    if ui.add_enabled(editable, egui::Button::new("删除（置空）")).clicked() {
                         let root = self.root_of(node.id);
                         let e = edit::delete(&node, root);
                         self.apply_edit(e);
                     }
                 });
-                ui.separator();
-                let appended = self.editor.as_ref().map(|e| e.appended).unwrap_or(0);
-                ui.weak(format!(
-                    "本次会话追加 {appended} 条记录；合并（compact）留待下一步接入"
-                ));
+                if let Value::Blob(bytes) = &node.value {
+                    ui.separator();
+                    ui.label(format!("二进制块 {} 字节", bytes.len()));
+                    let head: Vec<String> =
+                        bytes.iter().take(24).map(|b| format!("{b:02x}")).collect();
+                    ui.monospace(head.join(" "));
+                    if let Ok(text) = std::str::from_utf8(&bytes[..bytes.len().min(400)]) {
+                        ui.label("文本预览");
+                        ui.monospace(text.chars().take(160).collect::<String>());
+                    }
+                    if ui.button("导出为文件").clicked() {
+                        if let Some(target) = rfd::FileDialog::new().save_file() {
+                            match std::fs::write(&target, bytes) {
+                                Ok(()) => {
+                                    self.status = format!("已导出 blob → {}", target.display())
+                                }
+                                Err(e) => self.error = Some(e.to_string()),
+                            }
+                        }
+                    }
+                }
                 ui.separator();
                 let focusing = self.focus == Some(node.id);
                 if ui
                     .selectable_label(focusing, if focusing { "取消聚焦" } else { "聚焦此子树" })
-                    .on_hover_text("聚焦后：这棵子树按树布局排开，图里其余节点淡出为背景")
+                    .on_hover_text("图视图里把焦点子树排成树形，其余节点淡出为背景")
                     .clicked()
                 {
                     self.focus = if focusing { None } else { Some(node.id) };
@@ -591,9 +1081,14 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = self.error.clone() {
-                ui.colored_label(egui::Color32::from_rgb(200, 60, 60), err);
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(200, 60, 60), err);
+                    if ui.small_button("知道了").clicked() {
+                        self.error = None;
+                    }
+                });
             }
-            if self.doc.is_none() {
+            if self.tabs.is_empty() {
                 ui.centered_and_justified(|ui| ui.label("打开一个 .xirang 文件开始（⌘O）"));
                 return;
             }
@@ -606,29 +1101,103 @@ impl eframe::App for App {
         if self.show_settings {
             self.graph_settings_window(ctx);
         }
+        if self.show_export {
+            let mut open = true;
+            egui::Window::new("导出")
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("导出的是「折叠视图」（同编号只留最后一条）");
+                    for fmt in ["json", "xml", "yaml", "md"] {
+                        if ui.button(format!("导出为 {fmt}")).clicked() {
+                            self.export(fmt);
+                        }
+                    }
+                });
+            self.show_export = open;
+        }
         self.maybe_idle_trim(ctx);
     }
 }
 
 impl App {
-    fn show_graph(&mut self, ui: &mut egui::Ui) {
-        // 1) 需要时重建：候选集合 = 最近一次树摊平出来的节点（没有就退到根）
-        if self.graph_dirty {
-            let candidates = if self.known.is_empty() {
-                self.doc.as_mut().map(|d| d.roots()).unwrap_or_default()
-            } else {
-                self.known.clone()
+    fn show_tree(&mut self, ui: &mut egui::Ui) {
+        if self.rows_dirty {
+            let (expanded, show_aux, label) = {
+                let tab = &self.tabs[self.active];
+                (
+                    tab.expanded.clone(),
+                    self.show_aux,
+                    tab.path.display().to_string(),
+                )
             };
-            let label = self.path_input.clone();
-            if let Some(doc) = self.doc.as_mut() {
-                let mut g = Graph::new(self.graph_settings.clone());
-                g.build(doc, &candidates, self.show_aux, &label);
-                self.graph = Some(g);
-            }
-            self.graph_dirty = false;
-            self.graph_built_orphans = self.graph_settings.show_orphans;
+            let rows = if let Some(tab) = self.tab() {
+                flatten(&mut tab.doc, &expanded, show_aux, ROW_BUDGET.min(MAX_ROWS))
+            } else {
+                Vec::new()
+            };
+            self.known = rows.iter().map(|r| (r.id, label.clone())).collect();
+            self.rows = rows;
+            self.rows_dirty = false;
         }
+        let layout = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.layout)
+            .unwrap_or(Layout::Indent);
+        let selected = self.selected_id();
+        let rows = self.rows.clone();
+        let mut toggle: Option<Uuid> = None;
+        let mut select: Option<Uuid> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
+                for idx in range {
+                    let row = &rows[idx];
+                    ui.horizontal(|ui| {
+                        ui.add_space(row.indent(layout));
+                        if layout == Layout::Indent {
+                            ui.monospace(row.guide());
+                        }
+                        if row.has_children() {
+                            if ui.small_button(row.twisty()).clicked() {
+                                toggle = Some(row.id);
+                            }
+                        } else {
+                            ui.weak("·");
+                        }
+                        let name = if row.name.is_empty() {
+                            "(空槽位)".to_string()
+                        } else {
+                            row.name.clone()
+                        };
+                        let text = if row.value.is_empty() {
+                            name
+                        } else {
+                            format!("{name} = {}", row.value)
+                        };
+                        if ui.selectable_label(selected == Some(row.id), text).clicked() {
+                            select = Some(row.id);
+                        }
+                    });
+                    ui.separator();
+                }
+            });
+        if let Some(id) = toggle {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                if !tab.expanded.remove(&id) {
+                    tab.expanded.insert(id);
+                }
+            }
+            self.rows_dirty = true;
+        }
+        if let Some(id) = select {
+            self.set_selected(Some(id));
+            self.sync_inputs();
+        }
+    }
 
+    fn show_graph(&mut self, ui: &mut egui::Ui) {
+        self.ensure_graph();
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
@@ -640,37 +1209,38 @@ impl App {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "这个文件里没有引用关系（图是空的）",
+                "这些文件里没有引用关系（图是空的）",
                 egui::FontId::proportional(14.0),
                 ui.visuals().weak_text_color(),
             );
             return;
         }
-
-        // 2) 力模拟：每帧 2 次迭代，静止后自动停算（省电）
         if graph.step(2) {
             ui.ctx().request_repaint();
         }
 
-        // 3) 聚焦：焦点子树改用树布局（横向缩进），逐帧过渡过去
         let mut focus_members: HashSet<Uuid> = HashSet::new();
         if let Some(focus) = self.focus {
             let members: Vec<Uuid> = graph.nodes.iter().map(|n| n.id).collect();
-            if let Some(doc) = self.doc.as_mut() {
-                let subtree = Graph::subtree(doc, focus, &members);
-                for (id, _) in &subtree {
-                    focus_members.insert(*id);
+            let tabs = &mut self.tabs;
+            let mut subtree = Vec::new();
+            for tab in tabs.iter_mut() {
+                if tab.doc.node(focus).is_some() {
+                    subtree = Graph::subtree(&mut tab.doc, focus, &members);
+                    break;
                 }
-                if subtree.len() > 1 {
-                    let targets = graph.focus_targets(&subtree, [0.0, 0.0], 130.0, 34.0);
-                    if graph.move_towards(&targets, 0.25) {
-                        ui.ctx().request_repaint();
-                    }
+            }
+            for (id, _) in &subtree {
+                focus_members.insert(*id);
+            }
+            if subtree.len() > 1 {
+                let targets = graph.focus_targets(&subtree, [0.0, 0.0], 130.0, 34.0);
+                if graph.move_towards(&targets, 0.25) {
+                    ui.ctx().request_repaint();
                 }
             }
         }
 
-        // 4) 缩放与平移
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let scroll = ui.input(|i| i.raw_scroll_delta.y);
         if response.hovered() && scroll != 0.0 {
@@ -692,7 +1262,6 @@ impl App {
             ]
         };
 
-        // 5) 悬停命中的节点（用于高亮、拖动、悬停标签）
         let hovered_idx = pointer.and_then(|p| {
             let mut best: Option<(f32, usize)> = None;
             for (i, node) in graph.nodes.iter().enumerate() {
@@ -705,24 +1274,17 @@ impl App {
             }
             best.map(|(_, i)| i)
         });
-        self.hovered = hovered_idx.map(|i| graph.nodes[i].id);
-
-        // 6) 拖动节点 / 拖空白平移
         if response.drag_started() {
-            match hovered_idx {
-                Some(i) => {
-                    self.dragging = Some(graph.nodes[i].id);
-                    graph.set_dragging(true);
-                }
-                None => {}
+            if let Some(i) = hovered_idx {
+                self.dragging = Some(graph.nodes[i].id);
+                graph.set_dragging(true);
             }
         }
         if response.dragged() {
             match self.dragging.and_then(|id| graph.index_of(id)) {
                 Some(i) => {
                     if let Some(p) = pointer {
-                        let world = from_screen(p);
-                        graph.nodes[i].pos = world;
+                        graph.nodes[i].pos = from_screen(p);
                         graph.nodes[i].vel = [0.0, 0.0];
                     }
                 }
@@ -739,13 +1301,11 @@ impl App {
         let mut clicked = false;
         if response.clicked() {
             if let Some(i) = hovered_idx {
-                let id = graph.nodes[i].id;
-                self.selected = Some(id);
+                self.selected = Some(graph.nodes[i].id);
                 clicked = true;
             }
         }
 
-        // 7) 画边（聚焦 / 悬停时其余淡出）
         let hover_neighbors: HashSet<Uuid> = match hovered_idx {
             Some(i) => {
                 let mut set = HashSet::new();
@@ -783,14 +1343,11 @@ impl App {
         for &(a, b) in &graph.edges {
             let (na, nb) = (&graph.nodes[a], &graph.nodes[b]);
             let alpha = dim_of(na.id).min(dim_of(nb.id));
-            let color = edge_color.gamma_multiply(alpha);
             painter.line_segment(
                 [to_screen(na.pos), to_screen(nb.pos)],
-                egui::Stroke::new(line_w * alpha.max(0.2), color),
+                egui::Stroke::new(line_w * alpha.max(0.2), edge_color.gamma_multiply(alpha)),
             );
         }
-
-        // 8) 画节点 + 标签（文字按缩放阈值淡入；缩小时只在悬停显示）
         let label_alpha = graph.settings.label_alpha(zoom);
         let text_color = ui.visuals().text_color();
         let accent = ui.visuals().selection.bg_fill;
@@ -801,8 +1358,7 @@ impl App {
             }
             let dim = dim_of(node.id);
             let r = (graph.settings.radius(node.degree) * zoom).max(1.5);
-            let is_selected = self.selected == Some(node.id);
-            let fill = if is_selected {
+            let fill = if self.selected == Some(node.id) {
                 accent
             } else if node.aux {
                 egui::Color32::from_rgb(160, 110, 70)
@@ -825,8 +1381,6 @@ impl App {
                 );
             }
         }
-
-        // 悬停：显示「节点名 + 所在文件」（缩小时名字就靠它看）
         if let Some(i) = hovered_idx {
             let node = &graph.nodes[i];
             let sp = to_screen(node.pos);
@@ -839,143 +1393,9 @@ impl App {
                 text_color,
             );
         }
-        let _ = zoom;
-        // 借用结束后再同步右侧面板
         if clicked {
+            self.set_selected(self.selected);
             self.sync_inputs();
         }
-    }
-
-    fn graph_settings_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_settings;
-        egui::Window::new("图设置")
-            .open(&mut open)
-            .default_width(320.0)
-            .show(ctx, |ui| {
-                let s = &mut self.graph_settings;
-                ui.heading("力");
-                ui.add(
-                    egui::Slider::new(&mut s.center_strength, 0.0..=1.0)
-                        .step_by(0.01)
-                        .text("图谱向心力"),
-                );
-                ui.add(egui::Slider::new(&mut s.repel_strength, 1.0..=30.0).text("节点间的排斥力"));
-                ui.add(
-                    egui::Slider::new(&mut s.link_strength, 0.0..=1.0)
-                        .step_by(0.01)
-                        .text("相连节点间的吸引力"),
-                );
-                ui.add(egui::Slider::new(&mut s.link_distance, 0.0..=500.0).text("连线长度"));
-                ui.separator();
-                ui.heading("显示");
-                ui.add(
-                    egui::Slider::new(&mut s.text_fade_multiplier, -3.0..=3.0)
-                        .step_by(0.1)
-                        .text("文字淡入阈值"),
-                );
-                ui.add(egui::Slider::new(&mut s.node_size_multiplier, 0.5..=3.0).text("节点大小"));
-                ui.add(egui::Slider::new(&mut s.line_size_multiplier, 0.5..=3.0).text("连线粗细"));
-                ui.checkbox(&mut s.show_arrow, "显示箭头（放大后）");
-                ui.checkbox(&mut s.animate, "生长动画");
-                ui.checkbox(&mut s.show_orphans, "显示孤立节点");
-                ui.separator();
-                if ui.button("重置为默认").clicked() {
-                    s.reset();
-                    self.graph_dirty = true;
-                }
-                ui.weak("默认值照搬 Obsidian 关系图谱：向心力 0.1 · 排斥力 10 · 连线力 1 · 连线长度 250");
-            });
-        self.show_settings = open;
-
-        if self.graph_settings.show_orphans != self.graph_built_orphans {
-            self.graph_dirty = true;
-        } else if let Some(g) = self.graph.as_mut() {
-            if g.settings != self.graph_settings {
-                g.settings = self.graph_settings.clone();
-                g.wake();
-            }
-        }
-    }
-
-    fn show_tree(&mut self, ui: &mut egui::Ui) {
-            if self.rows_dirty {
-                let (expanded, show_aux) = (self.expanded.clone(), self.show_aux);
-                if let Some(doc) = self.doc.as_mut() {
-                    self.rows = flatten(doc, &expanded, show_aux, ROW_BUDGET.min(MAX_ROWS));
-                    self.known = self.rows.iter().map(|r| r.id).collect();
-                }
-                self.rows_dirty = false;
-            }
-            let rows = self.rows.clone();
-            let mut toggle: Option<Uuid> = None;
-            let mut select: Option<Uuid> = None;
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
-                    for idx in range {
-                        let row = &rows[idx];
-                        ui.horizontal(|ui| {
-                            ui.add_space(row.indent(self.layout));
-                            if self.layout == Layout::Indent {
-                                ui.monospace(row.guide());
-                            }
-                            let twisty = row.twisty();
-                            if row.has_children() {
-                                if ui.small_button(twisty).clicked() {
-                                    toggle = Some(row.id);
-                                }
-                            } else {
-                                ui.weak("·");
-                            }
-                            let name = if row.name.is_empty() {
-                                "(空槽位)".to_string()
-                            } else {
-                                row.name.clone()
-                            };
-                            let text = if row.value.is_empty() {
-                                name
-                            } else {
-                                format!("{name} = {}", row.value)
-                            };
-                            let color = if row.is_aux {
-                                egui::Color32::from_rgb(160, 110, 70)
-                            } else if row.name.is_empty() {
-                                egui::Color32::GRAY
-                            } else {
-                                ui.visuals().text_color()
-                            };
-                            if ui
-                                .selectable_label(self.selected == Some(row.id), text)
-                                .clicked()
-                            {
-                                select = Some(row.id);
-                            }
-                            let _ = color;
-                        });
-                        ui.separator();
-                    }
-                });
-            if let Some(id) = toggle {
-                if !self.expanded.remove(&id) {
-                    self.expanded.insert(id);
-                }
-                self.rows_dirty = true;
-            }
-            if let Some(id) = select {
-                self.selected = Some(id);
-                self.sync_inputs();
-            }
-    }
-}
-
-fn value_kind(v: &Value) -> &'static str {
-    match v {
-        Value::Empty => "空",
-        Value::Int(_) => "整数",
-        Value::Float(_) => "浮点数",
-        Value::Bool(_) => "布尔",
-        Value::Text(_) => "文本",
-        Value::Reference(_) => "引用",
-        Value::Blob(_) => "二进制块",
     }
 }

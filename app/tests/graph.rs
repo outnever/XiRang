@@ -8,6 +8,16 @@ use xirang_core::codec::{Uuid, Value};
 use xirang_core::index::sidecar_path;
 use xirang_core::tree::Store;
 
+/// 单文件建图的便捷封装：候选带同一个文件名，解析走该文件的 Doc。
+fn build_graph(g: &mut Graph, doc: &mut Doc, ids: &[Uuid], show_aux: bool) {
+    let candidates: Vec<(Uuid, String)> = ids
+        .iter()
+        .map(|id| (*id, "sample.xirang".to_string()))
+        .collect();
+    let mut resolve = |id: Uuid| doc.node(id).map(|n| (n, "sample.xirang".to_string()));
+    g.build(&candidates, show_aux, &mut resolve);
+}
+
 fn tmp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("xr_graph_{name}_{}.xirang", Uuid::random_v4()))
 }
@@ -63,7 +73,7 @@ fn graph_keeps_only_connected_nodes_by_default() {
     assert_eq!(g.settings.link_distance, 250.0, "默认值照搬 Obsidian");
     assert_eq!(g.settings.center_strength, 0.1);
     assert_eq!(g.settings.repel_strength, 10.0);
-    g.build(&mut doc, &cands, true, "sample.xirang");
+    build_graph(&mut g, &mut doc, &cands, true);
     assert_eq!(g.len(), 4, "指向乙 / 深层 / 也指向乙 / 乙（目标只算一次）");
     assert_eq!(g.edges.len(), 3);
     assert!(g.nodes.iter().all(|n| n.name != "孤立"), "默认不画孤立节点");
@@ -73,7 +83,7 @@ fn graph_keeps_only_connected_nodes_by_default() {
         show_orphans: true,
         ..Settings::default()
     });
-    g2.build(&mut doc, &cands, true, "sample.xirang");
+    build_graph(&mut g2, &mut doc, &cands, true);
     assert!(g2.nodes.iter().any(|n| n.name == "孤立"));
 
     // 关掉辅助节点：@ 开头的节点不进图
@@ -84,7 +94,7 @@ fn graph_keeps_only_connected_nodes_by_default() {
     let mut doc = Doc::open(&p).unwrap();
     let cands = candidates(&mut doc);
     let mut g3 = Graph::new(Settings::default());
-    g3.build(&mut doc, &cands, false, "sample.xirang");
+    build_graph(&mut g3, &mut doc, &cands, false);
     assert!(g3.nodes.iter().all(|n| !n.name.starts_with('@')));
     cleanup(&p);
 }
@@ -99,7 +109,7 @@ fn force_step_pulls_linked_nodes_together_and_separates_others() {
         link_distance: 60.0,
         ..Settings::default()
     });
-    g.build(&mut doc, &cands, true, "sample.xirang");
+    build_graph(&mut g, &mut doc, &cands, true);
 
     let dist = |g: &Graph, i: usize, j: usize| {
         let (a, b) = (&g.nodes[i], &g.nodes[j]);
@@ -136,7 +146,7 @@ fn simulation_stops_when_idle_and_wakes_on_drag() {
     let mut doc = Doc::open(&p).unwrap();
     let cands = candidates(&mut doc);
     let mut g = Graph::new(Settings::default());
-    g.build(&mut doc, &cands, true, "sample.xirang");
+    build_graph(&mut g, &mut doc, &cands, true);
     let mut moved = false;
     for _ in 0..600 {
         moved = g.step(1);
@@ -180,7 +190,7 @@ fn focus_puts_subtree_on_a_tree_layout() {
     let mut doc = Doc::open(&p).unwrap();
     let cands = candidates(&mut doc);
     let mut g = Graph::new(Settings::default());
-    g.build(&mut doc, &cands, true, "sample.xirang");
+    build_graph(&mut g, &mut doc, &cands, true);
 
     let members: Vec<Uuid> = g.nodes.iter().map(|n| n.id).collect();
     let subtree = Graph::subtree(&mut doc, ids.link, &members);

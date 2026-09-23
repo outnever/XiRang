@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use xirang_core::codec::{Uuid, Value};
+use xirang_core::codec::{Node, Uuid, Value};
 
 use crate::lazy::Doc;
 
@@ -161,74 +161,82 @@ impl Graph {
         i
     }
 
-    /// 从文档建图：默认只收「有连接关系的节点」（引用源 + 目标），孤立节点按开关。
+    /// 建图：默认只收「有连接关系的节点」（引用源 + 目标），孤立节点按开关。
     ///
-    /// `candidates` 是候选节点（一般是当前树里已加载的那些）；`show_aux=false` 时跳过 `@` 节点。
+    /// `candidates` = (节点编号, 所在文件)；`resolve` 负责按编号取节点（可以跨多个已打开的文件，
+    /// 因此跨文件引用也能连成一张网）。`show_aux=false` 时跳过 `@` 节点。
     pub fn build(
         &mut self,
-        doc: &mut Doc,
-        candidates: &[Uuid],
+        candidates: &[(Uuid, String)],
         show_aux: bool,
-        file_label: &str,
+        resolve: &mut dyn FnMut(Uuid) -> Option<(Node, String)>,
     ) {
         self.nodes.clear();
         self.edges.clear();
         self.index.clear();
 
-        let mut refs: Vec<(Uuid, Uuid)> = Vec::new();
         let mut connected: HashSet<Uuid> = HashSet::new();
-        for id in candidates {
-            let Some(n) = doc.node(*id) else { continue };
-            if !show_aux && n.name.starts_with('@') {
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for (id, file) in candidates {
+            let Some((node, node_file)) = resolve(*id) else {
+                continue;
+            };
+            let target = match &node.value {
+                Value::Reference(t) => *t,
+                _ => continue,
+            };
+            let Some((tnode, tfile)) = resolve(target) else {
+                continue;
+            };
+            if !show_aux && (node.name.starts_with('@') || tnode.name.starts_with('@')) {
                 continue;
             }
-            if let Value::Reference(target) = n.value {
-                refs.push((n.id, target));
-                connected.insert(n.id);
-                connected.insert(target);
-            }
-        }
-        for (from, to) in &refs {
-            let (Some(a), Some(b)) = (doc.node(*from), doc.node(*to)) else { continue };
-            if !show_aux && (a.name.starts_with('@') || b.name.starts_with('@')) {
-                continue;
-            }
+            let file = if node_file.is_empty() { file.clone() } else { node_file };
             let ia = self.push(
-                a.id,
-                a.name.clone(),
-                file_label.to_string(),
-                a.name.starts_with('@'),
+                node.id,
+                node.name.clone(),
+                file,
+                node.name.starts_with('@'),
             );
             let ib = self.push(
-                b.id,
-                b.name.clone(),
-                file_label.to_string(),
-                b.name.starts_with('@'),
+                tnode.id,
+                tnode.name.clone(),
+                tfile,
+                tnode.name.starts_with('@'),
             );
-            self.edges.push((ia, ib));
+            edges.push(if ia <= ib { (ia, ib) } else { (ib, ia) });
             self.nodes[ia].degree += 1;
             self.nodes[ib].degree += 1;
+            connected.insert(node.id);
+            connected.insert(tnode.id);
         }
         if self.settings.show_orphans {
-            for id in candidates {
+            for (id, file) in candidates {
                 if connected.contains(id) {
                     continue;
                 }
-                if let Some(n) = doc.node(*id) {
+                if let Some((n, nfile)) = resolve(*id) {
                     if !show_aux && n.name.starts_with('@') {
                         continue;
                     }
                     self.push(
                         n.id,
                         n.name.clone(),
-                        file_label.to_string(),
+                        if nfile.is_empty() {
+                            file.clone()
+                        } else {
+                            nfile
+                        },
                         n.name.starts_with('@'),
                     );
                 }
             }
         }
-        self.edges.sort_unstable();
-        self.edges.dedup();
+        edges.sort_unstable();
+        edges.dedup();
+        for (a, b) in edges {
+            self.edges.push((a, b));
+        }
         self.alpha = if self.settings.animate { 0.0 } else { 1.0 };
     }
 

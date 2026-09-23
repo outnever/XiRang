@@ -21,3 +21,7 @@ archive/
 .exp/
 测试/
 .worktrees/
+
+# 打包产物（macOS .app）
+dist/
+app/target/

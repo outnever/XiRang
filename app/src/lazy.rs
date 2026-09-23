@@ -157,3 +157,16 @@ pub fn value_text(doc: &mut Doc, node: &Node) -> String {
         Value::Blob(b) => format!("[blob {} 字节]", b.len()),
     }
 }
+
+/// 可编辑文本：引用显示目标编号（而不是名字），blob 显示字节数。
+pub fn plain_value(v: &Value) -> String {
+    match v {
+        Value::Empty => String::new(),
+        Value::Int(n) => n.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Reference(t) => t.to_string(),
+        Value::Blob(b) => format!("[blob {} 字节]", b.len()),
+    }
+}

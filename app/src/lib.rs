@@ -5,4 +5,6 @@
 pub mod edit;
 pub mod graph;
 pub mod lazy;
+pub mod scan;
+pub mod state;
 pub mod view;

@@ -651,6 +651,22 @@ impl Sidecar {
         Ok(self.rev_roots.keys().next().copied())
     }
 
+    /// 全部根编号（基础块 + 追加进来的新根），只读编号、不解码节点。
+    pub fn all_roots(&mut self) -> Result<Vec<Uuid>, String> {
+        let mut out = Vec::new();
+        for i in 0..self.root_count {
+            out.push(read_uuid_at(&mut self.file, self.root_off + i * 32)?);
+        }
+        let mut extra: Vec<Uuid> = self.rev_roots.keys().copied().collect();
+        extra.sort_by(|a, b| a.0.cmp(&b.0));
+        for id in extra {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn find_assign(&mut self, id: Uuid) -> Result<Option<Uuid>, String> {
         if let Some(&ri) = self.rev_by_id.get(&id) {
             return Ok(Some(self.revs[ri].root));

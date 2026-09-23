@@ -23,3 +23,14 @@ jobs:
 
       - name: Rust 测试（交付实现）
         run: cargo test --manifest-path rust/Cargo.toml
+
+  desktop:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 桌面端编译检查（Rust + egui）
+        run: cargo check --manifest-path app/Cargo.toml
+
+      - name: 桌面端逻辑测试（懒加载 / 摊平 / 追加编辑）
+        run: cargo test --manifest-path app/Cargo.toml

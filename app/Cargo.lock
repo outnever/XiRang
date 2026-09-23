@@ -3206,8 +3206,10 @@ name = "xirang-app"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "png",
  "rfd",
  "xirang-core",
+ "zune-jpeg",
 ]
 
 [[package]]

@@ -158,6 +158,16 @@ fn view_state_roundtrip_and_recent() {
     st.touch_recent(std::path::Path::new("/tmp/甲.xirang"));
     assert_eq!(st.recent.first().unwrap(), "/tmp/甲.xirang");
     assert_eq!(st.recent.len(), 2, "不重复累积");
+
+    // 语言与配色也一起持久化
+    let mut st2 = ViewState::default();
+    st2.lang = "en".into();
+    st2.palette.bg = "#101010".into();
+    st2.palette.dark = false;
+    let back2 = ViewState::from_text(&st2.to_text());
+    assert_eq!(back2.lang, "en");
+    assert_eq!(back2.palette.bg, "#101010");
+    assert!(!back2.palette.dark);
 }
 
 /// 大文件实测（手动跑）：

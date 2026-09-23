@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use xirang_core::codec::Uuid;
 
+use crate::theme::Palette;
+
 #[derive(Clone, Debug, Default)]
 pub struct FileView {
     /// "indent" / "layered"
@@ -22,6 +24,10 @@ pub struct FileView {
 pub struct ViewState {
     pub recent: Vec<String>,
     pub files: HashMap<String, FileView>,
+    /// 界面语言："zh" / "en"
+    pub lang: String,
+    /// 配色
+    pub palette: Palette,
 }
 
 pub fn state_path() -> PathBuf {
@@ -85,7 +91,21 @@ impl ViewState {
     // —— 极简 JSON（只读写本文件需要的形状，避免引入额外依赖）——
 
     pub fn to_text(&self) -> String {
-        let mut out = String::from("{\"recent\":[");
+        let mut out = String::from("{\"lang\":");
+        out.push_str(&json_string(if self.lang.is_empty() { "zh" } else { &self.lang }));
+        out.push_str(",\"palette\":{\"dark\":");
+        out.push_str(if self.palette.dark { "true" } else { "false" });
+        out.push_str(",\"bg\":");
+        out.push_str(&json_string(&self.palette.bg));
+        out.push_str(",\"fg\":");
+        out.push_str(&json_string(&self.palette.fg));
+        out.push_str(",\"accent\":");
+        out.push_str(&json_string(&self.palette.accent));
+        out.push_str(",\"aux\":");
+        out.push_str(&json_string(&self.palette.aux));
+        out.push_str(",\"border\":");
+        out.push_str(&json_string(&self.palette.border));
+        out.push_str("},\"recent\":[");
         for (i, r) in self.recent.iter().enumerate() {
             if i > 0 {
                 out.push(',');
@@ -147,6 +167,26 @@ fn json_string(s: &str) -> String {
 /// 极简解析：只认自己写出来的形状（容错优先，认不出来就当空）。
 fn parse(text: &str) -> ViewState {
     let mut state = ViewState::default();
+    state.lang = find_string_field(text, "lang").unwrap_or_else(|| "zh".into());
+    if let Some(pal) = find_object_field(text, "palette") {
+        let pal = pal.as_str();
+        state.palette.dark = pal.contains("\"dark\":true");
+        if let Some(v) = find_string_field(pal, "bg") {
+            state.palette.bg = v;
+        }
+        if let Some(v) = find_string_field(pal, "fg") {
+            state.palette.fg = v;
+        }
+        if let Some(v) = find_string_field(pal, "accent") {
+            state.palette.accent = v;
+        }
+        if let Some(v) = find_string_field(pal, "aux") {
+            state.palette.aux = v;
+        }
+        if let Some(v) = find_string_field(pal, "border") {
+            state.palette.border = v;
+        }
+    }
     let Some(recent_start) = text.find("\"recent\":[") else {
         return state;
     };
@@ -205,6 +245,29 @@ fn find_string_field(obj: &str, name: &str) -> Option<String> {
         return None;
     }
     parse_string(rest, rest.find('"')?).map(|(s, _)| s)
+}
+
+/// 取一个嵌套对象的文本（`"palette":{...}`）——只认自己写出来的形状。
+fn find_object_field(text: &str, name: &str) -> Option<String> {
+    let key = format!("\"{name}\":{{");
+    let start = text.find(&key)? + key.len();
+    let mut depth = 1usize;
+    let bytes = text.as_bytes();
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[start..i].to_string());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn parse_string_array(body: &str) -> Vec<String> {

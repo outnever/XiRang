@@ -8,6 +8,9 @@ description = "息壤桌面阅读编辑工具（Rust + egui，依赖内核 v1.0�
 xirang-core = { path = "../rust/core" }
 eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts"] }
 rfd = "0.16"
+# 图片预览：只认 PNG / JPEG，按需解码（不把整张图常驻内存）
+png = "0.18"
+zune-jpeg = "0.5"
 
 [profile.dev]
 opt-level = 1

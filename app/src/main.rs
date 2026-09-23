@@ -13,16 +13,24 @@ use std::time::Instant;
 
 use eframe::egui;
 use xirang_core::codec::{parse_value, Node, Uuid, Value};
-use xirang_core::convert;
 use xirang_core::index::compact_file;
 use xirang_core::tree::Store;
 
 use xirang_app::edit;
+use xirang_app::blobimg;
+use xirang_app::export::{self, Scope};
 use xirang_app::graph::{Graph, Settings as GraphSettings};
+use xirang_app::i18n::{self, Lang};
 use xirang_app::lazy::{plain_value, Doc};
 use xirang_app::scan::{self, Query};
 use xirang_app::state::{FileView, ViewState};
+use xirang_app::theme::{self, Palette};
 use xirang_app::view::{flatten, Layout, Row, MAX_ROWS};
+
+/// 界面文案（跟着全局语言设置走）。
+fn t(zh: &'static str) -> &'static str {
+    i18n::t(zh)
+}
 
 const ROW_HEIGHT: f32 = 24.0;
 const IDLE_TRIM_SECS: f32 = 6.0;
@@ -128,12 +136,24 @@ struct App {
     idle_trimmed: bool,
     job: Option<Job>,
     show_export: bool,
+    /// 导出范围：0 = 完整折叠视图 · 1 = 当前视图（按展开态）· 2 = 选中子树
+    export_scope: usize,
+    show_palette: bool,
+    lang: Lang,
+    palette: Palette,
+    applied_palette: Option<Palette>,
+    /// 当前预览的图片（换选中节点 / 关文件时丢掉，显存及时还回去）
+    image: Option<(Uuid, egui::TextureHandle)>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let font_note =
             install_cjk_font(&cc.egui_ctx).unwrap_or_else(|| "未找到中文字体".to_string());
+        let state = ViewState::load();
+        let state_lang = state.lang.clone();
+        let state_palette = state.palette.clone();
+        i18n::set(Lang::from_str(&state_lang));
         let mut app = App {
             tabs: Vec::new(),
             active: 0,
@@ -165,11 +185,17 @@ impl App {
             query_kind: 0,
             results: Vec::new(),
             history: Vec::new(),
-            state: ViewState::load(),
+            state,
             last_interaction: Instant::now(),
             idle_trimmed: false,
             job: None,
             show_export: false,
+            export_scope: 0,
+            show_palette: false,
+            lang: Lang::from_str(&state_lang),
+            palette: state_palette,
+            applied_palette: None,
+            image: None,
         };
         let args: Vec<String> = std::env::args().skip(1).collect();
         if args.is_empty() {
@@ -302,6 +328,8 @@ impl App {
     }
 
     fn set_selected(&mut self, id: Option<Uuid>) {
+        // 换节点就把图片纹理丢掉（显存及时还给系统）
+        self.image = None;
         self.selected = id;
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.selected = id;
@@ -504,10 +532,28 @@ impl App {
     fn export(&mut self, fmt: &str) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let path = tab.path.clone();
+        let expanded = tab.expanded.clone();
+        let selected = tab.selected;
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "export".into());
+        let scope = match self.export_scope {
+            1 => Scope::View,
+            2 => match selected {
+                Some(id) => Scope::Subtree(id),
+                None => {
+                    self.error = Some("先选中一个节点再导出子树".into());
+                    return;
+                }
+            },
+            _ => Scope::Full,
+        };
+        let suffix = match scope {
+            Scope::Full => "",
+            Scope::View => "-current-view",
+            Scope::Subtree(_) => "-subtree",
+        };
         let ext = match fmt {
             "json" => "json",
             "xml" => "xml",
@@ -515,22 +561,27 @@ impl App {
             _ => "md",
         };
         let Some(target) = rfd::FileDialog::new()
-            .set_file_name(format!("{stem}.{ext}"))
+            .set_file_name(format!("{stem}{suffix}.{ext}"))
             .add_filter(fmt, &[ext])
             .save_file()
         else {
             return;
         };
-        match Store::load_view(&path) {
+        let built = match &scope {
+            Scope::Full => Store::load_view(&path),
+            other => {
+                let Some(tab) = self.tabs.get_mut(self.active) else { return };
+                export::build(&mut tab.doc, other, &expanded)
+            }
+        };
+        match built {
             Ok(store) => {
-                let text = match fmt {
-                    "json" => convert::to_json(&store),
-                    "xml" => convert::to_xml(&store),
-                    "yaml" => convert::to_yaml(&store),
-                    _ => convert::to_md(&store),
-                };
+                let n = store.len();
+                let text = export::to_text(&store, fmt);
                 match std::fs::write(&target, text) {
-                    Ok(()) => self.status = format!("已导出 {fmt} → {}", target.display()),
+                    Ok(()) => {
+                        self.status = format!("已导出 {fmt}（{n} 个节点）→ {}", target.display())
+                    }
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
@@ -632,19 +683,19 @@ impl App {
             .default_width(330.0)
             .show(ctx, |ui| {
                 let s = &mut self.graph_settings;
-                ui.heading("力");
-                ui.add(egui::Slider::new(&mut s.center_strength, 0.0..=1.0).step_by(0.01).text("图谱向心力"));
-                ui.add(egui::Slider::new(&mut s.repel_strength, 1.0..=30.0).text("节点间的排斥力"));
-                ui.add(egui::Slider::new(&mut s.link_strength, 0.0..=1.0).step_by(0.01).text("相连节点间的吸引力"));
-                ui.add(egui::Slider::new(&mut s.link_distance, 0.0..=500.0).text("连线长度"));
+                ui.heading(t("力"));
+                ui.add(egui::Slider::new(&mut s.center_strength, 0.0..=1.0).step_by(0.01).text(t("图谱向心力")));
+                ui.add(egui::Slider::new(&mut s.repel_strength, 1.0..=30.0).text(t("节点间的排斥力")));
+                ui.add(egui::Slider::new(&mut s.link_strength, 0.0..=1.0).step_by(0.01).text(t("相连节点间的吸引力")));
+                ui.add(egui::Slider::new(&mut s.link_distance, 0.0..=500.0).text(t("连线长度")));
                 ui.separator();
-                ui.heading("显示");
-                ui.add(egui::Slider::new(&mut s.text_fade_multiplier, -3.0..=3.0).step_by(0.1).text("文字淡入阈值"));
-                ui.add(egui::Slider::new(&mut s.node_size_multiplier, 0.5..=3.0).text("节点大小"));
-                ui.add(egui::Slider::new(&mut s.line_size_multiplier, 0.5..=3.0).text("连线粗细"));
-                ui.checkbox(&mut s.show_arrow, "显示箭头（放大后）");
-                ui.checkbox(&mut s.animate, "生长动画");
-                ui.checkbox(&mut s.show_orphans, "显示孤立节点");
+                ui.heading(t("显示"));
+                ui.add(egui::Slider::new(&mut s.text_fade_multiplier, -3.0..=3.0).step_by(0.1).text(t("文字淡入阈值")));
+                ui.add(egui::Slider::new(&mut s.node_size_multiplier, 0.5..=3.0).text(t("节点大小")));
+                ui.add(egui::Slider::new(&mut s.line_size_multiplier, 0.5..=3.0).text(t("连线粗细")));
+                ui.checkbox(&mut s.show_arrow, t("显示箭头（放大后）"));
+                ui.checkbox(&mut s.animate, t("生长动画"));
+                ui.checkbox(&mut s.show_orphans, t("显示孤立节点"));
                 ui.separator();
                 if ui.button("重置为默认").clicked() {
                     s.reset();
@@ -660,6 +711,81 @@ impl App {
                 g.settings = self.graph_settings.clone();
                 g.wake();
             }
+        }
+    }
+
+    /// 配色：暗 / 亮预设 + 自定义（背景 / 前景 / 强调色 / 辅助色 / 边框），写进用户配置。
+    fn palette_window(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut changed = false;
+        egui::Window::new(t("配色"))
+            .open(&mut open)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button(t("暗色")).clicked() {
+                        self.palette = Palette::default();
+                        changed = true;
+                    }
+                    if ui.button(t("亮色")).clicked() {
+                        self.palette = Palette::light();
+                        changed = true;
+                    }
+                });
+                ui.separator();
+                let mut bg = theme::parse_hex(&self.palette.bg).unwrap_or(egui::Color32::BLACK);
+                let mut fg = theme::parse_hex(&self.palette.fg).unwrap_or(egui::Color32::WHITE);
+                let mut accent =
+                    theme::parse_hex(&self.palette.accent).unwrap_or(egui::Color32::LIGHT_BLUE);
+                let mut aux =
+                    theme::parse_hex(&self.palette.aux).unwrap_or(egui::Color32::LIGHT_RED);
+                let mut border =
+                    theme::parse_hex(&self.palette.border).unwrap_or(egui::Color32::GRAY);
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgba(&mut bg);
+                    ui.label(t("背景"));
+                });
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgba(&mut fg);
+                    ui.label(t("前景"));
+                });
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgba(&mut accent);
+                    ui.label(t("强调色"));
+                });
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgba(&mut aux);
+                    ui.label(t("辅助节点色"));
+                });
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgba(&mut border);
+                    ui.label(t("边框"));
+                });
+                if changed
+                    || theme::to_hex(bg) != self.palette.bg
+                    || theme::to_hex(fg) != self.palette.fg
+                    || theme::to_hex(accent) != self.palette.accent
+                    || theme::to_hex(aux) != self.palette.aux
+                    || theme::to_hex(border) != self.palette.border
+                {
+                    self.palette.bg = theme::to_hex(bg);
+                    self.palette.fg = theme::to_hex(fg);
+                    self.palette.accent = theme::to_hex(accent);
+                    self.palette.aux = theme::to_hex(aux);
+                    self.palette.border = theme::to_hex(border);
+                    changed = true;
+                }
+                ui.separator();
+                if ui.button(t("重置为默认")).clicked() {
+                    self.palette = Palette::default();
+                    changed = true;
+                }
+                ui.weak("配色只存在用户配置里，不写进 .xirang");
+            });
+        self.show_palette = open;
+        if changed {
+            self.state.palette = self.palette.clone();
+            let _ = self.state.save();
         }
     }
 }
@@ -710,6 +836,11 @@ fn install_cjk_font(ctx: &egui::Context) -> Option<String> {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 配色变了就套上去（只在变化时做）
+        if self.applied_palette.as_ref() != Some(&self.palette) {
+            ctx.set_visuals(theme::visuals(&self.palette));
+            self.applied_palette = Some(self.palette.clone());
+        }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
             self.pick_files();
         }
@@ -717,7 +848,7 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("打开…").clicked() {
+                if ui.button(t("打开…")).clicked() {
                     self.pick_files();
                 }
                 if !self.tabs.is_empty() {
@@ -749,19 +880,24 @@ impl eframe::App for App {
                         self.validation.clear();
                         self.sync_inputs();
                     }
-                    if ui.button("关闭").clicked() {
+                    if ui.button(t("关闭")).clicked() {
                         let a = self.active;
                         self.close_tab(a);
                     }
                     ui.separator();
                 }
-                if ui.selectable_label(self.mode == ViewMode::Tree, "树").clicked()
+                if ui
+                    .selectable_label(self.mode == ViewMode::Tree, t("树"))
+                    .clicked()
                     && self.mode != ViewMode::Tree
                 {
                     self.mode = ViewMode::Tree;
-                    self.release_graph();
+        self.release_graph();
+        self.image = None;
                 }
-                if ui.selectable_label(self.mode == ViewMode::Graph, "引用图").clicked()
+                if ui
+                    .selectable_label(self.mode == ViewMode::Graph, t("引用图"))
+                    .clicked()
                     && self.mode != ViewMode::Graph
                 {
                     self.mode = ViewMode::Graph;
@@ -772,7 +908,7 @@ impl eframe::App for App {
                 if ui
                     .add_enabled(
                         layout.is_some(),
-                        egui::Button::selectable(layout == Some(Layout::Indent), "横向缩进"),
+                        egui::Button::selectable(layout == Some(Layout::Indent), t("横向缩进")),
                     )
                     .clicked()
                 {
@@ -784,7 +920,7 @@ impl eframe::App for App {
                 if ui
                     .add_enabled(
                         layout.is_some(),
-                        egui::Button::selectable(layout == Some(Layout::Layered), "纵向分层"),
+                        egui::Button::selectable(layout == Some(Layout::Layered), t("纵向分层")),
                     )
                     .clicked()
                 {
@@ -793,15 +929,28 @@ impl eframe::App for App {
                     }
                     self.rows_dirty = true;
                 }
-                if self.mode == ViewMode::Graph && ui.button("图设置").clicked() {
+                if self.mode == ViewMode::Graph && ui.button(t("图设置")).clicked() {
                     self.show_settings = !self.show_settings;
                 }
                 ui.separator();
-                if ui.checkbox(&mut self.show_aux, "辅助节点").changed() {
+                if ui.checkbox(&mut self.show_aux, t("辅助节点")).changed() {
                     self.rows_dirty = true;
                     self.graph_dirty = true;
                 }
-                ui.checkbox(&mut self.readonly, "只读");
+                ui.checkbox(&mut self.readonly, t("只读"));
+                if ui
+                    .button(t("中文 / EN"))
+                    .on_hover_text("切换界面语言 / Switch UI language")
+                    .clicked()
+                {
+                    self.lang = self.lang.toggle();
+                    i18n::set(self.lang);
+                    self.state.lang = self.lang.as_str().to_string();
+                    let _ = self.state.save();
+                }
+                if ui.button(t("配色")).on_hover_text("暗 / 亮 / 自定义").clicked() {
+                    self.show_palette = !self.show_palette;
+                }
                 ui.separator();
                 let (can_undo, can_redo) = self
                     .tabs
@@ -809,7 +958,10 @@ impl eframe::App for App {
                     .and_then(|t| t.editor.as_ref())
                     .map(|e| (e.can_undo(), e.can_redo()))
                     .unwrap_or((false, false));
-                if ui.add_enabled(can_undo, egui::Button::new("撤销")).clicked() {
+                if ui
+                    .add_enabled(can_undo, egui::Button::new(t("撤销")))
+                    .clicked()
+                {
                     let r = self
                         .tabs
                         .get_mut(self.active)
@@ -821,7 +973,10 @@ impl eframe::App for App {
                         _ => {}
                     }
                 }
-                if ui.add_enabled(can_redo, egui::Button::new("重做")).clicked() {
+                if ui
+                    .add_enabled(can_redo, egui::Button::new(t("重做")))
+                    .clicked()
+                {
                     let r = self
                         .tabs
                         .get_mut(self.active)
@@ -840,35 +995,38 @@ impl eframe::App for App {
                 ui.add_enabled(
                     !busy && has_file,
                     egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("搜索节点")
+                        .hint_text(t("搜索节点"))
                         .desired_width(170.0),
                 );
                 egui::ComboBox::from_id_salt("query_kind")
-                    .selected_text(["名字", "值", "类型"][self.query_kind.min(2)])
+                    .selected_text([t("名字"), t("值"), t("类型")][self.query_kind.min(2)])
                     .width(70.0)
                     .show_ui(ui, |ui| {
                         for (i, k) in ["名字", "值", "类型"].iter().enumerate() {
-                            ui.selectable_value(&mut self.query_kind, i, *k);
+                            ui.selectable_value(&mut self.query_kind, i, t(k));
                         }
                     });
-                if ui.add_enabled(!busy && has_file, egui::Button::new("搜索")).clicked() {
+                if ui
+                    .add_enabled(!busy && has_file, egui::Button::new(t("搜索")))
+                    .clicked()
+                {
                     self.start_search();
                 }
-                if ui.add_enabled(!busy && has_file, egui::Button::new("校验")).clicked() {
+                if ui
+                    .add_enabled(!busy && has_file, egui::Button::new(t("校验")))
+                    .clicked()
+                {
                     self.start_validate();
                 }
-                if busy && ui.button("取消").clicked() {
+                if busy && ui.button(t("取消")).clicked() {
                     self.cancel_job();
                 }
                 ui.separator();
-                if ui
-                    .add_enabled(has_file, egui::Button::new("导出 ▾"))
-                    .clicked()
-                {
+                if ui.add_enabled(has_file, egui::Button::new(t("导出 ▾"))).clicked() {
                     self.show_export = true;
                 }
                 if ui
-                    .add_enabled(has_file, egui::Button::new("合并"))
+                    .add_enabled(has_file, egui::Button::new(t("合并")))
                     .on_hover_text("折叠掉同一编号的历史记录（整份重写，大文件要十几秒）")
                     .clicked()
                 {
@@ -880,7 +1038,7 @@ impl eframe::App for App {
                             .get(self.active)
                             .map(|t| t.doc.cache_len() > 0)
                             .unwrap_or(false),
-                        egui::Button::new("释放缓存"),
+                        egui::Button::new(t("释放缓存")),
                     )
                     .clicked()
                 {
@@ -1047,6 +1205,30 @@ impl eframe::App for App {
                 if let Value::Blob(bytes) = &node.value {
                     ui.separator();
                     ui.label(format!("二进制块 {} 字节", bytes.len()));
+                    // 能认出来的图片就画出来（PNG / JPEG）；换节点 / 关文件时纹理会被丢掉
+                    let already = self.image.as_ref().map(|(id, _)| *id) == Some(node.id);
+                    let decoded = if already {
+                        true
+                    } else if let Some((w, h, rgba)) = blobimg::decode(bytes) {
+                        let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                        let tex = ui.ctx().load_texture(
+                            "blob-preview",
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.image = Some((node.id, tex));
+                        true
+                    } else {
+                        self.image = None;
+                        false
+                    };
+                    if decoded {
+                        if let Some((_, tex)) = self.image.as_ref() {
+                            let size = tex.size_vec2();
+                            let scale = (300.0 / size.x.max(1.0)).min(1.0);
+                            ui.image((tex.id(), size * scale));
+                        }
+                    }
                     let head: Vec<String> =
                         bytes.iter().take(24).map(|b| format!("{b:02x}")).collect();
                     ui.monospace(head.join(" "));
@@ -1103,10 +1285,15 @@ impl eframe::App for App {
         }
         if self.show_export {
             let mut open = true;
-            egui::Window::new("导出")
+            egui::Window::new(t("导出"))
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    ui.label("导出的是「折叠视图」（同编号只留最后一条）");
+                    ui.label(t("导出的是「折叠视图」（同编号只留最后一条）"));
+                    ui.separator();
+                    ui.radio_value(&mut self.export_scope, 0, t("完整折叠视图"));
+                    ui.radio_value(&mut self.export_scope, 1, t("当前视图"));
+                    ui.radio_value(&mut self.export_scope, 2, t("选中子树"));
+                    ui.separator();
                     for fmt in ["json", "xml", "yaml", "md"] {
                         if ui.button(format!("导出为 {fmt}")).clicked() {
                             self.export(fmt);
@@ -1114,6 +1301,9 @@ impl eframe::App for App {
                     }
                 });
             self.show_export = open;
+        }
+        if self.show_palette {
+            self.palette_window(ctx);
         }
         self.maybe_idle_trim(ctx);
     }
@@ -1146,6 +1336,7 @@ impl App {
             .unwrap_or(Layout::Indent);
         let selected = self.selected_id();
         let rows = self.rows.clone();
+        let aux_col = theme::aux_color(&self.palette);
         let mut toggle: Option<Uuid> = None;
         let mut select: Option<Uuid> = None;
         egui::ScrollArea::vertical()
@@ -1175,7 +1366,15 @@ impl App {
                         } else {
                             format!("{name} = {}", row.value)
                         };
-                        if ui.selectable_label(selected == Some(row.id), text).clicked() {
+                        let label = if row.is_aux {
+                            egui::RichText::new(text).color(aux_col)
+                        } else {
+                            egui::RichText::new(text)
+                        };
+                        if ui
+                            .selectable_label(selected == Some(row.id), label)
+                            .clicked()
+                        {
                             select = Some(row.id);
                         }
                     });

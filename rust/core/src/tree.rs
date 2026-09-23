@@ -13,6 +13,9 @@ use crate::codec::{self, Node, Uuid, Value};
 
 pub const MAGIC: &[u8; 4] = b"XRNG";
 pub const FORMAT_VERSION: u8 = 1;
+/// 协议标记（辅助节点 `@protocol` 的值）：同一文件里「同编号多记录 = 修订，后写覆盖」。
+/// 见 `spec/协议.md` 的 `append-v1`。
+pub const PROTOCOL_APPEND: &str = "append-v1";
 /// 文件头：纯英文自描述文本，与 README 第 4 节、tools/tree.py 完全一致。
 pub const HEADER: &str = include_str!("header.txt");
 
@@ -501,6 +504,88 @@ impl Store {
         let nodes = parse_file(&data)?;
         Store::decode(nodes).map_err(codec_error)
     }
+
+    /// 读回「折叠视图」：同编号只留最后一条记录（后写覆盖），供 `append-v1` 文件使用。
+    /// 没有重复编号的文件与 `load` 结果完全一致。
+    pub fn load_view(path: &Path) -> Result<Store, String> {
+        Ok(fold(&Store::load(path)?))
+    }
+
+    /// 该节点沿父边向上找到的根（原始记录视角；父链断裂或成环时回到自身）。
+    pub fn root_of(&self, id: Uuid) -> Option<Uuid> {
+        let mut cur = id;
+        let mut guard = 0usize;
+        loop {
+            let n = self.get(cur)?;
+            match n.parent {
+                None => return Some(n.id),
+                Some(p) => {
+                    if p == n.id || !self.index.contains_key(&p) {
+                        return Some(n.id);
+                    }
+                    guard += 1;
+                    if guard > 1_000_000 {
+                        return Some(n.id);
+                    }
+                    cur = p;
+                }
+            }
+        }
+    }
+
+    /// 根下是否挂了 `@protocol = <name>`（协议声明靠内容探测，不依赖侧车索引）。
+    pub fn declares_protocol(&self, root: Uuid, name: &str) -> bool {
+        match self.get(root) {
+            Some(r) => self
+                .children(r)
+                .into_iter()
+                .any(|c| c.name == "@protocol" && c.value == Value::Text(name.to_string())),
+            None => false,
+        }
+    }
+
+    /// 全部声明了 `@protocol = <name>` 的根。
+    pub fn protocol_roots(&self, name: &str) -> Vec<Uuid> {
+        self.roots()
+            .into_iter()
+            .filter(|r| self.declares_protocol(r.id, name))
+            .map(|r| r.id)
+            .collect()
+    }
+}
+
+/// 折叠：同一编号只留最后一条记录（后写覆盖），空名空值 = 空槽位（保留）。
+/// 输出按「首次出现位置」排序，保证子节点顺序稳定。
+pub fn fold(store: &Store) -> Store {
+    let mut first: HashMap<Uuid, usize> = HashMap::new();
+    let mut current: HashMap<Uuid, Node> = HashMap::new();
+    for (i, n) in store.nodes().iter().enumerate() {
+        first.entry(n.id).or_insert(i);
+        current.insert(n.id, n.clone());
+    }
+    let mut items: Vec<(usize, Node)> =
+        current.into_iter().map(|(id, n)| (first[&id], n)).collect();
+    items.sort_by_key(|(p, _)| *p);
+    let mut out = Store::new();
+    for (_, n) in items {
+        out.add(n);
+    }
+    out
+}
+
+/// 节点数据段在文件里的绝对起始偏移（魔数 4 + 版本 1 + 头长 4 + 头文本）。
+pub fn node_data_start(data: &[u8]) -> Result<u64, String> {
+    if data.len() < 9 {
+        return Err("F004：文件截断（头部不完整）".into());
+    }
+    if &data[..4] != MAGIC {
+        return Err("F001：魔数非法（不是 XRNG 息壤文件）".into());
+    }
+    let n = u32::from_be_bytes(data[5..9].try_into().unwrap()) as u64;
+    if 9 + n > data.len() as u64 {
+        return Err("F003：头长非法".into());
+    }
+    Ok(9 + n)
 }
 
 /// 复制子树的选项。
@@ -936,5 +1021,62 @@ mod tests {
         let snaps = s.children(hist);
         let snap = snaps.last().unwrap();
         assert_eq!(snap.name, "甲");
+    }
+
+    #[test]
+    fn fold_keeps_last_record_and_first_position() {
+        let mut s = Store::new();
+        let root = s.create(None, "根", Value::Empty, false).id;
+        let a = s.create(Some(root), "甲", Value::Text("旧".into()), false).id;
+        let b = s.create(Some(root), "乙", Value::Empty, false).id;
+        // 追加一条「甲」的修订（同编号、后写覆盖）
+        s.add(n(a, Some(root), "甲", Value::Text("新".into())));
+
+        let folded = fold(&s);
+        assert_eq!(folded.len(), 3, "折叠后只应有 3 个编号");
+        assert_eq!(folded.get(a).unwrap().value, Value::Text("新".into()));
+        // 顺序按首次出现位置：根、甲、乙（修订不改变位置）
+        let ids: Vec<Uuid> = folded.nodes().iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec![root, a, b]);
+        // 孩子不重复
+        assert_eq!(folded.children(folded.get(root).unwrap()).len(), 2);
+    }
+
+    #[test]
+    fn fold_handles_empty_slot_and_parent_move() {
+        let mut s = Store::new();
+        let root = s.create(None, "根", Value::Empty, false).id;
+        let other = s.create(None, "另一个根", Value::Empty, false).id;
+        let a = s.create(Some(root), "甲", Value::Text("值".into()), false).id;
+        // 删（置空）+ 迁移父节点
+        s.add(n(a, Some(root), "", Value::Empty));
+        s.add(n(a, Some(other), "甲", Value::Text("搬家".into())));
+
+        let folded = fold(&s);
+        assert_eq!(folded.children(folded.get(root).unwrap()).len(), 0);
+        assert_eq!(folded.children(folded.get(other).unwrap()).len(), 1);
+        assert_eq!(folded.get(a).unwrap().value, Value::Text("搬家".into()));
+    }
+
+    #[test]
+    fn protocol_detection_reads_marker_node() {
+        let mut s = Store::new();
+        let root = s.create(None, "根", Value::Empty, false).id;
+        let plain = s.create(None, "普通根", Value::Empty, false).id;
+        s.create(Some(root), "@protocol", Value::Text(PROTOCOL_APPEND.into()), false);
+
+        assert!(s.declares_protocol(root, PROTOCOL_APPEND));
+        assert!(!s.declares_protocol(plain, PROTOCOL_APPEND));
+        assert_eq!(s.protocol_roots(PROTOCOL_APPEND), vec![root]);
+        assert_eq!(s.root_of(root), Some(root));
+    }
+
+    #[test]
+    fn node_data_start_matches_make_file() {
+        let mut s = Store::new();
+        s.create(None, "根", Value::Empty, false);
+        let bytes = make_file(&s.encode().unwrap());
+        let start = node_data_start(&bytes).unwrap() as usize;
+        assert_eq!(&bytes[start..], parse_file(&bytes).unwrap());
     }
 }

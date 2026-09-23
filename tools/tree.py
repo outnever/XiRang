@@ -28,6 +28,8 @@ from tools.codec import Node
 # 注意：文件头只做「描述」，不内嵌任何可执行代码（安全原因见 README 的「⚠️ 安全提醒」节）。
 MAGIC = b"XRNG"       # 文件魔数：4 个 ASCII 字节
 FORMAT_VERSION = 1    # 文件格式版本（1 字节，单调递增）
+# 协议标记（辅助节点 `@protocol` 的值）：同一文件里「同编号多记录 = 修订，后写覆盖」。
+PROTOCOL_APPEND = "append-v1"
 
 HEADER = (
     "XiRang Tree v1.0\n"
@@ -269,6 +271,53 @@ class Store:
         """读回：剥掉魔数 + 版本 + 头，再解析节点。"""
         with open(path, "rb") as f:
             return cls.decode(_parse_file(f.read()))
+
+    # —— append-v1（修订v1）：折叠读 + 协议声明 ——
+
+    def fold(self):
+        """折叠：同一编号只留最后一条记录（后写覆盖）；顺序按「首次出现位置」。"""
+        first = {}
+        current = {}
+        for i, nid in enumerate(self._order):
+            first.setdefault(nid, i)
+            current[nid] = self._nodes[nid]
+        items = sorted(((first[nid], n) for nid, n in current.items()), key=lambda p: p[0])
+        out = Store()
+        for _, n in items:
+            out.add(n)
+        return out
+
+    @classmethod
+    def load_view(cls, path):
+        """读回「折叠视图」：同编号只留最后一条（append-v1 的读法）。"""
+        return cls.load(path).fold()
+
+    def root_of(self, node_id):
+        """沿父边向上找到的根（父链断裂或成环时回到自身）。"""
+        cur = node_id
+        seen = set()
+        while True:
+            n = self._nodes.get(cur)
+            if n is None:
+                return None
+            if n.parent is None or n.parent == n.id or n.parent not in self._nodes or cur in seen:
+                return n.id
+            seen.add(cur)
+            cur = n.parent
+
+    def declares_protocol(self, root_id, name):
+        """根下是否挂了 `@protocol = <name>`（靠内容探测，不依赖侧车索引）。"""
+        root = self._nodes.get(root_id)
+        if root is None:
+            return False
+        return any(
+            c.name == "@protocol" and c.value == (codec.TEXT, name)
+            for c in self.children(root)
+        )
+
+    def protocol_roots(self, name):
+        """全部声明了 `@protocol = <name>` 的根。"""
+        return [r.id for r in self.roots() if self.declares_protocol(r.id, name)]
 
 
 def walk(store, root, skip_aux=False):

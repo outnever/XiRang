@@ -29,8 +29,8 @@ PAIRS = [
     ("README.md", "spec/息壤文档.xirang", ["协议", "CLI", "MCP", "Skill", "rust/core", "rust/cli", "app", "255"]),
     ("spec/模板.md", "spec/模板.xirang", ["注释式", "@实例", "@模板", "格式转换"]),
     ("spec/版本规范.md", "spec/版本规范.xirang", ["shard-v1", "catalog-v1", "xirang-core", "xirang-app", "XRCAT", "XRIDX"]),
-    ("spec/协议.md", "spec/协议.xirang", ["shard-v1", "catalog-v1", "XRIDX", "分片清单", "磁盘二分"]),
-    ("errors/错误列表.md", "errors/错误列表.xirang", ["F009", "F010", "F011", "W001", "W008", "预留"]),
+    ("spec/协议.md", "spec/协议.xirang", ["shard-v1", "append-v1", "catalog-v1", "XRIDX", "分片清单", "磁盘二分"]),
+    ("errors/错误列表.md", "errors/错误列表.xirang", ["F009", "F010", "F011", "F012", "W001", "W008", "预留"]),
 ]
 
 

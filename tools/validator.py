@@ -22,6 +22,7 @@ import uuid
 from dataclasses import dataclass
 
 from tools import codec
+from tools import tree
 
 
 @dataclass
@@ -127,4 +128,24 @@ def validate(nodes) -> list:
     # 父节点成环
     errors.extend(_check_cycles(nodes, index))
 
+    return errors
+
+
+def validate_view(store) -> list:
+    """折叠视图校验（append-v1）：先按「同编号取最后一条」折叠，再跑结构校验。
+
+    声明了 `@protocol = append-v1` 的根下，重复编号 = 修订，**不报 E002**；
+    未声明的根下出现重复编号 = 真冲突，仍然报 E002。
+    """
+    folded = store.fold()
+    errors = validate(folded.nodes())
+
+    counts = {}
+    for n in store.nodes():
+        counts[n.id] = counts.get(n.id, 0) + 1
+    for nid in sorted((k for k, v in counts.items() if v > 1), key=lambda u: u.bytes):
+        root = store.root_of(nid) or nid
+        if store.declares_protocol(root, tree.PROTOCOL_APPEND):
+            continue
+        errors.append(Error("E002", str(nid), "编号冲突（与另一节点相同）"))
     return errors

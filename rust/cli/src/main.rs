@@ -216,7 +216,7 @@ fn cmd_info(file: &str) -> i32 {
 }
 
 fn cmd_tree(file: &str, node_id: Option<&str>, opts: &TreeOpts, head: Option<usize>, no_pager: bool) -> i32 {
-    let store = match tree::Store::load(Path::new(file)) {
+    let store = match tree::Store::load_view(Path::new(file)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("错误：{e}");
@@ -269,7 +269,7 @@ fn cmd_tree(file: &str, node_id: Option<&str>, opts: &TreeOpts, head: Option<usi
 /// 扁平视图：按文件里的存放顺序，一行一个节点（不缩进）。像浏览文本文件一样看。
 fn cmd_cat(file: &str, opts: &TreeOpts, head: Option<usize>, force: bool, no_pager: bool) -> i32 {
     const GUARD: usize = 100_000;
-    let store = match tree::Store::load(Path::new(file)) {
+    let store = match tree::Store::load_view(Path::new(file)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("错误：{e}");
@@ -311,7 +311,7 @@ fn cmd_cat(file: &str, opts: &TreeOpts, head: Option<usize>, force: bool, no_pag
 }
 
 fn cmd_validate(file: &str) -> i32 {
-    let store = match tree::Store::load(Path::new(file)) {
+    let store = match tree::Store::load_view(Path::new(file)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("错误：{e}");
@@ -319,7 +319,7 @@ fn cmd_validate(file: &str) -> i32 {
         }
     };
     index_store(file, &store);
-    let errs = validator::validate(store.nodes());
+    let errs = validator::validate_view(&store);
     if errs.is_empty() {
         println!("校验通过：0 错误");
         return 0;
@@ -334,7 +334,7 @@ fn cmd_validate(file: &str) -> i32 {
 // 值解析统一走核心库（codec::parse_value），避免 CLI / 桌面 / MCP 三处各写一份、行为分叉。
 
 fn load_store(file: &str) -> Result<tree::Store, i32> {
-    match tree::Store::load(Path::new(file)) {
+    match tree::Store::load_view(Path::new(file)) {
         Ok(store) => {
             index_store(file, &store);
             Ok(store)
@@ -394,7 +394,7 @@ fn index_file(file: &str) {
     if catalog::Catalog::is_fresh(&catalog::default_path(), &abs, fp) {
         return;
     }
-    if let Ok(store) = tree::Store::load(p) {
+    if let Ok(store) = tree::Store::load_view(p) {
         index_store(file, &store);
     }
 }
@@ -423,7 +423,7 @@ fn load_shard(dir: &Path, id: Uuid) -> Result<(tree::Store, PathBuf), i32> {
         }
     };
     let path = dir.join(&filename);
-    let raw = match tree::Store::load(&path) {
+    let raw = match tree::Store::load_view(&path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("错误：{e}");
@@ -1581,7 +1581,7 @@ fn cmd_index(files: &[String]) -> i32 {
 }
 
 fn cmd_collection_split(file: &str, rule: &str, out: &Path) -> i32 {
-    let store = match tree::Store::load(Path::new(file)) {
+    let store = match tree::Store::load_view(Path::new(file)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("错误：{e}");
@@ -1631,7 +1631,25 @@ fn cmd_collection_list(dir: &str) -> i32 {
 }
 
 fn cmd_compact(dir: &str, all: bool) -> i32 {
-    let mstore = match tree::Store::load(&Path::new(dir).join(shard::MANIFEST_NAME)) {
+    // 单文件：折叠掉 append-v1 累积的历史记录（整份重写 = 顺手合并）
+    let plain = Path::new(dir);
+    if plain.is_file() {
+        return match index::compact_file(plain) {
+            Ok((raw, folded)) => {
+                println!("已合并：{dir}");
+                println!(
+                    "  记录: {raw} → {folded}（折叠掉 {} 条历史记录）",
+                    raw.saturating_sub(folded)
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("错误：{e}");
+                2
+            }
+        };
+    }
+    let mstore = match tree::Store::load_view(&Path::new(dir).join(shard::MANIFEST_NAME)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("错误：{e}");
@@ -1648,7 +1666,7 @@ fn cmd_compact(dir: &str, all: bool) -> i32 {
     let mut compacted = 0;
     for e in &manifest.shards {
         let path = Path::new(dir).join(&e.filename);
-        let raw = match tree::Store::load(&path) {
+        let raw = match tree::Store::load_view(&path) {
             Ok(s) => s,
             Err(err) => {
                 eprintln!("错误：{err}");
@@ -1716,7 +1734,7 @@ fn cmd_catalog_scan(paths: &[String]) -> i32 {
     }
     let mut indexed = 0usize;
     for t in &targets {
-        let store = match tree::Store::load(t) {
+        let store = match tree::Store::load_view(t) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("跳过 {}：{e}", t.display());
@@ -1841,7 +1859,7 @@ fn cmd_catalog_check_sync(uuid_str: &str, base: &str) -> i32 {
         }
     };
     let base_abs = abs_str(Path::new(base));
-    let base_store = match tree::Store::load(Path::new(base)) {
+    let base_store = match tree::Store::load_view(Path::new(base)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("错误：{e}");
@@ -1871,7 +1889,7 @@ fn cmd_catalog_check_sync(uuid_str: &str, base: &str) -> i32 {
         if f == &base_abs {
             continue;
         }
-        let mut store = match tree::Store::load(Path::new(f)) {
+        let mut store = match tree::Store::load_view(Path::new(f)) {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -2246,7 +2264,7 @@ fn cmd_export(file: &str, format: &str, subtree: Option<&str>) -> i32 {
 
 fn cmd_import(file: &str, format: &str, source: &str) -> i32 {
     // 导入是「整文件替换」：先记下原节点数，输出里说清楚，避免静默覆盖。
-    let before = tree::Store::load(Path::new(file)).ok().map(|s| s.len());
+    let before = tree::Store::load_view(Path::new(file)).ok().map(|s| s.len());
     let text = match std::fs::read_to_string(source) {
         Ok(t) => t,
         Err(e) => {

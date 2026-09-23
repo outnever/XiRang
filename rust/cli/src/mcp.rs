@@ -68,7 +68,7 @@ fn node_json_rec(
 }
 
 fn load_store(path: &str) -> Result<tree::Store, String> {
-    tree::Store::load(Path::new(path)).map_err(|e| e.to_string())
+    tree::Store::load_view(Path::new(path)).map_err(|e| e.to_string())
 }
 
 // ============================================================================
@@ -174,7 +174,7 @@ fn cmd_instances(args: &Value) -> Result<Value, String> {
 fn cmd_validate(args: &Value) -> Result<Value, String> {
     let file = args["file"].as_str().ok_or("缺 file")?;
     let store = load_store(file)?;
-    let errs = validator::validate(store.nodes());
+    let errs = validator::validate_view(&store);
     let arr: Vec<Value> = errs
         .into_iter()
         .map(|e| json!({"code": e.code, "node": e.node_id.to_string(), "message": e.message}))

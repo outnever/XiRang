@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::codec::{Node, Uuid, Value};
+use crate::tree::{self, Store};
 
 /// 校验错误。
 #[derive(Debug, PartialEq, Clone)]
@@ -111,6 +112,38 @@ pub fn validate(nodes: &[Node]) -> Vec<Error> {
     errors
 }
 
+/// 折叠视图校验（`append-v1`）：先按「同编号取最后一条」折叠，再跑结构校验。
+///
+/// 声明了 `@protocol = append-v1` 的根下，重复编号 = 修订，**不报 E002**；
+/// 未声明的根下出现重复编号 = 真冲突，仍然报 E002。
+pub fn validate_view(store: &Store) -> Vec<Error> {
+    let folded = tree::fold(store);
+    let mut errors = validate(&folded.nodes());
+
+    let mut counts: HashMap<Uuid, usize> = HashMap::new();
+    for n in store.nodes() {
+        *counts.entry(n.id).or_insert(0) += 1;
+    }
+    let mut dup_ids: Vec<Uuid> = counts
+        .iter()
+        .filter(|(_, c)| **c > 1)
+        .map(|(id, _)| *id)
+        .collect();
+    dup_ids.sort_by(|a, b| a.0.cmp(&b.0));
+    for id in dup_ids {
+        let root = store.root_of(id).unwrap_or(id);
+        if store.declares_protocol(root, tree::PROTOCOL_APPEND) {
+            continue;
+        }
+        errors.push(Error {
+            code: "E002",
+            node_id: id,
+            message: "编号冲突（与另一节点相同）".into(),
+        });
+    }
+    errors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +231,67 @@ mod tests {
         let nodes = vec![n(a, None, Value::Reference(ghost))];
         let errs = validate(&nodes);
         assert!(errs.iter().any(|e| e.code == "R001"));
+    }
+
+    fn named(id: Uuid, parent: Option<Uuid>, name: &str, value: Value) -> Node {
+        Node {
+            id,
+            parent,
+            name: name.into(),
+            value,
+        }
+    }
+
+    fn manifest(id: Uuid, parent: Uuid) -> Node {
+        named(
+            id,
+            Some(parent),
+            "@protocol",
+            Value::Text(tree::PROTOCOL_APPEND.into()),
+        )
+    }
+
+    #[test]
+    fn append_view_allows_declared_revisions() {
+        let [a, b, c, ..] = ids();
+        let mut s = Store::new();
+        s.add(named(a, None, "根", Value::Empty));
+        s.add(manifest(c, a));
+        s.add(named(b, Some(a), "词形", Value::Text("灯".into())));
+        s.add(named(b, Some(a), "词形", Value::Text("灯（改）".into()))); // 修订
+
+        assert!(
+            validate_view(&s).is_empty(),
+            "声明了修订协议的根下，重复编号是修订，不算冲突"
+        );
+        assert!(
+            validate(s.nodes()).iter().any(|e| e.code == "E002"),
+            "原始记录视角仍然能看到重复编号"
+        );
+    }
+
+    #[test]
+    fn undeclared_duplicates_still_conflict_in_view() {
+        let [a, b, ..] = ids();
+        let mut s = Store::new();
+        s.add(named(a, None, "根", Value::Empty));
+        s.add(named(b, Some(a), "词形", Value::Text("灯".into())));
+        s.add(named(b, Some(a), "词形", Value::Text("灯（改）".into())));
+        assert!(validate_view(&s).iter().any(|e| e.code == "E002"));
+    }
+
+    #[test]
+    fn append_view_accepts_empty_slot_from_delete() {
+        let [a, b, c, ..] = ids();
+        let mut s = Store::new();
+        s.add(named(a, None, "根", Value::Empty));
+        s.add(manifest(c, a));
+        s.add(named(b, Some(a), "词形", Value::Text("灯".into())));
+        s.add(named(b, Some(a), "", Value::Empty)); // 删 = 追加一条空记录
+
+        let folded = tree::fold(&s);
+        assert_eq!(folded.get(b).unwrap().value, Value::Empty);
+        assert!(folded.get(b).unwrap().name.is_empty());
+        assert!(validate_view(&s).is_empty());
     }
 }

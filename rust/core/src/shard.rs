@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::codec::{self, Node, Uuid, Value};
-use crate::tree::Store;
+use crate::tree::{self, Store};
 
 pub const PROTOCOL: &str = "shard-v1";
 pub const MANIFEST_NAME: &str = "manifest.xirang";
@@ -180,20 +180,7 @@ pub fn split(store: &Store, rule: &ShardRule) -> Result<Vec<(Uuid, Store)>, Stri
 /// 折叠：同一 UUID 后写覆盖（last-write-wins），空名空值 = 空槽位（保留）。
 /// 输出按「首次出现位置」排序，保证子节点顺序稳定。
 pub fn fold(store: &Store) -> Store {
-    let mut first: HashMap<Uuid, usize> = HashMap::new();
-    let mut current: HashMap<Uuid, Node> = HashMap::new();
-    for (i, n) in store.nodes().iter().enumerate() {
-        first.entry(n.id).or_insert(i);
-        current.insert(n.id, n.clone());
-    }
-    let mut items: Vec<(usize, Node)> =
-        current.into_iter().map(|(id, n)| (first[&id], n)).collect();
-    items.sort_by_key(|(p, _)| *p);
-    let mut out = Store::new();
-    for (_, n) in items {
-        out.add(n);
-    }
-    out
+    tree::fold(store)
 }
 
 /// 追加一条修订记录到分片文件末尾（同 UUID 后写覆盖；空名空值 = 置空）。

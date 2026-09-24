@@ -119,3 +119,36 @@ fn physics_thread_feeds_positions() {
     assert_eq!(g.node_count(), 2);
     assert_eq!(g.link_count(), 1);
 }
+
+/// 「按根聚合」：引用边折算成**根之间**的边（对应 Obsidian 的「一篇笔记 = 一个节点」）。
+#[test]
+fn root_edges_aggregate_by_top_level_root() {
+    use xirang_app::lazy::Doc;
+    use xirang_core::codec::Value;
+    use xirang_core::index::sidecar_path;
+    use xirang_core::tree::Store;
+
+    let path = std::env::temp_dir().join(format!("xr_rootedges_{}.xirang", Uuid::random_v4()));
+    let mut s = Store::new();
+    // 两个词条（根），各自一个节点指向对方 → 应当得到一条「根 ↔ 根」的边
+    let a = s.create(None, "词条甲", Value::Empty, false).id;
+    let b = s.create(None, "词条乙", Value::Empty, false).id;
+    let a_child = s.create(Some(a), "指向乙", Value::Empty, false).id;
+    let b_child = s.create(Some(b), "指向甲", Value::Empty, false).id;
+    s.update(a_child, Value::Reference(b_child)).unwrap();
+    s.update(b_child, Value::Reference(a_child)).unwrap();
+    // 同一根内部的自引用：不该出现在根图上
+    let inner = s.create(Some(a), "自引用", Value::Reference(a_child), false).id;
+    let _ = inner;
+    s.save(&path).unwrap();
+
+    let mut doc = Doc::open(&path).unwrap();
+    let edges = doc.root_edges();
+    assert_eq!(edges.len(), 2, "两条跨根引用都会保留");
+    assert!(edges.iter().all(|(x, y)| (*x == a && *y == b) || (*x == b && *y == a)));
+    // 按节点的原始边更多（含根内自引用）
+    let raw = doc.edges();
+    assert!(raw.len() > edges.len(), "根聚合会丢掉根内的自引用");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(sidecar_path(&path));
+}

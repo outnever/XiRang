@@ -88,6 +88,8 @@ pub struct Options {
     /// 隐藏未解析（引用断裂）
     pub hide_unresolved: bool,
     pub local: bool,
+    /// **按根聚合**：每个顶层根当成一个节点（对应 Obsidian 的「一篇笔记 = 一个节点」）
+    pub by_root: bool,
     pub focused: Option<Uuid>,
 }
 
@@ -108,6 +110,7 @@ impl Default for Options {
             orphans: true,
             hide_unresolved: false,
             local: false,
+            by_root: true,
             focused: None,
         }
     }

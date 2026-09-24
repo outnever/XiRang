@@ -92,6 +92,26 @@ impl Doc {
         self.sc.all_edges().unwrap_or_default()
     }
 
+    /// **按根聚合**的引用边 `(源所属根, 目标所属根)`。
+    ///
+    /// 这是「一篇笔记 = 一个节点」的那套组织方式：息壤里与 Obsidian 的「笔记」对应的是
+    /// 顶层根（词条 / 条目），每个根下面的节点是它的内容。归属块里已经存了「节点 → 所属根」，
+    /// 所以这一步只查索引，不读节点、不扫全库。自环（同一根内部互相引用）会被丢掉。
+    pub fn root_edges(&mut self) -> Vec<(Uuid, Uuid)> {
+        let edges = self.sc.all_edges().unwrap_or_default();
+        let mut out = Vec::with_capacity(edges.len());
+        for (s, t) in edges {
+            let (Ok(Some(rs)), Ok(Some(rt))) = (self.sc.find_assign(s), self.sc.find_assign(t))
+            else {
+                continue;
+            };
+            if rs != rt {
+                out.push((rs, rt));
+            }
+        }
+        out
+    }
+
     /// 孩子数量（展开徽标 `▸ 3` 用，不读节点内容）。
     pub fn child_count(&mut self, id: Uuid) -> usize {
         self.sc.find_children(id).map(|v| v.len()).unwrap_or(0)

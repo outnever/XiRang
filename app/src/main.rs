@@ -670,9 +670,18 @@ impl App {
 
     /// 把「边的两端 + 语义开关」组装成图数据（照抄参考的 buildGraph 思路）。
     fn build_graph_data(&mut self) -> (Vec<NodeSpec>, Vec<(Uuid, Uuid)>) {
+        // 默认「按根聚合」：一篇笔记 = 一个顶层根（词条），边 = 根之间的引用
+        let by_root = self.graph.opt.by_root;
+        let groups = self.graph.opt.groups;
         let mut edges: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut root_ids: Vec<Uuid> = Vec::new();
         for tab in self.tabs.iter_mut() {
-            edges.extend(tab.doc.edges());
+            if by_root {
+                edges.extend(tab.doc.root_edges());
+                root_ids.extend(tab.doc.roots());
+            } else {
+                edges.extend(tab.doc.edges());
+            }
         }
         edges.sort_by_key(|(a, b)| (a.0, b.0));
         edges.dedup();
@@ -689,7 +698,44 @@ impl App {
             *degree.entry(*a).or_insert(0) += 1;
             *degree.entry(*b).or_insert(0) += 1;
         }
-        let groups = self.graph.opt.groups;
+        // 按根聚合：先把「有边的根」建成节点，孤立根按开关补
+        if by_root {
+            for id in root_ids.iter() {
+                if !seen.insert(*id) {
+                    continue;
+                }
+                let resolved = self.resolve_node(*id);
+                let (title, file) = match &resolved {
+                    Some((n, f)) => (n.name.clone(), f.clone()),
+                    None => (format!("<{}>", &id.to_string()[..8]), String::new()),
+                };
+                specs.push(NodeSpec {
+                    id: *id,
+                    title,
+                    kind: NodeKind::Note,
+                    weight: *degree.get(id).unwrap_or(&0),
+                    series: if groups {
+                        Some((fnv(file.as_bytes()) % 6) as usize)
+                    } else {
+                        None
+                    },
+                    file,
+                });
+            }
+            let keep: std::collections::HashSet<Uuid> = specs.iter().map(|s| s.id).collect();
+            let edges: Vec<(Uuid, Uuid)> = edges
+                .into_iter()
+                .filter(|(a, b)| keep.contains(a) && keep.contains(b))
+                .collect();
+            if self.graph.opt.local {
+                if let Some(f) = self.graph.opt.focused {
+                    if keep.contains(&f) {
+                        return local_subset(&specs, &edges, f);
+                    }
+                }
+            }
+            return (specs, edges);
+        }
         let hide_unresolved = self.graph.opt.hide_unresolved;
         let show_attachments = self.graph.opt.attachments;
         let show_tags = self.graph.opt.tags;
@@ -862,6 +908,7 @@ impl App {
                 structure_changed |= ui.checkbox(&mut o.attachments, t("附件")).changed();
                 structure_changed |= ui.checkbox(&mut o.orphans, t("孤立节点")).changed();
                 structure_changed |= ui.checkbox(&mut o.hide_unresolved, t("隐藏未解析")).changed();
+                structure_changed |= ui.checkbox(&mut o.by_root, t("按根聚合")).changed();
                 structure_changed |= ui.checkbox(&mut o.local, t("局部图谱")).changed();
                 ui.separator();
                 if ui.button(t("重置视图")).clicked() {

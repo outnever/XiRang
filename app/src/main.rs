@@ -19,7 +19,9 @@ use xirang_core::tree::Store;
 use xirang_app::edit;
 use xirang_app::blobimg;
 use xirang_app::export::{self, Scope};
-use xirang_app::graph::{Graph, Settings as GraphSettings};
+use xirang_app::obsidian::view::{
+    local_subset, Colors, GraphView, NodeKind, NodeSpec, Options,
+};
 use xirang_app::i18n::{self, Lang};
 use xirang_app::lazy::{plain_value, Doc};
 use xirang_app::scan::{self, Query};
@@ -39,6 +41,27 @@ const AUTO_EXPAND_MAX_CHILDREN: usize = 2_000;
 const ROW_BUDGET: usize = 50_000;
 /// 图里最多画多少条引用边（超过就截断并在状态栏说明）。
 const MAX_GRAPH_EDGES: usize = 20_000;
+/// 孤立节点最多补多少个（保持图可控）。
+const ORPHAN_LIMIT: usize = 2_000;
+
+/// 简单哈希（配色分组 / 合成标签编号用）。
+fn fnv(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// 由名字合成一个稳定的编号（标签节点用；同一名字永远同一个编号）。
+fn synthetic_id(name: &str) -> Uuid {
+    let h = fnv(name.as_bytes());
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&h.to_be_bytes());
+    b[8..].copy_from_slice(&fnv(&[name.as_bytes(), b"tag"].concat()).to_be_bytes());
+    Uuid(b)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -106,15 +129,10 @@ struct App {
     tabs: Vec<Tab>,
     active: usize,
     mode: ViewMode,
-    graph: Option<Graph>,
+    graph: GraphView,
     graph_dirty: bool,
-    graph_settings: GraphSettings,
-    graph_built_orphans: bool,
     graph_truncated: bool,
     show_settings: bool,
-    zoom: f32,
-    pan: egui::Vec2,
-    dragging: Option<Uuid>,
     focus: Option<Uuid>,
     known: Vec<(Uuid, String)>,
     rows: Vec<Row>,
@@ -161,15 +179,10 @@ impl App {
             tabs: Vec::new(),
             active: 0,
             mode: ViewMode::Tree,
-            graph: None,
+            graph: GraphView::new(),
             graph_dirty: true,
-            graph_settings: GraphSettings::default(),
-            graph_built_orphans: false,
             graph_truncated: false,
             show_settings: false,
-            zoom: 1.0,
-            pan: egui::Vec2::ZERO,
-            dragging: None,
             focus: None,
             known: Vec::new(),
             rows: Vec::new(),
@@ -212,11 +225,18 @@ impl App {
             }
         } else {
             for a in args {
+                if a == "--graph" {
+                    app.mode = ViewMode::Graph;
+                    continue;
+                }
                 let p = PathBuf::from(a);
                 if p.exists() {
                     app.open_path(&p);
                 }
             }
+        }
+        if app.mode == ViewMode::Graph {
+            app.graph_dirty = true;
         }
         app.state.prune(20);
         app
@@ -413,9 +433,8 @@ impl App {
     // —— 内存释放 ——
 
     fn release_graph(&mut self) {
-        self.graph = None;
+        self.graph.set_data(Vec::new(), Vec::new());
         self.graph_dirty = true;
-        self.dragging = None;
     }
 
     fn release_view_state(&mut self) {
@@ -638,97 +657,240 @@ impl App {
 
     // —— 图 ——
 
-    fn graph_candidates(&mut self) -> Vec<(Uuid, String)> {
-        let mut out: Vec<(Uuid, String)> = Vec::new();
-        for i in 0..self.tabs.len() {
-            let label = self.tabs[i].path.display().to_string();
-            if i == self.active && !self.known.is_empty() {
-                out.extend(self.known.iter().cloned());
-                continue;
+
+    /// 跨打开的文件解析一个编号。
+    fn resolve_node(&mut self, id: Uuid) -> Option<(Node, String)> {
+        for tab in self.tabs.iter_mut() {
+            if let Some(n) = tab.doc.node(id) {
+                return Some((n, tab.path.display().to_string()));
             }
-            let roots = self.tabs[i].doc.roots();
-            let mut ids = roots.clone();
-            for r in roots {
-                ids.extend(self.tabs[i].doc.children(r));
-            }
-            out.extend(ids.into_iter().map(|id| (id, label.clone())));
         }
-        out
+        None
     }
 
-    fn ensure_graph(&mut self) {
-        if !self.graph_dirty {
-            return;
-        }
-        // 引用边来自每个文件的侧车索引——与"展开了哪些节点"无关，深层的引用也不会漏
+    /// 把「边的两端 + 语义开关」组装成图数据（照抄参考的 buildGraph 思路）。
+    fn build_graph_data(&mut self) -> (Vec<NodeSpec>, Vec<(Uuid, Uuid)>) {
         let mut edges: Vec<(Uuid, Uuid)> = Vec::new();
         for tab in self.tabs.iter_mut() {
             edges.extend(tab.doc.edges());
         }
+        edges.sort_by_key(|(a, b)| (a.0, b.0));
+        edges.dedup();
         let truncated = edges.len() > MAX_GRAPH_EDGES;
         if truncated {
             edges.truncate(MAX_GRAPH_EDGES);
         }
-        let candidates = self.graph_candidates();
-        let show_aux = self.show_aux;
-        let orphans = self.graph_settings.show_orphans;
-        let mut g = Graph::new(self.graph_settings.clone());
-        {
-            let tabs = &mut self.tabs;
-            let mut resolve = |id: Uuid| -> Option<(Node, String)> {
-                for tab in tabs.iter_mut() {
-                    if let Some(n) = tab.doc.node(id) {
-                        return Some((n, tab.path.display().to_string()));
-                    }
+        self.graph_truncated = truncated;
+
+        let mut specs: Vec<NodeSpec> = Vec::new();
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let mut degree: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
+        for (a, b) in &edges {
+            *degree.entry(*a).or_insert(0) += 1;
+            *degree.entry(*b).or_insert(0) += 1;
+        }
+        let groups = self.graph.opt.groups;
+        let hide_unresolved = self.graph.opt.hide_unresolved;
+        let show_attachments = self.graph.opt.attachments;
+        let show_tags = self.graph.opt.tags;
+        let show_orphans = self.graph.opt.orphans;
+        for (a, b) in &edges {
+            for id in [a, b] {
+                if seen.contains(id) {
+                    continue;
                 }
-                None
-            };
-            g.build(&edges, show_aux, &mut resolve);
-            if orphans {
-                g.add_orphans(&candidates, show_aux, &mut resolve);
+                let resolved = self.resolve_node(*id);
+                let unresolved = resolved.is_none();
+                let attachment = matches!(
+                    resolved.as_ref().map(|(n, _)| &n.value),
+                    Some(Value::Blob(_))
+                );
+                if unresolved && hide_unresolved {
+                    continue;
+                }
+                if attachment && !show_attachments {
+                    continue;
+                }
+                seen.insert(*id);
+                let file = resolved
+                    .as_ref()
+                    .map(|(_, f)| f.clone())
+                    .unwrap_or_default();
+                let title = match &resolved {
+                    Some((n, _)) if !n.name.is_empty() => n.name.clone(),
+                    Some(_) => format!("<{}>", &id.to_string()[..8]),
+                    None => format!("未解析 {}", &id.to_string()[..8]),
+                };
+                let kind = if unresolved {
+                    NodeKind::Unresolved
+                } else if attachment {
+                    NodeKind::Attachment
+                } else {
+                    NodeKind::Note
+                };
+                specs.push(NodeSpec {
+                    id: *id,
+                    title,
+                    kind,
+                    weight: *degree.get(id).unwrap_or(&0),
+                    series: if groups {
+                        Some((fnv(file.as_bytes()) % 6) as usize)
+                    } else {
+                        None
+                    },
+                    file,
+                });
             }
         }
-        self.graph = Some(g);
+        // 丢掉「未解析 / 附件」被关掉之后悬空的边
+        let keep: std::collections::HashSet<Uuid> = specs.iter().map(|s| s.id).collect();
+        let mut edges: Vec<(Uuid, Uuid)> = edges
+            .into_iter()
+            .filter(|(a, b)| keep.contains(a) && keep.contains(b))
+            .collect();
+
+        // 标签：节点下的 `@` 辅助子节点（按名字聚合成一个标签节点）
+        if show_tags {
+            let ids: Vec<Uuid> = specs.iter().map(|s| s.id).collect();
+            let mut tags: std::collections::HashMap<String, Uuid> =
+                std::collections::HashMap::new();
+            for id in ids {
+                let children = match self.tabs.iter_mut().find_map(|t| {
+                    t.doc.node(id).map(|_| t.doc.children(id))
+                }) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                for cid in children {
+                    let name = match self.resolve_node(cid) {
+                        Some((n, _)) if n.name.starts_with('@') => n.name,
+                        _ => continue,
+                    };
+                    let tag_id = *tags.entry(name.clone()).or_insert_with(|| synthetic_id(&name));
+                    if !seen.contains(&tag_id) {
+                        seen.insert(tag_id);
+                        specs.push(NodeSpec {
+                            id: tag_id,
+                            title: name,
+                            kind: NodeKind::Tag,
+                            weight: 0,
+                            series: None,
+                            file: String::new(),
+                        });
+                    }
+                    edges.push((id, tag_id));
+                }
+            }
+        }
+
+        // 孤立节点：把「已经加载进来的、没有边的」节点补上
+        if show_orphans {
+            let known = self.known.clone();
+            let mut added = 0usize;
+            for (id, file) in known {
+                if added >= ORPHAN_LIMIT || seen.contains(&id) {
+                    continue;
+                }
+                if let Some((n, _)) = self.resolve_node(id) {
+                    seen.insert(id);
+                    specs.push(NodeSpec {
+                        id,
+                        title: n.name,
+                        kind: NodeKind::Note,
+                        weight: 0,
+                        series: None,
+                        file,
+                    });
+                    added += 1;
+                }
+            }
+        }
+
+        // 局部图谱：以焦点为中心的 1 跳
+        if self.graph.opt.local {
+            if let Some(f) = self.graph.opt.focused {
+                if seen.contains(&f) {
+                    return local_subset(&specs, &edges, f);
+                }
+            }
+        }
+        (specs, edges)
+    }
+
+    fn refresh_graph(&mut self) {
+        if !self.graph_dirty {
+            return;
+        }
+        let (specs, edges) = self.build_graph_data();
+        self.graph.set_data(specs, edges);
+        self.graph.push_forces();
         self.graph_dirty = false;
-        self.graph_built_orphans = orphans;
-        self.graph_truncated = truncated;
     }
 
     fn graph_settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
-        egui::Window::new("图设置")
+        let mut forces_changed = false;
+        let mut structure_changed = false;
+        let mut want_reset_view = false;
+        egui::Window::new(t("图设置"))
             .open(&mut open)
-            .default_width(330.0)
+            .default_width(320.0)
             .show(ctx, |ui| {
-                let s = &mut self.graph_settings;
+                let o = &mut self.graph.opt;
                 ui.heading(t("力"));
-                ui.add(egui::Slider::new(&mut s.center_strength, 0.0..=1.0).step_by(0.01).text(t("图谱向心力")));
-                ui.add(egui::Slider::new(&mut s.repel_strength, 1.0..=30.0).text(t("节点间的排斥力")));
-                ui.add(egui::Slider::new(&mut s.link_strength, 0.0..=1.0).step_by(0.01).text(t("相连节点间的吸引力")));
-                ui.add(egui::Slider::new(&mut s.link_distance, 0.0..=500.0).text(t("连线长度")));
+                forces_changed |= ui
+                    .add(egui::Slider::new(&mut o.center, 0.0..=1.0).step_by(0.001).text(t("图谱向心力")))
+                    .changed();
+                forces_changed |= ui
+                    .add(egui::Slider::new(&mut o.repel, 0.0..=20.0).step_by(1.0).text(t("节点间的排斥力")))
+                    .changed();
+                forces_changed |= ui
+                    .add(egui::Slider::new(&mut o.link, 0.0..=1.0).step_by(0.01).text(t("相连节点间的吸引力")))
+                    .changed();
+                forces_changed |= ui
+                    .add(egui::Slider::new(&mut o.dist, 30.0..=500.0).step_by(1.0).text(t("连线长度")))
+                    .changed();
                 ui.separator();
                 ui.heading(t("显示"));
-                ui.add(egui::Slider::new(&mut s.text_fade_multiplier, -3.0..=3.0).step_by(0.1).text(t("文字淡入阈值")));
-                ui.add(egui::Slider::new(&mut s.node_size_multiplier, 0.5..=3.0).text(t("节点大小")));
-                ui.add(egui::Slider::new(&mut s.line_size_multiplier, 0.5..=3.0).text(t("连线粗细")));
-                ui.checkbox(&mut s.show_arrow, t("显示箭头（放大后）"));
-                ui.checkbox(&mut s.animate, t("生长动画"));
-                ui.checkbox(&mut s.show_orphans, t("显示孤立节点"));
+                ui.add(egui::Slider::new(&mut o.fade, -3.0..=3.0).step_by(0.1).text(t("文字淡出")));
+                ui.add(egui::Slider::new(&mut o.node_size, 0.1..=5.0).step_by(0.1).text(t("节点大小")));
+                ui.add(egui::Slider::new(&mut o.line_size, 0.1..=5.0).step_by(0.1).text(t("连线粗细")));
                 ui.separator();
-                if ui.button("重置为默认").clicked() {
-                    s.reset();
-                    self.graph_dirty = true;
+                structure_changed |= ui.checkbox(&mut o.arrows, t("箭头")).changed();
+                structure_changed |= ui.checkbox(&mut o.groups, t("颜色分组")).changed();
+                structure_changed |= ui.checkbox(&mut o.tags, t("标签")).changed();
+                structure_changed |= ui.checkbox(&mut o.attachments, t("附件")).changed();
+                structure_changed |= ui.checkbox(&mut o.orphans, t("孤立节点")).changed();
+                structure_changed |= ui.checkbox(&mut o.hide_unresolved, t("隐藏未解析")).changed();
+                structure_changed |= ui.checkbox(&mut o.local, t("局部图谱")).changed();
+                ui.separator();
+                if ui.button(t("重置视图")).clicked() {
+                    want_reset_view = true;
+                }
+                if ui.button(t("重置为默认")).clicked() {
+                    let focused = o.focused;
+                    *o = Options::default();
+                    o.focused = focused;
+                    forces_changed = true;
+                    structure_changed = true;
+                }
+                if self.graph_truncated {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 140, 60),
+                        t("图已按上限截断"),
+                    );
                 }
                 ui.weak("默认值照搬 Obsidian：向心力 0.1 · 排斥力 10 · 连线力 1 · 连线长度 250");
             });
         self.show_settings = open;
-        if self.graph_settings.show_orphans != self.graph_built_orphans {
+        if want_reset_view {
+            self.graph.reset_view();
+        }
+        if structure_changed {
             self.graph_dirty = true;
-        } else if let Some(g) = self.graph.as_mut() {
-            if g.settings != self.graph_settings {
-                g.settings = self.graph_settings.clone();
-                g.wake();
-            }
+        }
+        if forces_changed {
+            self.graph.push_forces();
         }
     }
 
@@ -825,12 +987,37 @@ fn main() -> eframe::Result<()> {
 
 fn install_cjk_font(ctx: &egui::Context) -> Option<String> {
     const CANDIDATES: &[&str] = &[
+        // 西文标签优先用 Inter（放进 .app 的 Resources 或 ~/Library/Fonts 即可，OFL 许可）
+        "Inter-Medium.ttf",
+        "Inter.ttf",
+        // 其次：系统里常见的开源无衬线（Noto Sans SC 同时覆盖中英）
+        "NotoSansSC-Medium.ttf",
+        "NotoSansSC.ttf",
+        // 兜底：macOS 自带中文字体
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
         "/System/Library/Fonts/Supplemental/Songti.ttc",
     ];
-    for path in CANDIDATES {
+    // 相对文件名按「可执行文件旁的 Resources / 用户字体目录 / 系统字体目录」找
+    let mut resolved: Vec<std::path::PathBuf> = Vec::new();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let home = std::env::var("HOME").unwrap_or_default();
+    for c in CANDIDATES {
+        if c.starts_with('/') {
+            resolved.push(std::path::PathBuf::from(c));
+            continue;
+        }
+        if let Some(d) = &exe_dir {
+            resolved.push(d.join("../Resources").join(c));
+            resolved.push(d.join(c));
+        }
+        resolved.push(std::path::PathBuf::from(format!("{home}/Library/Fonts/{c}")));
+        resolved.push(std::path::PathBuf::from(format!("/Library/Fonts/{c}")));
+    }
+    for path in &resolved {
         let Ok(bytes) = std::fs::read(path) else { continue };
         let mut fonts = egui::FontDefinitions::default();
         fonts
@@ -847,7 +1034,7 @@ fn install_cjk_font(ctx: &egui::Context) -> Option<String> {
             .or_default()
             .push("cjk".to_owned());
         ctx.set_fonts(fonts);
-        return Some((*path).to_string());
+        return Some(path.display().to_string());
     }
     None
 }
@@ -1084,9 +1271,13 @@ impl eframe::App for App {
                         tab.doc.reads
                     ));
                 }
-                if let Some(g) = self.graph.as_ref() {
+                if self.graph.node_count() > 0 {
                     ui.separator();
-                    ui.label(format!("图 {} 节点 / {} 边", g.len(), g.edges.len()));
+                    ui.label(format!(
+                        "图 {} 节点 / {} 边",
+                        self.graph.node_count(),
+                        self.graph.link_count()
+                    ));
                 }
                 ui.separator();
                 ui.weak(self.font_note.clone());
@@ -1273,9 +1464,8 @@ impl eframe::App for App {
                     .clicked()
                 {
                     self.focus = if focusing { None } else { Some(node.id) };
-                    if let Some(g) = self.graph.as_mut() {
-                        g.wake();
-                    }
+                    self.graph.opt.focused = self.focus;
+                    self.graph.push_forces();
                 }
             });
 
@@ -1414,205 +1604,39 @@ impl App {
     }
 
     fn show_graph(&mut self, ui: &mut egui::Ui) {
-        self.ensure_graph();
-        let (rect, response) =
-            ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
-        let bg = ui.visuals().extreme_bg_color;
-        painter.rect_filled(rect, 0.0, bg);
-
-        let Some(graph) = self.graph.as_mut() else { return };
-        if graph.is_empty() {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "这些文件里没有引用关系（图是空的）",
-                egui::FontId::proportional(14.0),
-                ui.visuals().weak_text_color(),
-            );
-            return;
-        }
-        if graph.step(2) {
-            ui.ctx().request_repaint();
-        }
-
-        let mut focus_members: HashSet<Uuid> = HashSet::new();
-        if let Some(focus) = self.focus {
-            let members: Vec<Uuid> = graph.nodes.iter().map(|n| n.id).collect();
-            let tabs = &mut self.tabs;
-            let mut subtree = Vec::new();
-            for tab in tabs.iter_mut() {
-                if tab.doc.node(focus).is_some() {
-                    subtree = Graph::subtree(&mut tab.doc, focus, &members);
-                    break;
-                }
-            }
-            for (id, _) in &subtree {
-                focus_members.insert(*id);
-            }
-            if subtree.len() > 1 {
-                let targets = graph.focus_targets(&subtree, [0.0, 0.0], 130.0, 34.0);
-                if graph.move_towards(&targets, 0.25) {
-                    ui.ctx().request_repaint();
-                }
-            }
-        }
-
-        let pointer = ui.input(|i| i.pointer.hover_pos());
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
-        if response.hovered() && scroll != 0.0 {
-            self.zoom = (self.zoom * (1.0 + scroll * 0.0015)).clamp(0.05, 6.0);
-        }
-        let center = rect.center();
-        let zoom = self.zoom;
-        let pan = self.pan;
-        let to_screen = |p: [f32; 2]| {
-            egui::pos2(
-                center.x + (p[0] - pan.x) * zoom,
-                center.y + (p[1] - pan.y) * zoom,
-            )
-        };
-        let from_screen = |p: egui::Pos2| {
-            [
-                (p.x - center.x) / zoom + pan.x,
-                (p.y - center.y) / zoom + pan.y,
-            ]
-        };
-
-        let hovered_idx = pointer.and_then(|p| {
-            let mut best: Option<(f32, usize)> = None;
-            for (i, node) in graph.nodes.iter().enumerate() {
-                let sp = to_screen(node.pos);
-                let d = sp.distance(p);
-                let r = graph.settings.radius(node.degree) * zoom + 4.0;
-                if d <= r.max(8.0) && best.map(|(bd, _)| d < bd).unwrap_or(true) {
-                    best = Some((d, i));
-                }
-            }
-            best.map(|(_, i)| i)
-        });
-        if response.drag_started() {
-            if let Some(i) = hovered_idx {
-                self.dragging = Some(graph.nodes[i].id);
-                graph.set_dragging(true);
-            }
-        }
-        if response.dragged() {
-            match self.dragging.and_then(|id| graph.index_of(id)) {
-                Some(i) => {
-                    if let Some(p) = pointer {
-                        graph.nodes[i].pos = from_screen(p);
-                        graph.nodes[i].vel = [0.0, 0.0];
-                    }
-                }
-                None => self.pan -= response.drag_delta() / zoom,
-            }
-            ui.ctx().request_repaint();
-        }
-        if response.drag_stopped() {
-            if self.dragging.is_some() {
-                graph.set_dragging(false);
-            }
-            self.dragging = None;
-        }
-        let mut clicked = false;
-        if response.clicked() {
-            if let Some(i) = hovered_idx {
-                self.selected = Some(graph.nodes[i].id);
-                clicked = true;
-            }
-        }
-
-        let hover_neighbors: HashSet<Uuid> = match hovered_idx {
-            Some(i) => {
-                let mut set = HashSet::new();
-                set.insert(graph.nodes[i].id);
-                for &(a, b) in &graph.edges {
-                    if a == i {
-                        set.insert(graph.nodes[b].id);
-                    } else if b == i {
-                        set.insert(graph.nodes[a].id);
-                    }
-                }
-                set
-            }
-            None => HashSet::new(),
-        };
-        let dim_of = |id: Uuid| -> f32 {
-            if hovered_idx.is_some() {
-                if hover_neighbors.contains(&id) {
-                    1.0
-                } else {
-                    0.25
-                }
-            } else if !focus_members.is_empty() {
-                if focus_members.contains(&id) {
-                    1.0
-                } else {
-                    0.15
-                }
-            } else {
-                1.0
-            }
-        };
-        let line_w = graph.settings.line_size_multiplier;
-        let edge_color = ui.visuals().weak_text_color();
-        for &(a, b) in &graph.edges {
-            let (na, nb) = (&graph.nodes[a], &graph.nodes[b]);
-            let alpha = dim_of(na.id).min(dim_of(nb.id));
-            painter.line_segment(
-                [to_screen(na.pos), to_screen(nb.pos)],
-                egui::Stroke::new(line_w * alpha.max(0.2), edge_color.gamma_multiply(alpha)),
-            );
-        }
-        let label_alpha = graph.settings.label_alpha(zoom);
-        let text_color = ui.visuals().text_color();
-        let accent = ui.visuals().selection.bg_fill;
-        for node in graph.nodes.iter() {
-            let sp = to_screen(node.pos);
-            if !rect.contains(sp) {
-                continue;
-            }
-            let dim = dim_of(node.id);
-            let r = (graph.settings.radius(node.degree) * zoom).max(1.5);
-            let fill = if self.selected == Some(node.id) {
-                accent
-            } else if node.aux {
-                egui::Color32::from_rgb(160, 110, 70)
-            } else {
-                ui.visuals().widgets.inactive.bg_fill
-            };
-            painter.circle_filled(sp, r, fill.gamma_multiply(dim));
-            painter.circle_stroke(
-                sp,
-                r,
-                egui::Stroke::new(1.0_f32, edge_color.gamma_multiply(dim)),
-            );
-            if label_alpha > 0.02 {
-                painter.text(
-                    sp + egui::vec2(r + 4.0, 0.0),
-                    egui::Align2::LEFT_CENTER,
-                    &node.name,
-                    egui::FontId::proportional(12.0),
-                    text_color.gamma_multiply(label_alpha * dim),
-                );
-            }
-        }
-        if let Some(i) = hovered_idx {
-            let node = &graph.nodes[i];
-            let sp = to_screen(node.pos);
-            let r = graph.settings.radius(node.degree) * zoom;
-            painter.text(
-                sp + egui::vec2(r + 10.0, -8.0),
-                egui::Align2::LEFT_BOTTOM,
-                format!("{}\n{}", node.name, node.file),
-                egui::FontId::proportional(12.0),
-                text_color,
-            );
-        }
-        if clicked {
-            self.set_selected(self.selected);
+        self.refresh_graph();
+        self.graph.colors = self.graph_colors();
+        self.graph.ui(ui);
+        if let Some(id) = self.graph.picked() {
+            self.set_selected(Some(id));
             self.sync_inputs();
         }
+        if let Some(id) = self.graph.focused_request() {
+            self.focus = Some(id);
+            self.graph.opt.focused = Some(id);
+            if self.graph.opt.local {
+                self.graph_dirty = true;
+            }
+        }
+    }
+
+    /// 把当前配色映射到图上（muted = 前景压暗，强调色 = 高亮 / 聚焦）。
+    fn graph_colors(&self) -> Colors {
+        let bg = theme::parse_hex(&self.palette.bg).unwrap_or(egui::Color32::from_rgb(31, 35, 40));
+        let fg = theme::parse_hex(&self.palette.fg).unwrap_or(egui::Color32::from_rgb(230, 237, 243));
+        let accent = theme::parse_hex(&self.palette.accent).unwrap_or(egui::Color32::from_rgb(88, 166, 255));
+        let aux = theme::aux_color(&self.palette);
+        let mut c = Colors::default();
+        c.bg = bg;
+        c.text = fg;
+        c.fill = fg.gamma_multiply(0.55);
+        c.line = fg.gamma_multiply(0.55);
+        c.arrow = fg;
+        c.circle = accent;
+        c.focused = accent;
+        c.line_highlight = accent;
+        c.tag = aux;
+        c.unresolved = fg.gamma_multiply(0.45);
+        c
     }
 }

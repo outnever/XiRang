@@ -129,6 +129,16 @@ pub const TABLE: &[(&str, &str)] = &[
     ("显示箭头（放大后）", "Arrows (when zoomed in)"),
     ("生长动画", "Animate growth"),
     ("显示孤立节点", "Show orphans"),
+    ("文字淡出", "Text fade"),
+    ("箭头", "Arrows"),
+    ("颜色分组", "Color groups"),
+    ("标签", "Tags"),
+    ("附件", "Attachments"),
+    ("孤立节点", "Orphans"),
+    ("隐藏未解析", "Hide unresolved"),
+    ("局部图谱", "Local graph"),
+    ("重置视图", "Reset view"),
+    ("图已按上限截断", "Graph truncated at the limit"),
 ];
 
 /// 取文案：表里有就用英文，没有就原样返回中文。

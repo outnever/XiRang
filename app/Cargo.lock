@@ -3208,6 +3208,7 @@ dependencies = [
  "eframe",
  "png",
  "rfd",
+ "serde_json",
  "xirang-core",
  "zune-jpeg",
 ]

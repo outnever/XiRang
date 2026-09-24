@@ -8,6 +8,7 @@ pub mod export;
 pub mod graph;
 pub mod i18n;
 pub mod lazy;
+pub mod obsidian;
 pub mod scan;
 pub mod state;
 pub mod theme;

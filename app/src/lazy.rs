@@ -87,6 +87,11 @@ impl Doc {
             .collect()
     }
 
+    /// 这个文件里全部的引用边 `(源, 目标)`——从侧车索引直接读，与「展开了哪些节点」无关。
+    pub fn edges(&mut self) -> Vec<(Uuid, Uuid)> {
+        self.sc.all_edges().unwrap_or_default()
+    }
+
     /// 孩子数量（展开徽标 `▸ 3` 用，不读节点内容）。
     pub fn child_count(&mut self, id: Uuid) -> usize {
         self.sc.find_children(id).map(|v| v.len()).unwrap_or(0)

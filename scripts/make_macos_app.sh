@@ -9,12 +9,16 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 app_crate="$root/app"
 out="$root/dist/XiRang.app"
 
-# 仓库自带的 Rust 工具链（.cargo / .rustup）；没有就用系统的
-if [ -x "$root/.cargo/bin/cargo" ]; then
-  export PATH="$root/.cargo/bin:$PATH"
-  export RUSTUP_HOME="$root/.rustup"
-  export CARGO_HOME="$root/.cargo"
-fi
+# 仓库自带的 Rust 工具链（.cargo / .rustup）；在 worktree 里跑时它在上层目录；都没有就用系统的
+for d in "$root" "$root/.." "$root/../.." "$root/../../.."; do
+  if [ -x "$d/.cargo/bin/cargo" ]; then
+    d="$(cd "$d" && pwd)"
+    export PATH="$d/.cargo/bin:$PATH"
+    export RUSTUP_HOME="$d/.rustup"
+    export CARGO_HOME="$d/.cargo"
+    break
+  fi
+done
 
 echo "→ 编译 release（app/Cargo.toml）"
 cargo build --release --manifest-path "$app_crate/Cargo.toml"

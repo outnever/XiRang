@@ -171,6 +171,20 @@ fn view_state_roundtrip_and_recent() {
 }
 
 /// 大文件实测（手动跑）：
+/// 打印某个文件的引用边数（核对「全局图」的取数）：
+/// `XIRANG_FILE=... cargo test -p xirang-app --test scan_state -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn report_edges_of_file() {
+    let Ok(path) = std::env::var("XIRANG_FILE") else {
+        return;
+    };
+    let mut doc = xirang_app::lazy::Doc::open(std::path::Path::new(&path)).unwrap();
+    let edges = doc.edges();
+    println!("{path}: {} 条引用边", edges.len());
+}
+
+/// 大文件实测（手动跑）：
 /// `XIRANG_BIG=/path/big.xirang cargo test -p xirang-app --test scan_state -- --ignored --nocapture`
 #[test]
 #[ignore]

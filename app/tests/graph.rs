@@ -10,12 +10,17 @@ use xirang_core::tree::Store;
 
 /// 单文件建图的便捷封装：候选带同一个文件名，解析走该文件的 Doc。
 fn build_graph(g: &mut Graph, doc: &mut Doc, ids: &[Uuid], show_aux: bool) {
-    let candidates: Vec<(Uuid, String)> = ids
-        .iter()
-        .map(|id| (*id, "sample.xirang".to_string()))
-        .collect();
+    // 边从实现层索引直接读（与展开状态无关）
+    let edges = doc.edges();
     let mut resolve = |id: Uuid| doc.node(id).map(|n| (n, "sample.xirang".to_string()));
-    g.build(&candidates, show_aux, &mut resolve);
+    g.build(&edges, show_aux, &mut resolve);
+    if g.settings.show_orphans {
+        let candidates: Vec<(Uuid, String)> = ids
+            .iter()
+            .map(|id| (*id, "sample.xirang".to_string()))
+            .collect();
+        g.add_orphans(&candidates, show_aux, &mut resolve);
+    }
 }
 
 fn tmp(name: &str) -> PathBuf {
@@ -96,6 +101,29 @@ fn graph_keeps_only_connected_nodes_by_default() {
     let mut g3 = Graph::new(Settings::default());
     build_graph(&mut g3, &mut doc, &cands, false);
     assert!(g3.nodes.iter().all(|n| !n.name.starts_with('@')));
+    cleanup(&p);
+}
+
+/// 回归：深层的引用必须出现在图里（哪怕一个节点都没展开）。
+///
+/// 之前图是从"已展开的行"里找引用的，深层的引用会整片漏掉、图看起来是空的。
+#[test]
+fn graph_sees_deep_references_without_expanding_anything() {
+    let p = tmp("deep");
+    let ids = sample(&p);
+    let mut doc = Doc::open(&p).unwrap();
+    // 一个节点都不展开：只从索引取边
+    let edges = doc.edges();
+    assert_eq!(edges.len(), 3, "索引里应当有 3 条引用边");
+
+    let mut g = Graph::new(Settings::default());
+    let mut resolve = |id: Uuid| doc.node(id).map(|n| (n, "sample.xirang".to_string()));
+    g.build(&edges, true, &mut resolve);
+
+    assert!(g.index_of(ids.deep).is_some(), "第 2 层的引用节点应当在图里");
+    assert!(g.index_of(ids.link).is_some(), "第 1 层的引用节点也在");
+    assert!(g.index_of(ids.target).is_some(), "被引用的目标也在");
+    assert_eq!(g.edges.len(), 3);
     cleanup(&p);
 }
 

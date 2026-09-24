@@ -37,6 +37,8 @@ const IDLE_TRIM_SECS: f32 = 6.0;
 const IDLE_KEEP: usize = 2_000;
 const AUTO_EXPAND_MAX_CHILDREN: usize = 2_000;
 const ROW_BUDGET: usize = 50_000;
+/// 图里最多画多少条引用边（超过就截断并在状态栏说明）。
+const MAX_GRAPH_EDGES: usize = 20_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -108,6 +110,7 @@ struct App {
     graph_dirty: bool,
     graph_settings: GraphSettings,
     graph_built_orphans: bool,
+    graph_truncated: bool,
     show_settings: bool,
     zoom: f32,
     pan: egui::Vec2,
@@ -162,6 +165,7 @@ impl App {
             graph_dirty: true,
             graph_settings: GraphSettings::default(),
             graph_built_orphans: false,
+            graph_truncated: false,
             show_settings: false,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
@@ -656,8 +660,18 @@ impl App {
         if !self.graph_dirty {
             return;
         }
+        // 引用边来自每个文件的侧车索引——与"展开了哪些节点"无关，深层的引用也不会漏
+        let mut edges: Vec<(Uuid, Uuid)> = Vec::new();
+        for tab in self.tabs.iter_mut() {
+            edges.extend(tab.doc.edges());
+        }
+        let truncated = edges.len() > MAX_GRAPH_EDGES;
+        if truncated {
+            edges.truncate(MAX_GRAPH_EDGES);
+        }
         let candidates = self.graph_candidates();
         let show_aux = self.show_aux;
+        let orphans = self.graph_settings.show_orphans;
         let mut g = Graph::new(self.graph_settings.clone());
         {
             let tabs = &mut self.tabs;
@@ -669,11 +683,15 @@ impl App {
                 }
                 None
             };
-            g.build(&candidates, show_aux, &mut resolve);
+            g.build(&edges, show_aux, &mut resolve);
+            if orphans {
+                g.add_orphans(&candidates, show_aux, &mut resolve);
+            }
         }
         self.graph = Some(g);
         self.graph_dirty = false;
-        self.graph_built_orphans = self.graph_settings.show_orphans;
+        self.graph_built_orphans = orphans;
+        self.graph_truncated = truncated;
     }
 
     fn graph_settings_window(&mut self, ctx: &egui::Context) {

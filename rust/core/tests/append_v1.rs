@@ -177,6 +177,40 @@ fn compact_file_folds_revisions_and_keeps_view() {
     let _ = std::fs::remove_file(sidecar_path(&p));
 }
 
+/// `all_edges`：全局引用图的取数——边跟着「最后一条记录」走。
+#[test]
+fn all_edges_follows_last_write_wins() {
+    let p = tmp("edges");
+    let mut s = Store::new();
+    let a = s.create(None, "甲", Value::Empty, false).id;
+    let b = s.create(None, "乙", Value::Empty, false).id;
+    let link = s.create(Some(a), "指向乙", Value::Reference(b), false).id;
+    s.save(&p).unwrap();
+
+    let mut sc = Sidecar::open_for(&p).unwrap();
+    assert_eq!(sc.all_edges().unwrap(), vec![(link, b)]);
+
+    // 改成空值 → 这条边应当消失
+    let (mut w, _) = AppendWriter::open(&p).unwrap();
+    w.append_node(&node(link, Some(a), "指向乙", Value::Empty))
+        .unwrap();
+    w.sync().unwrap();
+    let mut sc = Sidecar::open_for(&p).unwrap();
+    assert!(sc.all_edges().unwrap().is_empty(), "值改成空后不该还有边");
+
+    // 新增一条引用 → 边出现
+    let c = Uuid::random_v4();
+    let (mut w, _) = AppendWriter::open(&p).unwrap();
+    w.append_node(&node(c, Some(a), "指向甲", Value::Reference(a)))
+        .unwrap();
+    w.sync().unwrap();
+    let mut sc = Sidecar::open_for(&p).unwrap();
+    assert_eq!(sc.all_edges().unwrap(), vec![(c, a)]);
+
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(sidecar_path(&p));
+}
+
 /// 大文件实测（手动跑）：
 /// `XIRANG_BIG=/path/big.xirang cargo test -p xirang-core --test append_v1 -- --ignored --nocapture`
 #[test]

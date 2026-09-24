@@ -667,6 +667,41 @@ impl Sidecar {
         Ok(out)
     }
 
+    /// 全部引用边 `(源, 目标)`——**不管节点有没有被展开**，直接把反向块顺序扫一遍。
+    ///
+    /// 这是「全局引用图」的正确取数方式：347 万节点的文件里，边数通常只有几十到几千条，
+    /// 扫一遍只要几十微秒；而按树遍历去找引用，深层的会漏，还慢。
+    /// 语义与 `find_reverse` 一致：同一源节点以它的最后一条记录为准。
+    pub fn all_edges(&mut self) -> Result<Vec<(Uuid, Uuid)>, String> {
+        let mut out: Vec<(Uuid, Uuid)> = Vec::new();
+        for i in 0..self.edge_count {
+            let off = self.reverse_off + i * 32;
+            let target = read_uuid_at(&mut self.file, off)?;
+            let source = read_uuid_at(&mut self.file, off + 16)?;
+            match self.rev_by_id.get(&source) {
+                Some(&ri) => {
+                    // 源节点后来改过：按修订后的引用走
+                    if self.revs[ri].ref_target == Some(target) {
+                        out.push((source, target));
+                    }
+                }
+                None => out.push((source, target)),
+            }
+        }
+        for i in 0..self.revs.len() {
+            let r = self.revs[i];
+            if self.rev_by_id.get(&r.id) != Some(&i) {
+                continue;
+            }
+            if let Some(t) = r.ref_target {
+                if !out.iter().any(|(s, tt)| *s == r.id && *tt == t) {
+                    out.push((r.id, t));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn find_assign(&mut self, id: Uuid) -> Result<Option<Uuid>, String> {
         if let Some(&ri) = self.rev_by_id.get(&id) {
             return Ok(Some(self.revs[ri].root));

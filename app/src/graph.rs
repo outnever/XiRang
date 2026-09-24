@@ -2,9 +2,9 @@
 //!
 //! 这里不依赖 egui：建图、力模拟、标签淡入、聚焦目标位置都能在没有界面的情况下测试。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use xirang_core::codec::{Node, Uuid, Value};
+use xirang_core::codec::{Node, Uuid};
 
 use crate::lazy::Doc;
 
@@ -161,13 +161,13 @@ impl Graph {
         i
     }
 
-    /// 建图：默认只收「有连接关系的节点」（引用源 + 目标），孤立节点按开关。
+    /// 建图：直接摆引用边（源 → 目标），两端都要能解析出名字。
     ///
-    /// `candidates` = (节点编号, 所在文件)；`resolve` 负责按编号取节点（可以跨多个已打开的文件，
-    /// 因此跨文件引用也能连成一张网）。`show_aux=false` 时跳过 `@` 节点。
+    /// `edges` 应当来自实现层的索引（`Sidecar::all_edges`），而不是"当前展开了哪些节点"——
+    /// 深层的引用才不会漏。`resolve` 可以跨多个已打开的文件取节点，所以跨文件引用也连得上。
     pub fn build(
         &mut self,
-        candidates: &[(Uuid, String)],
+        edges: &[(Uuid, Uuid)],
         show_aux: bool,
         resolve: &mut dyn FnMut(Uuid) -> Option<(Node, String)>,
     ) {
@@ -175,69 +175,49 @@ impl Graph {
         self.edges.clear();
         self.index.clear();
 
-        let mut connected: HashSet<Uuid> = HashSet::new();
-        let mut edges: Vec<(usize, usize)> = Vec::new();
-        for (id, file) in candidates {
-            let Some((node, node_file)) = resolve(*id) else {
+        let mut local: Vec<(usize, usize)> = Vec::new();
+        for (from, to) in edges {
+            let (Some((a, af)), Some((b, bf))) = (resolve(*from), resolve(*to)) else {
                 continue;
             };
-            let target = match &node.value {
-                Value::Reference(t) => *t,
-                _ => continue,
-            };
-            let Some((tnode, tfile)) = resolve(target) else {
-                continue;
-            };
-            if !show_aux && (node.name.starts_with('@') || tnode.name.starts_with('@')) {
+            if !show_aux && (a.name.starts_with('@') || b.name.starts_with('@')) {
                 continue;
             }
-            let file = if node_file.is_empty() { file.clone() } else { node_file };
-            let ia = self.push(
-                node.id,
-                node.name.clone(),
-                file,
-                node.name.starts_with('@'),
-            );
-            let ib = self.push(
-                tnode.id,
-                tnode.name.clone(),
-                tfile,
-                tnode.name.starts_with('@'),
-            );
-            edges.push(if ia <= ib { (ia, ib) } else { (ib, ia) });
+            let ia = self.push(a.id, a.name.clone(), af, a.name.starts_with('@'));
+            let ib = self.push(b.id, b.name.clone(), bf, b.name.starts_with('@'));
+            local.push(if ia <= ib { (ia, ib) } else { (ib, ia) });
             self.nodes[ia].degree += 1;
             self.nodes[ib].degree += 1;
-            connected.insert(node.id);
-            connected.insert(tnode.id);
         }
-        if self.settings.show_orphans {
-            for (id, file) in candidates {
-                if connected.contains(id) {
+        local.sort_unstable();
+        local.dedup();
+        self.edges = local;
+        self.alpha = if self.settings.animate { 0.0 } else { 1.0 };
+    }
+
+    /// 孤立节点：把「没有任何引用边」的候选节点也画上（默认关）。
+    pub fn add_orphans(
+        &mut self,
+        candidates: &[(Uuid, String)],
+        show_aux: bool,
+        resolve: &mut dyn FnMut(Uuid) -> Option<(Node, String)>,
+    ) {
+        for (id, file) in candidates {
+            if self.index.contains_key(id) {
+                continue;
+            }
+            if let Some((n, nfile)) = resolve(*id) {
+                if !show_aux && n.name.starts_with('@') {
                     continue;
                 }
-                if let Some((n, nfile)) = resolve(*id) {
-                    if !show_aux && n.name.starts_with('@') {
-                        continue;
-                    }
-                    self.push(
-                        n.id,
-                        n.name.clone(),
-                        if nfile.is_empty() {
-                            file.clone()
-                        } else {
-                            nfile
-                        },
-                        n.name.starts_with('@'),
-                    );
-                }
+                self.push(
+                    n.id,
+                    n.name.clone(),
+                    if nfile.is_empty() { file.clone() } else { nfile },
+                    n.name.starts_with('@'),
+                );
             }
         }
-        edges.sort_unstable();
-        edges.dedup();
-        for (a, b) in edges {
-            self.edges.push((a, b));
-        }
-        self.alpha = if self.settings.animate { 0.0 } else { 1.0 };
     }
 
     /// 一帧的力模拟：`iterations` 次迭代。返回是否还在动（静止后可停算省电 / 省内存）。

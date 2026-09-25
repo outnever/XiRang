@@ -142,6 +142,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("按根聚合", "Group by root"),
     ("已按预算截断", "Truncated by budget"),
     ("索引降级", "Index fallback"),
+    ("校验中（走 CLI 的同一实现）…", "Validating via the CLI implementation…"),
 ];
 
 /// 取文案：表里有就用英文，没有就原样返回中文。

@@ -14,7 +14,7 @@ use serde_json::json;
 use xirang_core::codec::Uuid;
 use xirang_core::{catalog, index, shard, tree};
 
-mod ops;
+use xirang_cli::ops;
 
 use ops::{ErrKind, Layout, MatchQuery, OpError, Policy, ViewOpts};
 

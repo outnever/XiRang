@@ -4,6 +4,10 @@ version = "0.3.0"
 edition = "2021"
 description = "息壤（XiRang）CLI：xr 命令"
 
+[lib]
+name = "xirang_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "xr"
 path = "src/main.rs"

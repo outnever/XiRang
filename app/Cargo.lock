@@ -3209,8 +3209,18 @@ dependencies = [
  "png",
  "rfd",
  "serde_json",
+ "xirang-cli",
  "xirang-core",
  "zune-jpeg",
+]
+
+[[package]]
+name = "xirang-cli"
+version = "0.3.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "xirang-core",
 ]
 
 [[package]]

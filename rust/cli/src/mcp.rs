@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use xirang_core::codec::Value as XValue;
 
-mod ops;
+use xirang_cli::ops;
 
 use ops::{Layout, MatchQuery, OpError, Policy, ViewOpts};
 

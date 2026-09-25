@@ -24,7 +24,7 @@ use xirang_app::obsidian::view::{
 };
 use xirang_app::i18n::{self, Lang};
 use xirang_app::lazy::{plain_value, Doc};
-use xirang_app::scan::{self, Query};
+use xirang_app::scan;
 use xirang_app::state::{FileView, ViewState};
 use xirang_app::theme::{self, Palette};
 use xirang_app::view::{flatten, Layout, Row, MAX_ROWS};
@@ -117,7 +117,7 @@ impl Tab {
 
 enum JobDone {
     Search(Result<Vec<scan::Hit>, String>),
-    Validate(Result<Vec<scan::Issue>, String>),
+    Validate(Vec<String>),
 }
 
 struct Job {
@@ -258,6 +258,8 @@ impl App {
             self.status = format!("已切到 {}", path.display());
             return;
         }
+        // 打开（含首次打开）后把文件登记进索引总账——用 CLI 的同一入口
+        xirang_cli::ops::update_index(path);
         match Doc::open(path) {
             Ok(mut doc) => {
                 let roots = doc.roots();
@@ -332,6 +334,10 @@ impl App {
     // —— 编辑 ——
 
     fn after_edit(&mut self, what: &str) {
+        // 编辑落盘后让索引总账跟上（CLI 的同一个入口）
+        if let Some(tab) = self.tabs.get(self.active) {
+            xirang_cli::ops::update_index(&tab.path);
+        }
         if let Some(tab) = self.tab() {
             if let Err(e) = tab.doc.reload() {
                 self.error = Some(e);
@@ -473,40 +479,66 @@ impl App {
 
     fn start_search(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else { return };
-        let path = tab.path.clone();
+        let path = tab.path.display().to_string();
         let q = self.query.clone();
-        let query = match self.query_kind {
-            0 => Query::Name(q.clone()),
-            1 => Query::Value(q.clone()),
-            _ => Query::Kind(q.clone()),
-        };
+        let q0 = q.clone();
+        let kind = self.query_kind;
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let c = cancel.clone();
         std::thread::spawn(move || {
-            let r = scan::search(&path, &query, &c);
+            // 搜索走 CLI 的同一实现（名字 / 值）；「类型」在结果上按类型名筛
+            let out = xirang_cli::ops::find(
+                &xirang_cli::ops::Policy::cli(false),
+                &xirang_cli::ops::NoHooks,
+                &path,
+                &q,
+            );
+            let _ = c;
+            let r = match out {
+                Ok(hits) => Ok(hits
+                    .into_iter()
+                    .filter(|h| kind != 2 || h.type_name == q)
+                    .map(|h| scan::Hit {
+                        id: h.id,
+                        name: h.name,
+                        value: h.value.unwrap_or_default(),
+                    })
+                    .collect::<Vec<scan::Hit>>()),
+                Err(e) => Err(e.message),
+            };
             let _ = tx.send(JobDone::Search(r));
         });
         self.job = Some(Job { cancel, rx });
-        self.status = format!(
-            "搜索「{q}」（{}）：扫描中…",
-            ["名字", "值", "类型"][self.query_kind.min(2)]
-        );
+        self.status = format!("搜索「{q0}」（走 CLI 的同一实现）：扫描中…");
     }
 
     fn start_validate(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else { return };
-        let path = tab.path.clone();
+        let path = tab.path.display().to_string();
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let c = cancel.clone();
         std::thread::spawn(move || {
-            let mut done = 0u64;
-            let r = scan::validate_stream(&path, &c, &mut |n| done = n);
-            let _ = tx.send(JobDone::Validate(r));
+            // 校验走 CLI 的同一实现（含「未声明修订却重复编号」的 E002 判定）
+            let out = xirang_cli::ops::validate(
+                &xirang_cli::ops::Policy::cli(false),
+                &xirang_cli::ops::NoHooks,
+                &path,
+            );
+            let _ = c;
+            let lines = match out {
+                Ok(o) => o
+                    .errors
+                    .iter()
+                    .map(|e| format!("{} <{}> {}", e.code, &e.node_id.to_string()[..8], e.message))
+                    .collect::<Vec<String>>(),
+                Err(e) => vec![format!("校验失败：{}", e.message)],
+            };
+            let _ = tx.send(JobDone::Validate(lines));
         });
         self.job = Some(Job { cancel, rx });
-        self.status = "校验中（流式扫描，不整份载入）…".to_string();
+        self.status = t("校验中（走 CLI 的同一实现）…").to_string();
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
@@ -521,20 +553,13 @@ impl App {
                 self.error = Some(e);
                 self.job = None;
             }
-            Ok(JobDone::Validate(Ok(issues))) => {
-                self.status = if issues.is_empty() {
+            Ok(JobDone::Validate(lines)) => {
+                self.status = if lines.is_empty() {
                     "校验通过：0 错误".to_string()
                 } else {
-                    format!("{} 个校验错误", issues.len())
+                    format!("{} 个校验错误", lines.len())
                 };
-                self.validation = issues
-                    .iter()
-                    .map(|i| format!("{} <{}> {}", i.code, &i.node_id.to_string()[..8], i.message))
-                    .collect();
-                self.job = None;
-            }
-            Ok(JobDone::Validate(Err(e))) => {
-                self.error = Some(e);
+                self.validation = lines;
                 self.job = None;
             }
             Err(mpsc::TryRecvError::Empty) => ctx.request_repaint(),

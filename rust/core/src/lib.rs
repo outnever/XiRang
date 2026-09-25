@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod convert;
 pub mod index;
 pub mod query;
+pub mod scan;
 pub mod shard;
 pub mod validator;
 pub mod tree;

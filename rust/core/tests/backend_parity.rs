@@ -116,14 +116,13 @@ fn budget_truncates_and_edges_among_only_returns_inside() {
     ] {
         let mut b = backend;
         let roots = b.roots();
-        let root = roots[0];
-        // 从根的孩子里挑一个"带引用"的节点（保证向外扩一定有事可做）
-        let kids = b.children(root);
-        let hub = kids
+        // 找出"带引用"的邻居节点（顺序随机，所以要遍历所有根去找）
+        let hub = roots
             .iter()
+            .flat_map(|r| b.children(*r))
             .find(|(_, n)| matches!(n.value, Value::Reference(_)))
             .map(|(_, n)| n.id)
-            .unwrap_or(root);
+            .expect("测试数据里应当有一个带引用的节点");
         // 极小预算：必须截断并回报，而不是无限扩散
         let tight = Budget {
             max_nodes: 1,
@@ -135,6 +134,7 @@ fn budget_truncates_and_edges_among_only_returns_inside() {
 
         // 集合内边：只给一个节点时，指向集合外的边不能出现
         let (edges, _) = b.edges_among(&[hub], Budget::default());
+        let _ = roots;
         assert!(
             edges.iter().all(|(a, t)| *a == hub && *t == hub),
             "{}：edges_among 只能返回集合内的边",

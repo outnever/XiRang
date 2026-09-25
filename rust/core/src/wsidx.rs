@@ -1041,29 +1041,174 @@ pub fn gc(ws_root: &Path) -> Result<usize, String> {
 
 #[derive(Clone, Debug, Default)]
 pub struct Status {
+    pub version: u8,
     pub generation: u64,
     pub files: usize,
+    pub uuid_total: u64,
     pub loc_blocks: usize,
     pub rel_blocks: usize,
     pub rev_blocks: usize,
+    pub loc_entries: u64,
+    pub rel_entries: u64,
+    pub rev_entries: u64,
     pub log_bytes: u64,
     pub base_bytes: u64,
+    /// 索引目录（含 manifest 与日志）的总字节数
+    pub index_bytes: u64,
     pub stale_files: Vec<String>,
     pub need_compact: bool,
+}
+
+/// 文件表里的一行：谁被索引了、状态如何。
+#[derive(Clone, Debug, Default)]
+pub struct FileStatus {
+    pub path: String,
+    pub entries: u64,
+    /// 块条目的基线代号；与 `cur_gen` 不等说明块已过期（走日志）
+    pub gen: u64,
+    pub cur_gen: u64,
+    pub exists: bool,
+    pub fresh: bool,
+}
+
+fn entry_sum(l: &LedgerInfo) -> u64 {
+    l.blocks.iter().map(|b| b.count).sum()
+}
+
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if let Ok(m) = e.metadata() {
+                total += if m.is_dir() { dir_bytes(&e.path()) } else { m.len() };
+            }
+        }
+    }
+    total
+}
+
+/// 深信息：比 `status` 多出每本台账的条目数、索引目录总体积与协议版本。
+pub fn info(ws_root: &Path) -> Result<Status, String> {
+    let mut s = status(ws_root)?;
+    let dir = index_dir(ws_root);
+    let m = read_manifest(&dir)?;
+    s.version = VERSION;
+    s.loc_entries = entry_sum(&m.loc);
+    s.rel_entries = entry_sum(&m.rel);
+    s.rev_entries = entry_sum(&m.rev);
+    s.uuid_total = m.files.iter().map(|f| f.uuid_count).sum();
+    s.index_bytes = dir_bytes(&dir);
+    Ok(s)
+}
+
+/// 文件清单（`xr index files`）。
+pub fn files_status(ws_root: &Path) -> Result<Vec<FileStatus>, String> {
+    let m = read_manifest(&index_dir(ws_root))?;
+    let mut out: Vec<FileStatus> = m
+        .files
+        .iter()
+        .map(|f| {
+            let cur = match fingerprint_of(Path::new(&f.path)) {
+                Some((s, sec, nsec)) => {
+                    Path::new(&f.path).exists() && s == f.size && sec == f.mtime_sec && nsec == f.mtime_nsec
+                }
+                None => false,
+            };
+            FileStatus {
+                path: f.path.clone(),
+                entries: f.uuid_count,
+                gen: f.gen,
+                cur_gen: f.cur_gen,
+                exists: Path::new(&f.path).exists(),
+                fresh: cur,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// 增量修复：只重扫指纹变了的文件（自愈），再顺带清理已消失的文件。
+/// 返回（更新的文件数，追加的条目数，清理的文件数）。
+pub fn update(ws_root: &Path) -> Result<(usize, u64, usize), String> {
+    let stale: Vec<PathBuf> = files_status(ws_root)?
+        .into_iter()
+        .filter(|f| f.exists && !f.fresh)
+        .map(|f| PathBuf::from(f.path))
+        .collect();
+    let mut entries = 0u64;
+    for p in &stale {
+        entries += append_file(ws_root, p)?.loc;
+    }
+    let removed = gc(ws_root)?;
+    Ok((stale.len(), entries, removed))
+}
+
+/// 删除整个索引目录（只删索引，绝不碰数据文件）。返回（释放字节数，登记的文件数）。
+pub fn drop_index(ws_root: &Path) -> Result<(u64, usize), String> {
+    let dir = index_dir(ws_root);
+    if !dir.exists() {
+        return Ok((0, 0));
+    }
+    let bytes = dir_bytes(&dir);
+    let files = read_manifest(&dir).map(|m| m.files.len()).unwrap_or(0);
+    let _guard = lock_writer(&dir)?;
+    fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok((bytes, files))
+}
+
+/// 把指定文件从台账移除（写删除记录 + 从文件表删除）；数据文件不动。
+pub fn forget_files(ws_root: &Path, paths: &[String]) -> Result<usize, String> {
+    let dir = index_dir(ws_root);
+    let _guard = lock_writer(&dir)?;
+    let mut m = read_manifest(&dir)?;
+    let targets: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            Path::new(p)
+                .canonicalize()
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| lexical_abs(p))
+        })
+        .collect();
+    let doomed: Vec<FileEntry> =
+        m.files.iter().filter(|f| targets.contains(&f.path)).cloned().collect();
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    for kind in [KIND_LOC, KIND_REL, KIND_REV] {
+        ensure_log(&dir, kind)?;
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(log_path(&dir, kind))
+            .map_err(|e| e.to_string())?;
+        for r in &doomed {
+            append_rec(&mut f, REC_FILE_REMOVE, &r.id.to_be_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
+    let ids: HashSet<u32> = doomed.iter().map(|f| f.id).collect();
+    m.files.retain(|f| !ids.contains(&f.id));
+    write_file_atomic(&manifest_path(&dir), &enc_manifest(&m)).map_err(|e| e.to_string())?;
+    Ok(doomed.len())
+}
+
+/// 清掉写者锁；返回（锁里记的 pid，那个进程是否还活着）。
+pub fn unlock(ws_root: &Path) -> Result<Option<(i32, bool)>, String> {
+    let path = lock_path(&index_dir(ws_root));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let pid = fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok());
+    let alive = pid.map(|p| unsafe { libc::kill(p, 0) } == 0).unwrap_or(false);
+    fs::remove_file(&path).map_err(|e| e.to_string())?;
+    Ok(pid.map(|p| (p, alive)))
 }
 
 /// 索引状态：块数、日志占比、指纹不符的文件、是否建议压实。
 pub fn status(ws_root: &Path) -> Result<Status, String> {
     let dir = index_dir(ws_root);
     let m = read_manifest(&dir)?;
-    let mut base_bytes = 0u64;
-    if let Ok(rd) = fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            if e.file_name().to_string_lossy().ends_with(".blk") {
-                base_bytes += e.metadata().map(|x| x.len()).unwrap_or(0);
-            }
-        }
-    }
+    let base_bytes = m.loc.base_bytes + m.rel.base_bytes + m.rev.base_bytes;
     let mut stale = Vec::new();
     for f in &m.files {
         match fingerprint_of(Path::new(&f.path)) {
@@ -1073,13 +1218,19 @@ pub fn status(ws_root: &Path) -> Result<Status, String> {
     }
     let log_bytes = m.loc.log_bytes + m.rel.log_bytes + m.rev.log_bytes;
     Ok(Status {
+        version: VERSION,
         generation: m.generation,
         files: m.files.len(),
+        uuid_total: m.files.iter().map(|f| f.uuid_count).sum(),
         loc_blocks: m.loc.blocks.len(),
         rel_blocks: m.rel.blocks.len(),
         rev_blocks: m.rev.blocks.len(),
+        loc_entries: entry_sum(&m.loc),
+        rel_entries: entry_sum(&m.rel),
+        rev_entries: entry_sum(&m.rev),
         log_bytes,
         base_bytes,
+        index_bytes: 0,
         stale_files: stale,
         // 小索引不提示（几 KB 的头部就能把比例顶上去，没有意义）
         need_compact: base_bytes >= 1_000_000

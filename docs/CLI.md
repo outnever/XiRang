@@ -108,24 +108,37 @@ xr ws <节点ID> a.xirang b.xirang   # 两份都列出，孩子取并集，每�
 xr ws <节点ID> a.xirang --only a.xirang   # 只看 a.xirang 里的那一份（孩子也只来自它）
 ```
 
-### `xr index status|rebuild|compact|check|gc [路径…]`
+### `xr index <子命令> [路径…] [--json] [--verbose] [--stale] [--dry-run] [--yes] [--sample N] [--deep]`
 工作区索引维护（默认走「工作区统一索引」：`<工作区>/.xirang-index/` 下的三本台账——定位 / 关系 / 反向）。
 索引是**实现层缓存**：可整体删除、可重建，不改动 `.xirang` 本体，也不含任何独家数据。
 
-- `status`：文件数 / 代数 / 块数 / 主干与日志体积 / 指纹不符的文件 / 是否建议压实
-- `rebuild`：重扫并重建（缺省扫工作区全部 `.xirang`）
-- `compact`：把日志合并回块（写新块 → 原子改名 → 切 manifest）
-- `check`：一致性抽查（指纹 + 抽样节点能否定位并读出）
-- `gc`：清掉已不存在的文件条目
+| 子命令 | 作用 |
+|---|---|
+| `status [--verbose]` | 总览：三本台账的块数/条目数/主干与日志体积、代数、文件与编号总数、指纹不符的文件、是否建议压实、索引目录总体积；`--verbose` 再列文件表前几条 |
+| `files [--stale]` | 逐文件：条目数、代号（块基线/最新）、指纹是否一致、磁盘上在不在 |
+| `update` | **增量修复**：只重扫指纹变了的文件（自愈），顺带清掉已删除文件的条目 |
+| `rebuild` | 全量重建（缺省扫工作区全部 `.xirang`） |
+| `compact` | 把日志合并回块（新块写新名字 → 原子换 manifest → 删旧块） |
+| `check [--sample N] [--deep]` | 一致性校验：抽样 N 个编号（默认 5）定位并读出；`--deep` 再对每个文件重扫比对条目数 |
+| `gc` | 清掉已不存在的文件条目（下次压实后真正回收） |
+| `drop --yes` | **删除整个索引目录**（数据文件不受影响） |
+| `forget <文件…> --yes` | 把指定文件的条目从台账移除（数据文件保留） |
+| `unlock` | 清掉写者锁（报出锁里的 pid 及是否还在运行） |
+| `path` | 打印索引目录的绝对路径 |
 
 数据文件写完后，索引由写路径自动追加日志（不原地改块）；体积超过主干 30% 时 `status` 会提示压实。
 `XIRANG_INDEX_MODE=sidecar` 时退化为旧的每文件 `.idx`（`status` / `rebuild` / `gc` 可用）。
+**破坏性命令（`drop` / `forget`）必须加 `--yes`**；任何命令都可加 `--dry-run` 先看会做什么（不动手）。
+所有子命令都支持 `--json`（camelCase 字段），供脚本与 GUI 消费。
 
 ```bash
 xr index status                     # 看当前工作区索引状态
-xr index rebuild 词库.shards         # 重扫分片目录，重建索引
+xr index files --stale              # 哪些文件被外部改过
+xr index update                     # 增量修好它们（自愈）
+xr index rebuild 词库.shards         # 或整库重扫
 xr index compact                     # 压实日志
 xr index check                       # 一致性抽查
+xr index drop --yes                  # 删掉索引（数据不动）
 ```
 
 ### `xr history <file> <node-id>`

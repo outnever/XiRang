@@ -140,6 +140,8 @@ pub const TABLE: &[(&str, &str)] = &[
     ("重置视图", "Reset view"),
     ("图已按上限截断", "Graph truncated at the limit"),
     ("按根聚合", "Group by root"),
+    ("已按预算截断", "Truncated by budget"),
+    ("索引降级", "Index fallback"),
 ];
 
 /// 取文案：表里有就用英文，没有就原样返回中文。

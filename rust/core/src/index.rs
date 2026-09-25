@@ -76,6 +76,9 @@ pub const REV_SIZE: u64 = 80;
 /// 已扫描区间之前的「守护窗口」大小（字节）。
 pub const GUARD_WINDOW: u64 = 65536;
 
+/// 列顶层根时的扫描上限（屏幕装不下更多，超出截断）。
+pub const ROOTS_LIMIT: usize = 5_000;
+
 /// sidecar 路径 = 源文件全名后追加 `.idx`（如 `foo.xirang` → `foo.xirang.idx`）。
 pub fn sidecar_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
@@ -1190,6 +1193,163 @@ pub trait Backend {
     fn last_error(&self) -> Option<String> {
         None
     }
+
+    // —— 界面需要的「按点 / 按邻域」查询（只读，不写盘、不新增索引文件）——
+
+    /// 顶层根（父为空的节点）。默认走「空父的孩子」；后端有更快路径可覆盖。
+    fn roots(&mut self) -> Vec<Uuid> {
+        self.children(codec::NIL_UUID)
+            .into_iter()
+            .map(|(_, n)| n.id)
+            .collect()
+    }
+
+    /// 孩子数量。默认实现只数索引条目、**不解码节点字节**；后端可覆盖为更省的做法。
+    fn child_count(&mut self, parent: Uuid) -> usize {
+        self.children(parent).len()
+    }
+
+    /// 以 `id` 为中心向外扩 `depth` 跳的邻域（节点 + 其中的边），**带预算**。
+    ///
+    /// 出边直接读该节点自身的值（息壤里一个节点最多一个引用值，O(1)，不查索引）；
+    /// 入边走反向表。触顶立即停止并回报 `truncated`——屏幕有限，不做无界扩散。
+    fn neighbors(&mut self, id: Uuid, depth: usize, budget: Budget) -> Neighborhood {
+        let mut ids: Vec<Uuid> = vec![id];
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        seen.insert(id);
+        let mut edges: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut frontier: Vec<Uuid> = vec![id];
+        let mut truncated = false;
+        'outer: for _ in 0..depth.max(1) {
+            let mut next: Vec<Uuid> = Vec::new();
+            for u in frontier {
+                if let Some((_, n)) = self.locate(u).into_iter().next() {
+                    if let codec::Value::Reference(t) = n.value {
+                        edges.push((u, t));
+                        if seen.insert(t) {
+                            ids.push(t);
+                            next.push(t);
+                        }
+                    }
+                }
+                for (_, src) in self.references(u) {
+                    edges.push((src, u));
+                    if seen.insert(src) {
+                        ids.push(src);
+                        next.push(src);
+                    }
+                }
+                if ids.len() > budget.max_nodes || edges.len() > budget.max_edges {
+                    truncated = true;
+                    break 'outer;
+                }
+            }
+            frontier = next;
+        }
+        let mut nodes: Vec<FileNode> = Vec::new();
+        for i in &ids {
+            if let Some(f) = self.locate(*i).into_iter().next() {
+                nodes.push(f);
+            }
+        }
+        Neighborhood {
+            nodes,
+            edges,
+            truncated,
+        }
+    }
+
+    /// 节点所属的顶层根（按根聚合时用）。
+    fn root_of(&mut self, id: Uuid) -> Option<Uuid> {
+        let _ = id;
+        None
+    }
+
+    /// **有界**地枚举全部引用边。只给整体视角的调用方用（按根聚合的图 / 导出统计）；
+    /// 界面按视口取数请用 `neighbors` / `edges_among`。
+    fn all_edges(&mut self, limit: usize) -> Vec<(Uuid, Uuid)> {
+        let _ = limit;
+        Vec::new()
+    }
+
+    /// 按根聚合的边（根 → 根），有界：把 `all_edges` 的两端折算成所属根。
+    fn root_edges(&mut self, roots: &[Uuid], limit: usize) -> (Vec<(Uuid, Uuid)>, bool) {
+        let set: HashSet<Uuid> = roots.iter().copied().collect();
+        let all = self.all_edges(limit);
+        let truncated = all.len() >= limit;
+        let mut cache: HashMap<Uuid, Option<Uuid>> = HashMap::new();
+        let mut out: Vec<(Uuid, Uuid)> = Vec::new();
+        for (s, t) in all {
+            let rs = match cache.get(&s) {
+                Some(v) => *v,
+                None => {
+                    let v = self.root_of(s);
+                    cache.insert(s, v);
+                    v
+                }
+            };
+            let rt = match cache.get(&t) {
+                Some(v) => *v,
+                None => {
+                    let v = self.root_of(t);
+                    cache.insert(t, v);
+                    v
+                }
+            };
+            if let (Some(rs), Some(rt)) = (rs, rt) {
+                if rs != rt && set.contains(&rs) && set.contains(&rt) {
+                    out.push((rs, rt));
+                }
+            }
+        }
+        (out, truncated)
+    }
+
+    /// 给定集合**内部**的边；集合外的边一律不返回（只读集合成员的节点值，不查索引）。
+    fn edges_among(&mut self, ids: &[Uuid], budget: Budget) -> (Vec<(Uuid, Uuid)>, bool) {
+        let set: HashSet<Uuid> = ids.iter().copied().collect();
+        let mut out: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut truncated = false;
+        for id in ids {
+            if let Some((_, n)) = self.locate(*id).into_iter().next() {
+                if let codec::Value::Reference(t) = n.value {
+                    if set.contains(&t) {
+                        out.push((*id, t));
+                        if out.len() >= budget.max_edges {
+                            truncated = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        (out, truncated)
+    }
+}
+
+/// 邻域 / 集合查询的预算（默认值：节点 300、边 800）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub max_nodes: usize,
+    pub max_edges: usize,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Budget {
+            max_nodes: 300,
+            max_edges: 800,
+        }
+    }
+}
+
+/// 邻域查询结果。
+#[derive(Clone, Debug, Default)]
+pub struct Neighborhood {
+    pub nodes: Vec<FileNode>,
+    pub edges: Vec<(Uuid, Uuid)>,
+    /// 是否因为预算触顶而截断
+    pub truncated: bool,
 }
 
 /// 侧车后端：每文件一份 XRIDX，逐个文件查（旧行为）。
@@ -1263,6 +1423,60 @@ impl Backend for SidecarBackend {
         self.files.len()
     }
 
+    /// 侧车里有现成的根块，直接取；没有再退化为「空父的孩子」。
+    fn roots(&mut self) -> Vec<Uuid> {
+        let mut out: Vec<Uuid> = Vec::new();
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        for (_, sc) in &mut self.files {
+            for r in sc.all_roots().unwrap_or_default() {
+                if seen.insert(r) {
+                    out.push(r);
+                }
+            }
+        }
+        if out.is_empty() {
+            for (_, n) in self.children(codec::NIL_UUID) {
+                if seen.insert(n.id) {
+                    out.push(n.id);
+                }
+            }
+        }
+        out
+    }
+
+    fn root_of(&mut self, id: Uuid) -> Option<Uuid> {
+        for (_, sc) in &mut self.files {
+            if let Ok(Some(r)) = sc.find_assign(id) {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    fn all_edges(&mut self, limit: usize) -> Vec<(Uuid, Uuid)> {
+        let mut out: Vec<(Uuid, Uuid)> = Vec::new();
+        for (_, sc) in &mut self.files {
+            for e in sc.all_edges().unwrap_or_default() {
+                out.push(e);
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
+    /// 只数父子块的条目，不解码节点字节（大节点下省内存）。
+    fn child_count(&mut self, parent: Uuid) -> usize {
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        for (_, sc) in &mut self.files {
+            for (child, _, _) in sc.find_children(parent).unwrap_or_default() {
+                seen.insert(child);
+            }
+        }
+        seen.len()
+    }
+
     fn kind(&self) -> &'static str {
         "sidecar"
     }
@@ -1328,6 +1542,32 @@ impl Backend for WorkspaceBackend {
         self.reader.file_count()
     }
 
+    /// 台账没有单独的根清单 → 扫一遍定位表，取「自己是自己的根」的条目（带上限）。
+    fn roots(&mut self) -> Vec<Uuid> {
+        self.reader.roots(ROOTS_LIMIT)
+    }
+
+    fn root_of(&mut self, id: Uuid) -> Option<Uuid> {
+        self.reader.root_of(id)
+    }
+
+    fn all_edges(&mut self, limit: usize) -> Vec<(Uuid, Uuid)> {
+        self.reader.edges(limit)
+    }
+
+    /// 只数关系表条目，不读节点字节。
+    fn child_count(&mut self, parent: Uuid) -> usize {
+        let kids = self.reader.children_of(parent);
+        let hits = self.note(kids);
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        for h in hits {
+            if let Ok(n) = crate::wsidx::read_node_at_hit(&h) {
+                seen.insert(n.id);
+            }
+        }
+        seen.len()
+    }
+
     fn opens(&self) -> u64 {
         self.reader.opens
     }
@@ -1390,6 +1630,56 @@ impl Backend for MemoryBackend {
 
     fn references(&mut self, target: Uuid) -> Vec<(String, Uuid)> {
         self.reverse.get(&target).cloned().unwrap_or_default()
+    }
+
+    fn root_of(&mut self, id: Uuid) -> Option<Uuid> {
+        for (_, s) in &self.files {
+            if let Some(n) = s.get(id) {
+                let mut cur = n;
+                let mut guard = 0;
+                while let Some(p) = cur.parent {
+                    guard += 1;
+                    if guard > 4096 {
+                        break;
+                    }
+                    match s.get(p) {
+                        Some(pn) => cur = pn,
+                        None => break,
+                    }
+                }
+                return Some(cur.id);
+            }
+        }
+        None
+    }
+
+    fn all_edges(&mut self, limit: usize) -> Vec<(Uuid, Uuid)> {
+        let mut out: Vec<(Uuid, Uuid)> = Vec::new();
+        for (_, s) in &self.files {
+            for n in s.nodes() {
+                if let codec::Value::Reference(t) = n.value {
+                    out.push((n.id, t));
+                    if out.len() >= limit {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 内存里的根就是「父为空」的节点（不是挂在空编号下）。
+    fn roots(&mut self) -> Vec<Uuid> {
+        let mut out: Vec<Uuid> = Vec::new();
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        for (_, s) in &self.files {
+            for n in s.roots() {
+                if seen.insert(n.id) {
+                    out.push(n.id);
+                }
+            }
+        }
+        out
     }
 
     fn subtree(&mut self, root: Uuid) -> Vec<FileNode> {
@@ -1499,6 +1789,36 @@ impl LazyWorkspace {
     /// 并集后的孩子：所有文件里父边指向该编号的节点，同一个孩子编号只算一次。
     pub fn children_union(&mut self, id: Uuid) -> Vec<(String, Node)> {
         self.backend.children(id)
+    }
+
+    /// 顶层根（父为空的节点）。
+    pub fn roots(&mut self) -> Vec<Uuid> {
+        self.backend.roots()
+    }
+
+    /// 孩子数量（只数索引条目，不读节点字节）。
+    pub fn child_count(&mut self, parent: Uuid) -> usize {
+        self.backend.child_count(parent)
+    }
+
+    /// 以 `id` 为中心的一跳/多跳邻域（带预算，屏幕有限不做无界扩散）。
+    pub fn neighbors(&mut self, id: Uuid, depth: usize, budget: Budget) -> Neighborhood {
+        self.backend.neighbors(id, depth, budget)
+    }
+
+    /// 给定集合内部的边（只返回集合内的，集合外的边不返回）。
+    pub fn edges_among(&mut self, ids: &[Uuid], budget: Budget) -> (Vec<(Uuid, Uuid)>, bool) {
+        self.backend.edges_among(ids, budget)
+    }
+
+    /// 有界地枚举全部引用边（整体视角用）。
+    pub fn all_edges(&mut self, limit: usize) -> Vec<(Uuid, Uuid)> {
+        self.backend.all_edges(limit)
+    }
+
+    /// 按根聚合的边（根 → 根），有界。
+    pub fn root_edges(&mut self, roots: &[Uuid], limit: usize) -> (Vec<(Uuid, Uuid)>, bool) {
+        self.backend.root_edges(roots, limit)
     }
 
     /// 谁引用了我：跨所有文件聚合反向边，逐个懒加载源节点。

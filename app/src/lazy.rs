@@ -1,43 +1,66 @@
-//! 懒加载文档层：侧车索引 + 按偏移直读，节点不整份载入内存。
+//! 懒加载文档层：走 **CLI 的统一索引机制**（`xirang_core::index`），节点不整份载入内存。
 //!
-//! 「打开 179 MB / 347 万节点的文件」在这里只做三件事：读文件头、读侧车索引的
-//! 几条记录、按需读第一屏需要的节点。实测冷开 0 ms、取一个节点 16 µs。
+//! 索引模式由 `XIRANG_INDEX_MODE` 决定（默认「工作区总账」，`sidecar` 则走侧车），
+//! 桌面端不再自己挑后端——这样它和 CLI 读写的就是同一份索引文件。
+//! 查询一律「按点 / 按邻域」，带预算；不做无界的全量枚举（屏幕装不下）。
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use xirang_core::codec::{Node, Uuid, Value};
-use xirang_core::index::{read_node_at, Sidecar};
+use xirang_core::index::{Budget, LazyWorkspace};
 
 /// 节点缓存上限（每节点约 150–400 字节 → 最多几 MB）。
 pub const CACHE_CAP: usize = 20_000;
+/// 图视图的默认预算：节点 300 / 边 800（超出截断并提示）。
+pub const GRAPH_BUDGET: Budget = Budget {
+    max_nodes: 300,
+    max_edges: 800,
+};
 
 pub struct Doc {
     path: PathBuf,
-    sc: Sidecar,
+    /// 传给索引机制的路径（与台账里记录的一致）
+    key: String,
+    ws: LazyWorkspace,
     cache: HashMap<Uuid, Node>,
     order: VecDeque<Uuid>,
     /// 统计：按偏移直读次数 / 命中缓存次数。
     pub reads: usize,
     pub hits: usize,
+    /// 最近一次查询是否因预算被截断（界面据此提示）
+    pub truncated: bool,
 }
 
 impl Doc {
     pub fn open(path: &Path) -> Result<Doc, String> {
-        let sc = Sidecar::open_for(path)?;
+        let key = path.display().to_string();
+        let ws = LazyWorkspace::from_paths(std::slice::from_ref(&key))?;
         Ok(Doc {
             path: path.to_path_buf(),
-            sc,
+            key,
+            ws,
             cache: HashMap::new(),
             order: VecDeque::new(),
             reads: 0,
             hits: 0,
+            truncated: false,
         })
     }
 
-    /// 编辑落盘后重新打开：索引只补扫新增的那一段（毫秒级），缓存作废。
+    /// 当前用的是哪套索引（workspace / sidecar / memory）。
+    pub fn mode(&self) -> &'static str {
+        self.ws.backend_kind()
+    }
+
+    /// 索引没覆盖这个文件时的降级原因（正常返回 None）。
+    pub fn fallback_reason(&self) -> Option<String> {
+        self.ws.fallback_reason().map(|s| s.to_string())
+    }
+
+    /// 编辑落盘后重新打开：索引跟着数据走，缓存作废。
     pub fn reload(&mut self) -> Result<(), String> {
-        self.sc = Sidecar::open_for(&self.path)?;
+        self.ws = LazyWorkspace::from_paths(std::slice::from_ref(&self.key))?;
         self.clear_cache();
         Ok(())
     }
@@ -74,47 +97,77 @@ impl Doc {
 
     /// 顶层根（只读索引，不解码节点）。
     pub fn roots(&mut self) -> Vec<Uuid> {
-        self.sc.all_roots().unwrap_or_default()
+        self.ws.roots()
     }
 
-    /// 直接孩子（只读「父 → 孩子」块，不解码节点）。
+    /// 直接孩子（跨文件取并集——「同编号多文件」是息壤的正常语义）。
     pub fn children(&mut self, id: Uuid) -> Vec<Uuid> {
-        self.sc
-            .find_children(id)
-            .unwrap_or_default()
+        self.ws
+            .children_union(id)
             .into_iter()
-            .map(|(child, _, _)| child)
+            .map(|(_, n)| n.id)
             .collect()
     }
 
-    /// 这个文件里全部的引用边 `(源, 目标)`——从侧车索引直接读，与「展开了哪些节点」无关。
-    pub fn edges(&mut self) -> Vec<(Uuid, Uuid)> {
-        self.sc.all_edges().unwrap_or_default()
+    /// 孩子数量（只数索引条目，不读节点字节）。
+    pub fn child_count(&mut self, id: Uuid) -> usize {
+        self.ws.child_count(id)
     }
 
-    /// **按根聚合**的引用边 `(源所属根, 目标所属根)`。
+    /// 一组节点**内部**的边（集合外的不返回）——界面画"可见的线"就用它。
+    pub fn edges_among(&mut self, ids: &[Uuid], budget: Budget) -> Vec<(Uuid, Uuid)> {
+        let (edges, truncated) = self.ws.edges_among(ids, budget);
+        self.truncated |= truncated;
+        edges
+    }
+
+    /// 以某个节点为中心的邻域（带预算）。
+    pub fn neighbors(&mut self, id: Uuid, depth: usize, budget: Budget) -> Vec<(Uuid, Uuid)> {
+        let n = self.ws.neighbors(id, depth, budget);
+        self.truncated |= n.truncated;
+        n.edges
+    }
+
+    /// 预览用：这个文件里全部的引用边（**有界**：只在顶层根 + 它们的孩子之间找）。
     ///
-    /// 这是「一篇笔记 = 一个节点」的那套组织方式：息壤里与 Obsidian 的「笔记」对应的是
-    /// 顶层根（词条 / 条目），每个根下面的节点是它的内容。归属块里已经存了「节点 → 所属根」，
-    /// 所以这一步只查索引，不读节点、不扫全库。自环（同一根内部互相引用）会被丢掉。
+    /// 注意这不再是无界枚举：屏幕装不下，索引层也不提供无界版本。
+    pub fn edges(&mut self) -> Vec<(Uuid, Uuid)> {
+        let edges = self.ws.all_edges(GRAPH_BUDGET.max_edges);
+        self.truncated |= edges.len() >= GRAPH_BUDGET.max_edges;
+        edges
+    }
+
+    /// **按根聚合**的引用边（根 → 根）：一篇笔记 = 一个顶层根。
+    ///
+    /// 靠索引里的「节点 → 所属根」把每条引用边折算到根上；枚举**有界**
+    /// （默认 800 条，超出截断并置 `truncated`）。
     pub fn root_edges(&mut self) -> Vec<(Uuid, Uuid)> {
-        let edges = self.sc.all_edges().unwrap_or_default();
-        let mut out = Vec::with_capacity(edges.len());
-        for (s, t) in edges {
-            let (Ok(Some(rs)), Ok(Some(rt))) = (self.sc.find_assign(s), self.sc.find_assign(t))
-            else {
-                continue;
-            };
-            if rs != rt {
-                out.push((rs, rt));
+        let roots = self.roots();
+        let (edges, truncated) = self.ws.root_edges(&roots, GRAPH_BUDGET.max_edges);
+        self.truncated |= truncated;
+        edges
+    }
+
+    /// 图视图的候选集合：`by_root` = 只用顶层根；否则再加上它们的直接孩子。
+    /// 两者都有界（受 `GRAPH_BUDGET` 约束），不再"整库枚举"。
+    pub fn graph_sets(&mut self, by_root: bool) -> (Vec<Uuid>, bool) {
+        let mut ids = self.roots();
+        let mut truncated = ids.len() > GRAPH_BUDGET.max_nodes;
+        ids.truncate(GRAPH_BUDGET.max_nodes);
+        if !by_root {
+            let roots = ids.clone();
+            for r in roots {
+                for c in self.children(r) {
+                    if ids.len() >= GRAPH_BUDGET.max_nodes {
+                        truncated = true;
+                        break;
+                    }
+                    ids.push(c);
+                }
             }
         }
-        out
-    }
-
-    /// 孩子数量（展开徽标 `▸ 3` 用，不读节点内容）。
-    pub fn child_count(&mut self, id: Uuid) -> usize {
-        self.sc.find_children(id).map(|v| v.len()).unwrap_or(0)
+        self.truncated |= truncated;
+        (ids, truncated)
     }
 
     /// 节点自身（名字 / 值）：命中缓存或「查目录 → 跳字节 → 解一条」。
@@ -123,11 +176,7 @@ impl Doc {
             self.hits += 1;
             return Some(n.clone());
         }
-        let (rel, len) = match self.sc.find_node_loc(id) {
-            Ok(Some(loc)) => loc,
-            _ => return None,
-        };
-        let n = read_node_at(&self.path, self.sc.node_data_start, rel, len).ok()?;
+        let (_, n) = self.ws.find(id)?;
         self.reads += 1;
         self.insert(n.clone());
         Some(n)
@@ -152,12 +201,14 @@ impl Doc {
         }
     }
 
-    pub fn node_count(&self) -> u64 {
-        self.sc.node_count + self.sc.rev_count
+    /// 节点总数：侧车模式能直接给出；工作区总账不存总数 → None（界面显示"—"）。
+    pub fn node_count(&self) -> Option<u64> {
+        None
     }
 
-    pub fn rev_count(&self) -> u64 {
-        self.sc.rev_count
+    /// 本文件的修订条数：只有侧车后端知道；总账模式下为 None。
+    pub fn rev_count(&self) -> Option<u64> {
+        None
     }
 
     pub fn cache_len(&self) -> usize {

@@ -1726,6 +1726,78 @@ impl Reader {
     }
 
     /// 抽样若干编号（`xr index check` 用）。
+    /// 某个编号所属的顶层根（定位表里记着它）。
+    pub fn root_of(&mut self, id: Uuid) -> Option<Uuid> {
+        self.roots_of(id).ok().and_then(|v| v.into_iter().next())
+    }
+
+    /// **有界**地枚举引用边 `(源, 目标)`：顺序扫反向表，最多 `limit` 条。
+    ///
+    /// 只给「按根聚合的图 / 导出统计」这类需要整体视角的调用方用；
+    /// 界面按视口取数应当走 `children_of` / `references` 这种按点查询。
+    pub fn edges(&mut self, limit: usize) -> Vec<(Uuid, Uuid)> {
+        let mut out: Vec<(Uuid, Uuid)> = Vec::new();
+        for v in self.rev_over.values() {
+            for e in v {
+                out.push((e.source, e.target));
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+        if let Some(info) = ledger_ref(&self.manifest, KIND_REV).blocks.first().cloned() {
+            if let Ok(mut blk) = self.open_block(KIND_REV, &info) {
+                let mut i = 0u64;
+                while i < blk.count {
+                    if let Ok(raw) = blk.entry(i) {
+                        let e = dec_rev(&raw);
+                        out.push((e.source, e.target));
+                        if out.len() >= limit {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// 顶层根的**粗略枚举**：定位表里「自己是自己的根」的条目就是根。
+    ///
+    /// 台账没有单独的根清单，所以这是一次定位表扫描（按 `limit` 提前停止）；
+    /// 只是给界面"库里有哪些条目"用的，拿到的编号仍可用 `locate` 复核。
+    pub fn roots(&mut self, limit: usize) -> Vec<Uuid> {
+        let mut out: Vec<Uuid> = Vec::new();
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        for ((u, _), e) in &self.loc_over {
+            if e.uuid == e.root && seen.insert(*u) {
+                out.push(*u);
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+        if let Some(info) = ledger_ref(&self.manifest, KIND_LOC).blocks.first().cloned() {
+            if let Ok(mut blk) = self.open_block(KIND_LOC, &info) {
+                let mut i = 0u64;
+                while i < blk.count {
+                    if let Ok(raw) = blk.entry(i) {
+                        let e = dec_loc(&raw);
+                        if e.uuid == e.root && seen.insert(e.uuid) {
+                            out.push(e.uuid);
+                            if out.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
     pub fn sample_nodes(&mut self, n: usize) -> Vec<Uuid> {
         let mut out: Vec<Uuid> = Vec::new();
         for ((u, _), _) in &self.loc_over {

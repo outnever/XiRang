@@ -1107,13 +1107,9 @@ impl eframe::App for App {
                     let labels: Vec<String> = self
                         .tabs
                         .iter()
-                        .map(|t| {
-                            let revs = t.doc.rev_count();
-                            if revs > 0 {
-                                format!("{}（+{revs}）", t.label())
-                            } else {
-                                t.label()
-                            }
+                        .map(|t| match t.doc.rev_count() {
+                            Some(revs) if revs > 0 => format!("{}（+{revs}）", t.label()),
+                            _ => t.label(),
                         })
                         .collect();
                     let mut active = self.active;
@@ -1308,15 +1304,31 @@ impl eframe::App for App {
                 ui.label(&self.status);
                 if let Some(tab) = self.tabs.get(self.active) {
                     ui.separator();
+                    let counts = match (tab.doc.node_count(), tab.doc.rev_count()) {
+                        (Some(n), Some(r)) => format!("节点 {n}（含修订 {r}）· "),
+                        _ => String::new(),
+                    };
                     ui.label(format!(
-                        "节点 {}（含修订 {}）· 缓存 {} 个 / 约 {} KB · 命中 {} / 直读 {}",
-                        tab.doc.node_count(),
-                        tab.doc.rev_count(),
+                        "{counts}缓存 {} 个 / 约 {} KB · 命中 {} / 直读 {} · 索引 {}",
                         tab.doc.cache_len(),
                         tab.doc.cache_bytes() / 1024,
                         tab.doc.hits,
-                        tab.doc.reads
+                        tab.doc.reads,
+                        tab.doc.mode()
                     ));
+                    if tab.doc.truncated {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 140, 60),
+                            t("已按预算截断"),
+                        );
+                    }
+                    // 索引没覆盖这个文件时会降级成「整份载入」——必须让用户看见
+                    if let Some(why) = tab.doc.fallback_reason() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 140, 60),
+                            format!("{}（{why}）", t("索引降级")),
+                        );
+                    }
                 }
                 if self.graph.node_count() > 0 {
                     ui.separator();

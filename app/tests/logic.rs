@@ -175,7 +175,7 @@ fn lazy_reads_only_what_is_needed() {
     sample(&p);
     let mut doc = Doc::open(&p).unwrap();
     assert_eq!(doc.reads, 0, "打开时不读节点");
-    assert_eq!(doc.node_count(), 5, "根 + 词形 + 词义 + 01 + 释义");
+    assert!(doc.node_count().is_none() || doc.node_count() == Some(5), "节点数（总账模式不存总数 → None）");
     let roots = doc.roots();
     assert_eq!(roots.len(), 1);
     let _ = doc.node(roots[0]);

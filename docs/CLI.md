@@ -28,6 +28,8 @@ cargo build --manifest-path rust/Cargo.toml -p xirang-cli
 - **I/O 约定**：数据走 stdout，错误/提示走 stderr，退出码 `0`=成功、`1`=校验失败、`2`=用法/运行错误。命令可安全批处理、供程序解析。
 - `--json`：结构化输出（替代人类可读文本），供程序/大模型消费，后面不再重复说明。
 - `--no-history`：写操作不记 `@history`/`@created`（批量创建、初始数据用）。
+- `--yes`：确认执行被护栏拦下的操作（改模板定义、`tmpl rm`、`import` 覆盖非空文件、`blob-export` 覆盖已有文件）。
+- **给 AI 代理用**：`xr-mcp` 把同一套操作暴露成结构化工具（能力与护栏完全一致，另外限定在允许目录内），见 [MCP](MCP.md)。
 - `--yes`：跳过保护性确认。
 - `--no-index`：读命令默认会把读到的文件登记进**本机目录**（见「本机目录」节），此标志单次关闭；也可用环境变量 `XIRANG_INDEX=off` 全局关闭。
 - 路径寻址：`名/子名/孙名`（`/` 分隔），相对某子树根。
@@ -306,7 +308,7 @@ xr blob-import 资产.xirang nil logo.png
 ```
 
 ### `xr blob-export <file> <node-id> <dest>`
-导出二进制块为文件。
+导出二进制块为文件。**目标文件已存在时拒绝覆盖**，确认要覆盖请加 `--yes`（这条护栏与 MCP 侧一致）。
 
 ```bash
 xr blob-export 资产.xirang <节点ID> out.png
@@ -340,6 +342,8 @@ xr export 数据.xirang json --subtree <节点ID>    # 只导出某子树
 
 ### `xr import <file> <json|yaml|xml> <source>`
 导入（`json` 需是 `xr export json` 的格式；`data.json` 若为记录数组且想按模板实例化，用 `--template`，见上）。
+
+这是**整文件替换**：目标文件里已有节点时会被拦下，确认覆盖请加 `--yes`；想保留原内容请改用 `--append` / `--template`。
 
 ```bash
 xr import 数据.xirang yaml data.yaml

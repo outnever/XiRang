@@ -28,7 +28,8 @@ cargo build --manifest-path rust/Cargo.toml -p xirang-cli
 - **I/O convention**: data goes to stdout, errors/notes go to stderr; exit codes are `0`=success, `1`=validation failed, `2`=usage/runtime error. Commands are safe to pipeline and to parse programmatically.
 - `--json`: structured output (instead of human text), for programs/LLMs.
 - `--no-history`: write operations do not record `@history`/`@created` (for batch creation / initial data).
-- `--yes`: skip a protective confirmation.
+- `--yes`: confirm an action that a guard stopped (template-definition edits, `tmpl rm`, `import` over a non-empty file, `blob-export` over an existing file).
+- **For AI agents**: `xr-mcp` exposes the same operations as structured tools (identical capabilities and guards, plus confinement to allowed roots) — see [MCP](MCP.en.md).
 - `--no-index`: read commands index the files they touch into the **local catalog** by default (see "Local catalog"); this flag disables it for one run, and `XIRANG_INDEX=off` disables it globally.
 - Path addressing: `name/child/grandchild` (`/`-separated), relative to a given subtree root.
 
@@ -306,7 +307,7 @@ xr blob-import assets.xirang nil logo.png
 ```
 
 ### `xr blob-export <file> <node-id> <dest>`
-Export a blob node to a file.
+Export a blob node to a file. It **refuses to overwrite an existing file** — add `--yes` if you really want to replace it (same guard as the MCP side).
 
 ```bash
 xr blob-export assets.xirang <nodeID> out.png
@@ -340,6 +341,8 @@ xr export data.xirang json --subtree <nodeID>    # export only a subtree
 
 ### `xr import <file> <json|yaml|xml> <source>`
 Import. `json` must be the `xr export json` format; for an array of records, use `--template` (see above).
+
+This **replaces the whole file**: if the target already holds nodes you'll be stopped — add `--yes` to overwrite, or use `--append` / `--template` to keep what's there.
 
 ```bash
 xr import data.xirang yaml data.yaml

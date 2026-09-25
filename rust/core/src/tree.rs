@@ -431,6 +431,60 @@ impl Store {
         Ok(())
     }
 
+    /// 裁剪某个节点的 `@history` 留痕：保留最近的 `keep` 条，并（可选）只裁掉早于 `before` 的。
+    ///
+    /// `before` 是 ISO 时间前缀（如 `2026-01-01` 或 `2026-09-23T22:00`），与快照上的
+    /// `@replaced` 做字符串比较——同一时间格式下，字符串序就是时间序。
+    /// 被裁掉的快照是**真正的结构删除**（它们只用于回滚）；`@history` 节点本身保留。
+    pub fn prune_history(
+        &mut self,
+        node_id: Uuid,
+        keep: usize,
+        before: Option<&str>,
+    ) -> Result<PruneReport, String> {
+        let node = self.get(node_id).cloned().ok_or("节点不存在")?;
+        let hist = match self.child_by_name(&node, "@history") {
+            Some(h) => h.clone(),
+            None => {
+                return Ok(PruneReport {
+                    removed: 0,
+                    kept: 0,
+                    before_nodes: self.nodes.len(),
+                    after_nodes: self.nodes.len(),
+                })
+            }
+        };
+        let snaps: Vec<Node> = self.children(&hist).into_iter().cloned().collect();
+        let total = snaps.len();
+        let keep_from = total.saturating_sub(keep);
+        let mut doomed: Vec<Uuid> = Vec::new();
+        for (i, s) in snaps.iter().enumerate() {
+            let old_enough = match before {
+                None => true,
+                Some(cut) => match self.child_by_name(s, "@replaced") {
+                    Some(r) => match &r.value {
+                        Value::Text(t) => t.as_str() < cut,
+                        _ => false,
+                    },
+                    None => false, // 没有 @replaced 的快照保守留下
+                },
+            };
+            if i < keep_from && old_enough {
+                doomed.push(s.id);
+            }
+        }
+        let before_nodes = self.nodes.len();
+        for id in &doomed {
+            self.remove_subtree(*id)?;
+        }
+        Ok(PruneReport {
+            removed: doomed.len(),
+            kept: total - doomed.len(),
+            before_nodes,
+            after_nodes: self.nodes.len(),
+        })
+    }
+
     /// 确保 node_id 下有 @history 辅助节点，返回其编号；没有则建。
     fn ensure_history(&mut self, node_id: Uuid) -> Uuid {
         if let Some(h) = self
@@ -504,6 +558,15 @@ impl Store {
         let nodes = parse_file(&data)?;
         Store::decode(nodes).map_err(codec_error)
     }
+}
+
+/// 裁剪留痕的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PruneReport {
+    pub removed: usize,
+    pub kept: usize,
+    pub before_nodes: usize,
+    pub after_nodes: usize,
 }
 
 /// 复制子树的选项。

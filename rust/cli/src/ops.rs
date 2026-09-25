@@ -1412,6 +1412,63 @@ pub fn fill_values(
     Ok(FillOutcome { count: assigns.len() })
 }
 
+pub struct PruneHistoryOutcome {
+    pub removed: usize,
+    pub kept: usize,
+    pub nodes_before: usize,
+    pub nodes_after: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// 预演：只算不落盘
+    pub dry_run: bool,
+}
+
+/// 裁剪某节点的 `@history` 留痕：保留最近 `keep` 条，可选只裁早于 `before` 的。
+/// 破坏性（丢掉回滚能力）→ 没有 `force` 时若确实有东西可裁，返回 `guarded` 让调用方决定。
+pub fn prune_history(
+    pol: &Policy,
+    hooks: &dyn Hooks,
+    file: &str,
+    node: &str,
+    keep: usize,
+    before: Option<&str>,
+    dry_run: bool,
+) -> OpResult<PruneHistoryOutcome> {
+    let id = parse_uuid("节点 ID", node)?;
+    let (mut store, path, in_collection) = load_target(pol, hooks, file, Some(id))?;
+    if store.get(id).is_none() {
+        return Err(OpError::not_found(format!("节点不存在：{node}")));
+    }
+    guard_editable(pol, &store, id)?;
+    let bytes_before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let nodes_before = store.len();
+    let report = store.prune_history(id, keep, before).map_err(OpError::internal)?;
+    if report.removed > 0 && !pol.force {
+        return Err(OpError::guarded(
+            format!(
+                "裁剪留痕会丢掉这 {} 条快照的回滚能力（保留 {} 条）",
+                report.removed, report.kept
+            ),
+            "确认要裁就带 force（CLI：--yes）",
+        ));
+    }
+    let bytes_after = if dry_run || report.removed == 0 {
+        bytes_before
+    } else {
+        save(hooks, &store, &path, in_collection, None)?;
+        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+    };
+    Ok(PruneHistoryOutcome {
+        removed: report.removed,
+        kept: report.kept,
+        nodes_before,
+        nodes_after: report.after_nodes,
+        bytes_before,
+        bytes_after,
+        dry_run,
+    })
+}
+
 pub struct RevertOutcome {
     pub id: Uuid,
     pub name: String,
@@ -1918,7 +1975,7 @@ pub const MCP_TOOLS: &[&str] = &[
 
 pub const QUERY_ACTIONS: &[&str] = &["find", "match", "instances", "refs", "history"];
 pub const NODE_ACTIONS: &[&str] =
-    &["create", "set", "rename", "remove", "link", "copy", "fill", "revert"];
+    &["create", "set", "rename", "remove", "link", "copy", "fill", "revert", "prune_history"];
 pub const TEMPLATE_ACTIONS: &[&str] = &["define", "list", "instantiate", "remove"];
 pub const CONVERT_ACTIONS: &[&str] = &["export", "import", "append"];
 pub const BLOB_ACTIONS: &[&str] = &["import", "export", "info"];

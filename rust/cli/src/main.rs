@@ -502,6 +502,33 @@ fn cmd_history(file: &str, node_id: &str) -> i32 {
     }
 }
 
+/// `xr history prune <file> <node-id> [--keep N] [--before <ISO前缀>] [--dry-run] [--yes]`
+/// 裁剪留痕：只保留最近 N 条快照（可选再要求「早于某时刻」），丢掉的是回滚能力。
+fn cmd_history_prune(file: &str, node_id: &str, keep: usize, before: Option<&str>, dry_run: bool, yes: bool) -> i32 {
+    match ops::prune_history(
+        &Policy::cli(yes),
+        &CliHooks,
+        file,
+        node_id,
+        keep,
+        before,
+        dry_run,
+    ) {
+        Ok(o) => {
+            let head = if o.dry_run { "（预演）将裁剪" } else { "已裁剪" };
+            println!(
+                "{head} {} 条留痕 · 保留 {} 条 · 节点 {} → {} · 文件 {} → {} 字节",
+                o.removed, o.kept, o.nodes_before, o.nodes_after, o.bytes_before, o.bytes_after
+            );
+            if o.removed == 0 {
+                println!("（没有可裁剪的快照：可能已被裁过，或 --before 比所有快照都早）");
+            }
+            0
+        }
+        Err(e) => report(&e),
+    }
+}
+
 fn cmd_export(file: &str, format: &str, subtree: Option<&str>) -> i32 {
     match ops::export_data(&Policy::cli(false), &CliHooks, file, format, subtree) {
         Ok(o) => {
@@ -2076,6 +2103,8 @@ fn usage() {
     println!("  xr catalog trash <路径>             移文件到回收站并从目录移除");
     println!("  （读命令默认维护本机目录；--no-index 或 XIRANG_INDEX=off 关闭）");
     println!("  xr history <file> <node-id>          查看 @history 快照");
+    println!("  xr history prune <file> <node-id> [--keep N] [--before <ISO前缀>] [--dry-run] [--yes]");
+    println!("      裁剪留痕：只保留最近 N 条（默认 20）快照，可选只裁早于某时刻的；丢掉的是回滚能力，故要 --yes");
     println!("  xr blob-import <file> <parent|nil> <src>   导入文件为二进制块");
     println!("  xr blob-export <file> <node-id> <dest>    导出二进制块为文件（目标已存在要加 --yes 覆盖）");
     println!("  xr blob-info <file> <node-id>           二进制块信息 / 预览");
@@ -2541,6 +2570,34 @@ fn main() {
             if args.len() < 4 {
                 usage();
                 2
+            } else if args[2] == "prune" {
+                // xr history prune <file> <node-id> [--keep N] [--before T] [--dry-run] [--yes]
+                if args.len() < 5 {
+                    eprintln!("错误：用法 xr history prune <file> <node-id> [--keep N] [--before <ISO前缀>] [--dry-run] [--yes]");
+                    2
+                } else {
+                    let keep = args
+                        .iter()
+                        .position(|a| a == "--keep")
+                        .and_then(|i| args.get(i + 1))
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(20);
+                    let before = args
+                        .iter()
+                        .position(|a| a == "--before")
+                        .and_then(|i| args.get(i + 1))
+                        .map(|s| s.as_str());
+                    cmd_history_prune(
+                        // 注意：这里的 `file`（args[2]）是子命令 "prune"，
+                        // 真正的文件名在 args[3]、节点在 args[4]
+                        &args[3],
+                        &args[4],
+                        keep,
+                        before,
+                        has_flag(&args, "--dry-run"),
+                        yes,
+                    )
+                }
             } else {
                 cmd_history(file, &args[3])
             }

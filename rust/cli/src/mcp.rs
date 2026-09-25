@@ -358,6 +358,29 @@ fn tool_node(cfg: &Config, args: &Value) -> Result<Value, OpError> {
                 "reason": o.no_snapshot,
             }))
         }
+        "prune_history" => {
+            // 裁剪留痕：丢掉的是回滚能力 → 没有 force 时由 ops 返回 guarded
+            let node = str_arg(args, "node")?;
+            let keep = usz_arg(args, "keep").unwrap_or(20);
+            let before = opt_str(args, "before");
+            let o = ops::prune_history(
+                &pol,
+                &ops::NoHooks,
+                &file,
+                &node,
+                keep,
+                before.as_deref(),
+                false,
+            )?;
+            Ok(json!({
+                "removed": o.removed,
+                "kept": o.kept,
+                "nodesBefore": o.nodes_before,
+                "nodesAfter": o.nodes_after,
+                "bytesBefore": o.bytes_before,
+                "bytesAfter": o.bytes_after,
+            }))
+        }
         _ => unreachable!(),
     }
 }
@@ -563,7 +586,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "node",
-            "description": "改节点。create=新建；set=改值；rename=改名（编号不变，旧名进 @history）；remove=删除（置空，可 revert 找回）；link=连引用边；copy=复制子树；fill=按名/路径赋值；revert=回滚到最近快照",
+            "description": "改节点。create=新建；set=改值；rename=改名（编号不变，旧名进 @history）；remove=删除（置空，可 revert 找回）；link=连引用边；copy=复制子树；fill=按名/路径赋值；revert=回滚到最近快照；prune_history=裁剪 @history 留痕（保留最近 keep 条，默认 20；会丢掉回滚能力，需 force）",
             "inputSchema": {"type": "object", "properties": {
                 "file": file_prop(),
                 "action": {"type": "string", "enum": ops::NODE_ACTIONS},
@@ -578,7 +601,9 @@ fn tool_defs() -> Vec<Value> {
                 "blank": {"type": "boolean", "description": "copy：只复制结构（标量值清空）"},
                 "root": {"type": "string", "description": "fill：赋值起点节点编号"},
                 "assigns": {"type": "array", "description": "fill：[{path, value}]，path 形如 \"词形\" 或 \"词义/01/释义\"",
-                    "items": {"type": "object", "properties": {"path": {"type": "string"}, "value": {}}, "required": ["path"]}}
+                    "items": {"type": "object", "properties": {"path": {"type": "string"}, "value": {}}, "required": ["path"]}},
+                "keep": {"type": "integer", "description": "prune_history：保留最近多少条快照，默认 20"},
+                "before": {"type": "string", "description": "prune_history：只裁早于该 ISO 时间前缀的快照（如 2026-01-01）"}
             }, "required": ["file", "action"]}
         }),
         json!({

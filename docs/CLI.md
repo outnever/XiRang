@@ -217,6 +217,25 @@ xr fill 词条.xirang <词条ID> 词形=灯 词义/01/释义=照明器具
 xr revert 数据.xirang <节点ID>
 ```
 
+### `xr history prune <file> <node-id> [--keep N] [--before <ISO前缀>] [--dry-run] [--yes]`
+裁剪留痕：只保留最近 N 条快照（默认 20），可选再要求「早于某时刻」。
+
+**为什么需要**：留痕是唯一会让单文件越用越大的东西——实测同一个节点连续改 50 次，默认写法文件 8850 字节、103 个节点，而 `--no-history` 只有 2498 字节、1 个节点（每改一次多 2 个节点：快照 + `@replaced`）。这些快照还会一起进索引。
+
+**注意**：被裁掉的快照是**真正的结构删除**，裁了就失去那部分回滚能力，所以：
+
+- 不带 `--yes` 时只打印「会丢掉多少条、保留多少条」并退出码 2
+- `--dry-run` 先预演（不动文件）
+- 保留的那几条仍可用 `xr revert` 回滚
+
+```bash
+xr history prune 数据.xirang <节点ID> --keep 5            # 先看会裁多少
+xr history prune 数据.xirang <节点ID> --keep 5 --yes      # 真裁
+xr history prune 数据.xirang <节点ID> --before 2026-01-01 --yes   # 只裁 2026 年以前的
+```
+
+跨文件的同一编号**不受影响**：裁剪只动这一个文件里这个节点的留痕，不会去重、也不会碰别的文件。
+
 ## 分片词库（shard）
 
 一个「大 `.xirang`」可无损拆成「目录 + 若干分片 `.xirang` + `manifest.xirang`」，之后写操作只动目标分片，不再重写整个词库。

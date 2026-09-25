@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::codec::{self, Node, Uuid};
+use crate::codec::{self, Node, Uuid, Value};
 use crate::tree::{self, Store};
 
 pub const MAGIC: &[u8; 5] = b"XRIDX";
@@ -572,125 +572,346 @@ pub fn read_node_at(
     crate::codec::decode_node(&buf, &mut off).map_err(tree::codec_error)
 }
 
-/// 跨文件工作区：只索引 + 按偏移读，节点数据不常驻；支持「同编号多文件」取并集。
+/// 索引模式：工作区三本台账（默认）还是每文件侧车。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexMode {
+    Workspace,
+    Sidecar,
+}
+
+/// 由环境变量 `XIRANG_INDEX_MODE` 决定：`sidecar` / `off` / `0` → 侧车；其余（含未设）→ 工作区台账。
+pub fn index_mode() -> IndexMode {
+    match std::env::var("XIRANG_INDEX_MODE").ok().as_deref() {
+        Some("sidecar") | Some("off") | Some("0") | Some("false") => IndexMode::Sidecar,
+        _ => IndexMode::Workspace,
+    }
+}
+
+/// 是否生成每文件侧车索引（工作区模式不再生成）。
+pub fn sidecar_enabled() -> bool {
+    index_mode() == IndexMode::Sidecar
+}
+
+/// 一处命中：哪个文件 + 节点。
+pub type FileNode = (String, Node);
+
+/// 「以某节点为根的整棵子树」（含根本身）——三个后端共用同一套展开语义：
+/// 先取自己，再逐层往下取孩子，同一编号只出现一次。
+fn bfs_subtree<F>(root: Uuid, mut children: F) -> Vec<FileNode>
+where
+    F: FnMut(Uuid) -> Vec<FileNode>,
+{
+    let mut out: Vec<FileNode> = Vec::new();
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    let mut queue: std::collections::VecDeque<Uuid> = std::collections::VecDeque::new();
+    queue.push_back(root);
+    seen.insert(root);
+    while let Some(id) = queue.pop_front() {
+        for (file, node) in children(id) {
+            if seen.insert(node.id) {
+                out.push((file, node.clone()));
+                queue.push_back(node.id);
+            }
+        }
+    }
+    out
+}
+
+/// 索引后端：三类查询 + 整树 + 统计。三种实现（侧车 / 工作区台账 / 整份载入）共用它，
+/// 于是「换索引」只是换一个后端，调用方一行不用改，也方便同场对比。
+pub trait Backend {
+    /// 编号 → 节点（可能多份：同编号多文件）。
+    fn locate(&mut self, id: Uuid) -> Vec<FileNode>;
+    /// 孩子（跨文件并集，按孩子编号去重）。
+    fn children(&mut self, parent: Uuid) -> Vec<FileNode>;
+    /// 谁引用我（来源编号 + 所在文件）。
+    fn references(&mut self, target: Uuid) -> Vec<(String, Uuid)>;
+    /// 整棵子树（含根）。
+    fn subtree(&mut self, root: Uuid) -> Vec<FileNode>;
+    fn file_count(&self) -> usize;
+    /// 打开了多少次索引 / 数据文件（跨文件开销的代理指标）。
+    fn opens(&self) -> u64 {
+        0
+    }
+    /// 后端名字：workspace / sidecar / memory。
+    fn kind(&self) -> &'static str;
+}
+
+/// 侧车后端：每文件一份 XRIDX，逐个文件查（旧行为）。
 #[derive(Default)]
-pub struct LazyWorkspace {
+pub struct SidecarBackend {
     files: Vec<(String, Sidecar)>,
-    subtree_cache: HashMap<Uuid, Store>,
+}
+
+impl SidecarBackend {
+    pub fn open(paths: &[String]) -> Result<Self, String> {
+        let mut files = Vec::new();
+        for p in paths {
+            files.push((p.clone(), Sidecar::open_for(Path::new(p))?));
+        }
+        Ok(Self { files })
+    }
+}
+
+impl Backend for SidecarBackend {
+    fn locate(&mut self, id: Uuid) -> Vec<FileNode> {
+        let mut out = Vec::new();
+        for (path, sc) in &mut self.files {
+            if let Ok(Some((rel, len))) = sc.find_node_loc(id) {
+                if let Ok(n) = read_node_at(Path::new(path), sc.node_data_start, rel, len) {
+                    out.push((path.clone(), n));
+                }
+            }
+        }
+        out
+    }
+
+    fn children(&mut self, parent: Uuid) -> Vec<FileNode> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        for (path, sc) in &mut self.files {
+            let kids = sc.find_children(parent).unwrap_or_default();
+            for (child, rel, len) in kids {
+                if !seen.insert(child) {
+                    continue;
+                }
+                if let Ok(n) = read_node_at(Path::new(path), sc.node_data_start, rel, len) {
+                    out.push((path.clone(), n));
+                }
+            }
+        }
+        out
+    }
+
+    fn references(&mut self, target: Uuid) -> Vec<(String, Uuid)> {
+        let mut out = Vec::new();
+        for (path, sc) in &mut self.files {
+            if let Ok(srcs) = sc.find_reverse(target) {
+                for s in srcs {
+                    out.push((path.clone(), s));
+                }
+            }
+        }
+        out
+    }
+
+    fn subtree(&mut self, root: Uuid) -> Vec<FileNode> {
+        // 根自己 + 逐层孩子（孩子由侧车的父子块给出，跨文件）
+        let mut out: Vec<FileNode> = self.locate(root);
+        out.extend(bfs_subtree(root, |id| self.children(id)));
+        let mut seen = HashSet::new();
+        out.retain(|(_, n)| seen.insert(n.id));
+        out
+    }
+
+    fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    fn kind(&self) -> &'static str {
+        "sidecar"
+    }
+}
+
+/// 工作区台账后端：三本 wsidx 台账，一次二分命中，不逐个文件扫。
+pub struct WorkspaceBackend {
+    reader: crate::wsidx::Reader,
+}
+
+impl WorkspaceBackend {
+    pub fn open(ws_root: &Path) -> Result<Self, String> {
+        Ok(Self { reader: crate::wsidx::Reader::open(ws_root)? })
+    }
+}
+
+impl Backend for WorkspaceBackend {
+    fn locate(&mut self, id: Uuid) -> Vec<FileNode> {
+        let hits = match self.reader.locate(id) {
+            Ok(h) => h,
+            Err(_) => return Vec::new(),
+        };
+        hits.into_iter()
+            .filter_map(|h| crate::wsidx::read_node_at_hit(&h).ok().map(|n| (h.file, n)))
+            .collect()
+    }
+
+    fn children(&mut self, parent: Uuid) -> Vec<FileNode> {
+        let hits = match self.reader.children_of(parent) {
+            Ok(h) => h,
+            Err(_) => return Vec::new(),
+        };
+        hits.into_iter()
+            .filter_map(|h| crate::wsidx::read_node_at_hit(&h).ok().map(|n| (h.file, n)))
+            .collect()
+    }
+
+    fn references(&mut self, target: Uuid) -> Vec<(String, Uuid)> {
+        self.reader.references(target).unwrap_or_default()
+    }
+
+    fn subtree(&mut self, root: Uuid) -> Vec<FileNode> {
+        let mut out: Vec<FileNode> = self.locate(root);
+        out.extend(bfs_subtree(root, |id| self.children(id)));
+        let mut seen = HashSet::new();
+        out.retain(|(_, n)| seen.insert(n.id));
+        out
+    }
+
+    fn file_count(&self) -> usize {
+        self.reader.file_count()
+    }
+
+    fn opens(&self) -> u64 {
+        self.reader.opens
+    }
+
+    fn kind(&self) -> &'static str {
+        "workspace"
+    }
+}
+
+/// 整份载入后端：索引缺失或对不上时的回退（也用作基准里的内存基线）。
+#[derive(Default)]
+pub struct MemoryBackend {
+    files: Vec<(String, Store)>,
+    /// 反向索引：载入时一次建好（「全部进内存」的用法本来就会这么干）
+    reverse: HashMap<Uuid, Vec<(String, Uuid)>>,
+}
+
+impl MemoryBackend {
+    pub fn load(paths: &[String]) -> Result<Self, String> {
+        let mut files = Vec::new();
+        let mut reverse: HashMap<Uuid, Vec<(String, Uuid)>> = HashMap::new();
+        for p in paths {
+            let store = Store::load(Path::new(p))?;
+            for n in store.nodes() {
+                if let Value::Reference(t) = &n.value {
+                    reverse.entry(*t).or_default().push((p.clone(), n.id));
+                }
+            }
+            files.push((p.clone(), store));
+        }
+        Ok(Self { files, reverse })
+    }
+}
+
+impl Backend for MemoryBackend {
+    fn locate(&mut self, id: Uuid) -> Vec<FileNode> {
+        self.files
+            .iter()
+            .filter_map(|(p, s)| s.get(id).map(|n| (p.clone(), n.clone())))
+            .collect()
+    }
+
+    fn children(&mut self, parent: Uuid) -> Vec<FileNode> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        for (p, s) in &self.files {
+            let Some(node) = s.get(parent) else { continue };
+            for c in s.children(node) {
+                if seen.insert(c.id) {
+                    out.push((p.clone(), c.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    fn references(&mut self, target: Uuid) -> Vec<(String, Uuid)> {
+        self.reverse.get(&target).cloned().unwrap_or_default()
+    }
+
+    fn subtree(&mut self, root: Uuid) -> Vec<FileNode> {
+        let mut out: Vec<FileNode> = self.locate(root);
+        out.extend(bfs_subtree(root, |id| self.children(id)));
+        let mut seen = HashSet::new();
+        out.retain(|(_, n)| seen.insert(n.id));
+        out
+    }
+
+    fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    fn kind(&self) -> &'static str {
+        "memory"
+    }
+}
+
+/// 跨文件工作区：只索引 + 按偏移读，节点数据不常驻；支持「同编号多文件」取并集。
+pub struct LazyWorkspace {
+    backend: Box<dyn Backend>,
 }
 
 impl LazyWorkspace {
+    /// 按当前索引模式打开。工作区模式下若索引缺失或不覆盖给定文件，回退到整份载入。
     pub fn from_paths(paths: &[String]) -> Result<Self, String> {
-        let mut files = Vec::new();
-        for p in paths {
-            let sidecar = Sidecar::open_for(Path::new(p))?;
-            files.push((p.clone(), sidecar));
-        }
-        Ok(Self { files, subtree_cache: HashMap::new() })
-    }
-
-    fn ensure_subtree(&mut self, file_idx: usize, root_id: Uuid) -> Result<(), String> {
-        if self.subtree_cache.contains_key(&root_id) {
-            return Ok(());
-        }
-        if let Err(e) = self.read_subtree(file_idx, root_id) {
-            // 索引偏移失效：重建该文件索引后重试一次。
-            let path = self.files[file_idx].0.clone();
-            rebuild(Path::new(&path))?;
-            self.files[file_idx].1 = Sidecar::open(&sidecar_path(Path::new(&path)))?;
-            self.subtree_cache.clear();
-            self.read_subtree(file_idx, root_id).map_err(|_| e)?;
-        }
-        Ok(())
-    }
-
-    fn read_subtree(&mut self, file_idx: usize, root_id: Uuid) -> Result<(), String> {
-        let (rel_off, len, node_data_start, path) = {
-            let (path, sc) = &mut self.files[file_idx];
-            let (rel_off, len) = sc.find_root(root_id)?.ok_or("F008：索引与源文件不一致")?;
-            (rel_off, len, sc.node_data_start, path.clone())
+        let backend: Box<dyn Backend> = match index_mode() {
+            IndexMode::Sidecar => Box::new(SidecarBackend::open(paths)?),
+            IndexMode::Workspace => {
+                let ws_root = crate::wsidx::workspace_root(Path::new(&paths[0]));
+                let dir = crate::wsidx::index_dir(&ws_root);
+                let mut covered = dir.exists();
+                if covered {
+                    let r = crate::wsidx::Reader::open(&ws_root)?;
+                    covered = paths.iter().all(|p| r.covers(p));
+                }
+                if covered {
+                    Box::new(WorkspaceBackend::open(&ws_root)?)
+                } else {
+                    Box::new(MemoryBackend::load(paths)?)
+                }
+            }
         };
-        let abs = node_data_start + rel_off;
-        let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        let mut buf = vec![0u8; len as usize];
-        f.seek(SeekFrom::Start(abs)).map_err(|e| e.to_string())?;
-        f.read_exact(&mut buf).map_err(|e| e.to_string())?;
-        let store = Store::decode(&buf).map_err(tree::codec_error)?;
-        let root = store.get(root_id).cloned().ok_or("F008：索引与源文件不一致")?;
-        self.subtree_cache.insert(root_id, store.sub_store(&root));
-        Ok(())
+        Ok(Self { backend })
     }
 
-    /// 按 UUID 定位并懒加载目标节点，返回 (文件路径, 节点)。
+    /// 当前后端名字：workspace / sidecar / memory（回退时是 memory）。
+    pub fn backend_kind(&self) -> &'static str {
+        self.backend.kind()
+    }
+
+    /// 打开过的索引 / 数据文件次数。
+    pub fn opens(&self) -> u64 {
+        self.backend.opens()
+    }
+
+    /// 台账里的文件数（memory 后端等于载入的文件数）。
+    pub fn file_count(&self) -> usize {
+        self.backend.file_count()
+    }
+
+    /// 按 UUID 定位目标节点（懒加载，只读那一段）。
     pub fn find(&mut self, id: Uuid) -> Option<(String, Node)> {
-        for fi in 0..self.files.len() {
-            let root_id = match self.files[fi].1.find_assign(id) {
-                Ok(Some(r)) => r,
-                _ => continue,
-            };
-            if self.ensure_subtree(fi, root_id).is_err() {
-                continue;
-            }
-            if let Some(node) = self.subtree_cache.get(&root_id).and_then(|s| s.get(id)).cloned() {
-                return Some((self.files[fi].0.clone(), node));
-            }
-        }
-        None
+        self.backend.locate(id).into_iter().next()
     }
 
     /// 该编号在**每个相关文件**里的一份（名字/值 + 来源文件），按文件顺序。
     /// 「同编号多文件」是正常现象，所以这里是「多份」而不是「一份」。
     pub fn node_views(&mut self, id: Uuid) -> Vec<(String, Node)> {
-        let mut out = Vec::new();
-        for fi in 0..self.files.len() {
-            let loc = self.files[fi].1.find_node_loc(id).ok().flatten();
-            if let Some((rel, len)) = loc {
-                let path = self.files[fi].0.clone();
-                let nstart = self.files[fi].1.node_data_start;
-                if let Ok(n) = read_node_at(Path::new(&path), nstart, rel, len) {
-                    out.push((path, n));
-                }
-            }
-        }
-        out
+        self.backend.locate(id)
     }
 
-    /// 并集后的孩子：**所有文件里父边指向该编号的节点**，按「文件顺序 + 文件内追加序」，
-    /// 同一个孩子编号只算一次（来源取最先出现的那个文件）。
+    /// 并集后的孩子：所有文件里父边指向该编号的节点，同一个孩子编号只算一次。
     pub fn children_union(&mut self, id: Uuid) -> Vec<(String, Node)> {
-        let mut out = Vec::new();
-        let mut seen: HashSet<Uuid> = HashSet::new();
-        for fi in 0..self.files.len() {
-            let kids = self.files[fi].1.find_children(id).unwrap_or_default();
-            for (child, rel, len) in kids {
-                if !seen.insert(child) {
-                    continue;
-                }
-                let path = self.files[fi].0.clone();
-                let nstart = self.files[fi].1.node_data_start;
-                if let Ok(n) = read_node_at(Path::new(&path), nstart, rel, len) {
-                    out.push((path, n));
-                }
-            }
-        }
-        out
+        self.backend.children(id)
     }
 
     /// 谁引用了我：跨所有文件聚合反向边，逐个懒加载源节点。
     pub fn references_to(&mut self, id: Uuid) -> Vec<(String, Node)> {
+        let srcs = self.backend.references(id);
         let mut out = Vec::new();
-        for fi in 0..self.files.len() {
-            let srcs = match self.files[fi].1.find_reverse(id) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for s in srcs {
-                if let Some((path, n)) = self.find(s) {
-                    out.push((path, n));
-                }
+        for (_file, s) in srcs {
+            if let Some((path, n)) = self.find(s) {
+                out.push((path, n));
             }
         }
         out
+    }
+
+    /// 按树根取整棵子树（含根）。
+    pub fn subtree(&mut self, root: Uuid) -> Vec<(String, Node)> {
+        self.backend.subtree(root)
     }
 }
 

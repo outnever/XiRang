@@ -30,6 +30,7 @@ cargo build --manifest-path rust/Cargo.toml -p xirang-cli
 - `--no-history`：写操作不记 `@history`/`@created`（批量创建、初始数据用）。
 - `--yes`：确认执行被护栏拦下的操作（改模板定义、`tmpl rm`、`import` 覆盖非空文件、`blob-export` 覆盖已有文件）。
 - **给 AI 代理用**：`xr-mcp` 把同一套操作暴露成结构化工具（能力与护栏完全一致，另外限定在允许目录内），见 [MCP](MCP.md)。
+- `XIRANG_INDEX_MODE`：`workspace`（默认，工作区统一索引）/ `sidecar`（旧的每文件侧车索引）。切换后需要重建对应索引。
 - `--yes`：跳过保护性确认。
 - `--no-index`：读命令默认会把读到的文件登记进**本机目录**（见「本机目录」节），此标志单次关闭；也可用环境变量 `XIRANG_INDEX=off` 全局关闭。
 - 路径寻址：`名/子名/孙名`（`/` 分隔），相对某子树根。
@@ -104,11 +105,24 @@ xr ws <节点ID> a.xirang b.xirang   # 两份都列出，孩子取并集，每�
 xr ws <节点ID> a.xirang --only a.xirang   # 只看 a.xirang 里的那一份（孩子也只来自它）
 ```
 
-### `xr index <file1> [file2…]`
-重建/刷新 sidecar 索引并打印摘要（实现层缓存，`.xirang.idx`，不改动 `.xirang` 本体）。
+### `xr index status|rebuild|compact|check|gc [路径…]`
+工作区索引维护（默认走「工作区统一索引」：`<工作区>/.xirang-index/` 下的三本台账——定位 / 关系 / 反向）。
+索引是**实现层缓存**：可整体删除、可重建，不改动 `.xirang` 本体，也不含任何独家数据。
+
+- `status`：文件数 / 代数 / 块数 / 主干与日志体积 / 指纹不符的文件 / 是否建议压实
+- `rebuild`：重扫并重建（缺省扫工作区全部 `.xirang`）
+- `compact`：把日志合并回块（写新块 → 原子改名 → 切 manifest）
+- `check`：一致性抽查（指纹 + 抽样节点能否定位并读出）
+- `gc`：清掉已不存在的文件条目
+
+数据文件写完后，索引由写路径自动追加日志（不原地改块）；体积超过主干 30% 时 `status` 会提示压实。
+`XIRANG_INDEX_MODE=sidecar` 时退化为旧的每文件 `.idx`（`status` / `rebuild` / `gc` 可用）。
 
 ```bash
-xr index 词库.xirang 图.xirang      # 每文件：根数 / 节点数 / 引用边数 / 新建或复用
+xr index status                     # 看当前工作区索引状态
+xr index rebuild 词库.shards         # 重扫分片目录，重建索引
+xr index compact                     # 压实日志
+xr index check                       # 一致性抽查
 ```
 
 ### `xr history <file> <node-id>`

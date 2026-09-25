@@ -64,9 +64,11 @@ MCP 没有「停下来问你一下」的回合，所以下面这些操作不带 
 
 ## 不在 MCP 里的东西
 
-「你这台电脑的状态」这类操作留在 `xr` CLI：`catalog`（本机目录）、`index`（sidecar 索引）、`collection` / `compact`（分片词库）、`ws`（跨文件视图）。
+「你这台电脑的状态」这类操作留在 `xr` CLI：`catalog`（本机目录）、`index`（工作区索引的 status / rebuild / compact / check / gc）、`collection` / `compact`（分片词库）、`ws`（跨文件视图）。
 
 MCP **不写本机目录**。后果要说清楚：纯 MCP 的会话不会把文件登记进 catalog，之后 `xr ws` 就不会自动找到它们；要跨文件解析，先跑一次 `xr catalog scan`。分片词库目录（`.xirang` 目录）在 MCP 一律返回 `unsupported`。
+
+工作区索引（`.xirang-index/` 下的三本台账）**由写路径自动维护**：CLI 与 MCP 共用同一份操作层，写数据后都会往索引追加日志；重建与压实用 CLI 的 `xr index ...`。
 
 ## 旧工具名 → 新工具名
 

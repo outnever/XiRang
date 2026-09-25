@@ -241,11 +241,22 @@ fn save(
     if in_collection {
         let before = before.ok_or_else(|| OpError::internal("词库写入缺少改动前快照"))?;
         shard::append_changes(path, before, store).map_err(OpError::internal)?;
-        return Ok(());
+    } else {
+        store.save(path).map_err(|e| OpError::internal(e.to_string()))?;
     }
-    store.save(path).map_err(|e| OpError::internal(e.to_string()))?;
     hooks.on_save(path, store);
+    update_index(path);
     Ok(())
+}
+
+/// 数据落盘后的索引维护：台账模式追加日志（侧车模式由 `Store::save` 自己写侧车）。
+/// 尽力而为——索引只是缓存，失败不影响数据写入，可由 `xr index rebuild` 重建。
+pub fn update_index(path: &Path) {
+    if xirang_core::index::sidecar_enabled() {
+        return;
+    }
+    let ws_root = xirang_core::wsidx::workspace_root(path);
+    let _ = xirang_core::wsidx::append_file(&ws_root, path);
 }
 
 /// 在词库目录里按 UUID 定位分片，读出折叠后的可编辑 Store + 该分片文件路径。
@@ -1077,6 +1088,7 @@ pub fn create_node(
                 let filename = format!("{}.xirang", n.id);
                 let shard_path = path.join(&filename);
                 store.save(&shard_path).map_err(|e| OpError::internal(e.to_string()))?;
+                update_index(&shard_path);
                 let entry = shard::ShardEntry { name: name.to_string(), filename };
                 if let Err(e) = shard::add_shard_entry(&path, entry) {
                     // 清单更新失败 → 回滚刚写的分片，别留半成品
@@ -1139,6 +1151,7 @@ pub fn create_node(
     let n = store.create(p, name, value, !no_history);
     store.save(&path).map_err(|e| OpError::internal(e.to_string()))?;
     hooks.on_save(&path, &store);
+    update_index(&path);
     Ok(CreateOutcome { id: n.id, name: name.to_string(), new_shard: false, warnings })
 }
 
@@ -1690,6 +1703,7 @@ pub fn template_define(
     let id = build_template(&mut store, None, name, sample).map_err(OpError::invalid)?;
     store.save(&path).map_err(|e| OpError::internal(e.to_string()))?;
     hooks.on_save(&path, &store);
+    update_index(&path);
     Ok(TemplateDefineOutcome { id, name: name.to_string() })
 }
 
@@ -1874,6 +1888,7 @@ pub fn import_data(
     let nodes = store.len();
     store.save(&path).map_err(|e| OpError::internal(e.to_string()))?;
     hooks.on_save(&path, &store);
+    update_index(&path);
     Ok(ImportOutcome { nodes, previous_nodes: before })
 }
 

@@ -491,7 +491,10 @@ impl Store {
         let bytes = make_file(&nodes_bytes);
         std::fs::write(path, &bytes)?;
         // 写穿 sidecar 索引（实现层缓存，失败静默，可重建）。
-        crate::index::write_for(path, &bytes);
+        // 工作区台账模式（默认）下不再生成每文件侧车，改由 `xirang_core::wsidx` 维护。
+        if crate::index::sidecar_enabled() {
+            crate::index::write_for(path, &bytes);
+        }
         Ok(())
     }
 

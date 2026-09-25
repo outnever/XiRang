@@ -954,23 +954,211 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
     0
 }
 
-fn cmd_index(files: &[String]) -> i32 {
-    for f in files {
-        let idx_path = index::sidecar_path(Path::new(f));
-        let fresh = index::is_fresh(Path::new(f));
-        let sc = match index::Sidecar::open_for(Path::new(f)) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("错误：{f}：{e}");
-                return 2;
-            }
-        };
-        println!("{f}");
-        println!("  索引: {}", idx_path.display());
-        println!("  状态: {}", if fresh { "复用" } else { "新建/重建" });
-        println!("  根: {} · 节点: {} · 引用边: {}", sc.root_count, sc.node_count, sc.edge_count);
+/// `xr index <status|rebuild|compact|check|gc> [路径...]`。
+/// 工作区台账模式（默认）操作 `.xirang-index/`；侧车模式下退化为每文件 `.idx` 的维护。
+fn cmd_index(sub: &str, paths: &[String]) -> i32 {
+    let sidecar = xirang_core::index::index_mode() == xirang_core::index::IndexMode::Sidecar;
+    let first = paths.first().map(|s| s.as_str()).unwrap_or(".");
+    let ws_root = xirang_core::wsidx::workspace_root(Path::new(first));
+
+    if sidecar {
+        return cmd_index_sidecar(sub, paths, &ws_root);
     }
-    0
+
+    match sub {
+        "status" => match xirang_core::wsidx::status(&ws_root) {
+            Ok(s) => {
+                println!("索引模式: workspace（工作区台账）");
+                println!("索引目录: {}", xirang_core::wsidx::index_dir(&ws_root).display());
+                println!(
+                    "文件 {} 个 · 代数 {} · 块 {}（定位 {} / 关系 {} / 反向 {}）",
+                    s.files, s.generation, s.loc_blocks + s.rel_blocks + s.rev_blocks,
+                    s.loc_blocks, s.rel_blocks, s.rev_blocks
+                );
+                println!(
+                    "主干 {:.2} MB · 日志 {:.2} MB",
+                    s.base_bytes as f64 / 1e6,
+                    s.log_bytes as f64 / 1e6
+                );
+                if !s.stale_files.is_empty() {
+                    println!("指纹不符（读时回退整份载入）{} 个，例如：", s.stale_files.len());
+                    for p in s.stale_files.iter().take(3) {
+                        println!("  {p}");
+                    }
+                    println!("  修：xr index rebuild");
+                }
+                if s.need_compact {
+                    println!("日志已超过主干 30%，建议：xr index compact");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("错误：{e}");
+                2
+            }
+        },
+        "rebuild" => {
+            let files: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+            match xirang_core::wsidx::rebuild(&ws_root, &files) {
+                Ok(s) => {
+                    println!(
+                        "已重建索引：{} 个文件 · 定位 {} · 关系 {} · 反向 {} · 块 {}",
+                        s.files, s.loc, s.rel, s.rev, s.blocks
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("错误：{e}");
+                    2
+                }
+            }
+        }
+        "compact" => match xirang_core::wsidx::compact(&ws_root) {
+            Ok(s) => {
+                println!(
+                    "已压实：{} 个文件 · 定位 {} · 关系 {} · 反向 {} · 块 {}",
+                    s.files, s.loc, s.rel, s.rev, s.blocks
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("错误：{e}");
+                2
+            }
+        },
+        "gc" => match xirang_core::wsidx::gc(&ws_root) {
+            Ok(n) => {
+                println!("已清理 {n} 个已不存在的文件条目（下次压实后生效）");
+                0
+            }
+            Err(e) => {
+                eprintln!("错误：{e}");
+                2
+            }
+        },
+        "check" => {
+            let mut bad = 0usize;
+            let st = match xirang_core::wsidx::status(&ws_root) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("错误：{e}");
+                    return 2;
+                }
+            };
+            if !st.stale_files.is_empty() {
+                println!("指纹不符 {} 个（索引过期，读时回退整份载入）：", st.stale_files.len());
+                for p in &st.stale_files {
+                    println!("  {p}");
+                }
+                bad += st.stale_files.len();
+            }
+            let mut reader = match xirang_core::wsidx::Reader::open(&ws_root) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("错误：{e}");
+                    return 2;
+                }
+            };
+            for n in reader.sample_nodes(5) {
+                match reader.locate(n) {
+                    Ok(hits) if !hits.is_empty() => {
+                        let ok = hits.iter().all(|h| xirang_core::wsidx::read_node_at_hit(h).is_ok());
+                        if !ok {
+                            println!("抽样读取失败：{n}");
+                            bad += 1;
+                        }
+                    }
+                    _ => {
+                        println!("抽样定位失败：{n}");
+                        bad += 1;
+                    }
+                }
+            }
+            if bad == 0 {
+                println!("索引一致：抽样节点都能定位并读出");
+                0
+            } else {
+                println!("发现 {bad} 处问题；可跑 xr index rebuild 重建");
+                1
+            }
+        }
+        other => {
+            eprintln!("错误：未知子命令：{other}（可用：status / rebuild / compact / check / gc）");
+            2
+        }
+    }
+}
+
+/// 侧车模式下的 `xr index ...`：保持旧行为（每文件一份 `.idx`）。
+fn cmd_index_sidecar(sub: &str, paths: &[String], _ws_root: &Path) -> i32 {
+    let files: Vec<String> =
+        if paths.is_empty() { vec![".".to_string()] } else { paths.to_vec() };
+    match sub {
+        "status" | "check" => {
+            for f in &files {
+                let p = Path::new(f);
+                if p.is_dir() {
+                    continue;
+                }
+                let idx_path = index::sidecar_path(p);
+                let fresh = index::is_fresh(p);
+                let sc = match index::Sidecar::open_for(p) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("错误：{f}：{e}");
+                        return 2;
+                    }
+                };
+                println!("{f}");
+                println!("  索引: {}", idx_path.display());
+                println!("  状态: {}", if fresh { "复用" } else { "新建/重建" });
+                println!(
+                    "  根: {} · 节点: {} · 引用边: {}",
+                    sc.root_count, sc.node_count, sc.edge_count
+                );
+            }
+            0
+        }
+        "rebuild" | "compact" => {
+            let mut n = 0;
+            for f in &files {
+                let p = Path::new(f);
+                if p.is_file() {
+                    if let Err(e) = index::rebuild(p) {
+                        eprintln!("错误：{f}：{e}");
+                        return 2;
+                    }
+                    n += 1;
+                }
+            }
+            println!("已重建 {n} 个侧车索引");
+            0
+        }
+        "gc" => {
+            let mut n = 0;
+            for f in &files {
+                // 目录：删掉没有对应数据文件的孤儿 .idx
+                if let Ok(rd) = std::fs::read_dir(f) {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        let name = p.to_string_lossy().into_owned();
+                        if let Some(base) = name.strip_suffix(".idx") {
+                            if !Path::new(base).exists() {
+                                let _ = std::fs::remove_file(&p);
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            println!("已清理 {n} 个孤儿侧车索引");
+            0
+        }
+        other => {
+            eprintln!("错误：未知子命令：{other}（可用：status / rebuild / compact / check / gc）");
+            2
+        }
+    }
 }
 
 fn cmd_collection_split(file: &str, rule: &str, out: &Path) -> i32 {
@@ -1432,7 +1620,9 @@ fn usage() {
     println!("  xr refs <file> <node-id>            查看引用边（出 / 入）");
     println!("  xr ws <node-id> <file1> [file2...] [--only <file>] [--json]");
     println!("      按编号跨文件解析：默认列出该编号在各相关文件里的每一份、孩子取并集（每条标来源）；--only 只看一个文件");
-    println!("  xr index <file1> [file2...]          重建 / 刷新 sidecar 索引并打印摘要");
+    println!("  xr index status|rebuild|compact|check|gc [路径...]");
+    println!("      工作区索引维护：status 看状态、rebuild 重建、compact 压实日志、check 查一致性、gc 清已删文件");
+    println!("      （XIRANG_INDEX_MODE=sidecar 时退化为每文件 .idx 的维护；默认是工作区台账）");
     println!("  xr collection split <file> --rule <规则> [--out <dir>]   无损拆成 shard 词库");
     println!("  xr collection list <dir>            列出 shard 词库分片");
     println!("  xr compact <dir> [--all]            合并分片的覆盖日志");
@@ -1766,12 +1956,15 @@ fn main() {
             }
         }
         "index" => {
-            if args.len() < 3 {
-                usage();
-                2
+            const SUBS: [&str; 5] = ["status", "rebuild", "compact", "check", "gc"];
+            let maybe_sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            let (sub, paths) = if SUBS.contains(&maybe_sub) {
+                (maybe_sub, args[3..].to_vec())
             } else {
-                cmd_index(&args[2..])
-            }
+                // 兼容老写法 `xr index <file>`：默认看状态
+                ("status", args[2..].to_vec())
+            };
+            cmd_index(sub, &paths)
         }
         "collection" => {
             let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");

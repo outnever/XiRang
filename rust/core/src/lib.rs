@@ -9,7 +9,6 @@
 pub mod codec;
 pub mod catalog;
 pub mod convert;
-pub mod fixture;
 pub mod index;
 pub mod query;
 pub mod shard;

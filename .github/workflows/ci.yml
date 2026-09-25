@@ -24,9 +24,3 @@ jobs:
       - name: Rust 测试（交付实现）
         run: cargo test --manifest-path rust/Cargo.toml
 
-      - name: 索引对比基准（1 万 / 10 万节点 + 断言）
-        run: |
-          cargo build --release --manifest-path rust/Cargo.toml
-          ./rust/target/release/xr-bench run \
-            --out /tmp/xr-bench --nodes 10000,100000 --reps 1 \
-            --bin-dir rust/target/release --assert

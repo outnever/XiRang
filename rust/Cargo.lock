@@ -469,15 +469,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "xirang-bench"
-version = "0.1.0"
-dependencies = [
- "libc",
- "serde_json",
- "xirang-core",
-]
-
-[[package]]
 name = "xirang-cli"
 version = "0.3.0"
 dependencies = [

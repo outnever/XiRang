@@ -8,6 +8,13 @@ use xirang_core::index::{
 };
 use xirang_core::tree::{self, Store};
 
+
+/// 本文件的测试验的是 **侧车后端** 上的 append-v1 增量（修订块 / 尾部残片）。
+/// 主线把默认索引模式改成了「工作区台账（wsidx）」，所以这里显式锁到侧车模式。
+fn sidecar_mode() {
+    std::env::set_var("XIRANG_INDEX_MODE", "sidecar");
+}
+
 fn tmp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "xr_append_{name}_{}.xirang",
@@ -35,6 +42,7 @@ fn marker(parent: Uuid) -> Node {
 
 #[test]
 fn append_revision_is_visible_through_sidecar_and_view() {
+    sidecar_mode();
     let p = tmp("visible");
     let mut s = Store::new();
     let root = s.create(None, "根", Value::Empty, false).id;
@@ -69,6 +77,7 @@ fn append_revision_is_visible_through_sidecar_and_view() {
 
 #[test]
 fn incremental_index_matches_full_rebuild() {
+    sidecar_mode();
     let p = tmp("incremental");
     let mut s = Store::new();
     let a = s.create(None, "甲", Value::Empty, false).id;
@@ -118,6 +127,7 @@ fn incremental_index_matches_full_rebuild() {
 
 #[test]
 fn trailing_fragment_is_truncated() {
+    sidecar_mode();
     let p = tmp("fragment");
     let mut s = Store::new();
     let root = s.create(None, "根", Value::Empty, false).id;
@@ -148,6 +158,7 @@ fn trailing_fragment_is_truncated() {
 
 #[test]
 fn compact_file_folds_revisions_and_keeps_view() {
+    sidecar_mode();
     let p = tmp("compact");
     let mut s = Store::new();
     let root = s.create(None, "根", Value::Empty, false).id;
@@ -180,6 +191,7 @@ fn compact_file_folds_revisions_and_keeps_view() {
 /// `all_edges`：全局引用图的取数——边跟着「最后一条记录」走。
 #[test]
 fn all_edges_follows_last_write_wins() {
+    sidecar_mode();
     let p = tmp("edges");
     let mut s = Store::new();
     let a = s.create(None, "甲", Value::Empty, false).id;
@@ -216,6 +228,7 @@ fn all_edges_follows_last_write_wins() {
 #[test]
 #[ignore]
 fn bench_open_and_edit_on_big_file() {
+    sidecar_mode();
     let path = match std::env::var("XIRANG_BIG") {
         Ok(p) => PathBuf::from(p),
         Err(_) => return,

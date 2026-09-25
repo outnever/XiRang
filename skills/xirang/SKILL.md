@@ -37,7 +37,8 @@ $XR tree data.xirang --skip-aux     # human-readable view
 
 - Data goes to **stdout**; diagnostics/notes go to **stderr**. Exit codes: `0` success, `1` validation failed, `2` usage/runtime error.
 - Use **`--json`** on read commands to get machine-readable output instead of human text.
-- `--no-history` on writes = don't record `@history`/`@created` (batch/initial data). `--yes` = skips a protective confirmation.
+- `--no-history` on writes = don't record `@history`/`@created` (batch/initial data). `--yes` = passes a protective guard.
+- Guards that apply on **both** doors: editing inside a template definition, `tmpl rm`, `import` over a non-empty file, and `blob-export` over an existing file all need `--yes` (CLI) / `force: true` (MCP).
 - Path addressing: `name/child/grandchild` (`/`) relative to a subtree root.
 
 ## Capabilities, by goal
@@ -71,11 +72,11 @@ $XR tree data.xirang --skip-aux     # human-readable view
 
 **Convert / compare**
 - `xr export <file> <json|yaml|xml|md> [--subtree <id>]` — `json/yaml/xml` lossless round-trip; `md` lossy (export-only).
-- `xr import <file> <json|yaml|xml> <source>` — import (JSON must be the `xr export json` format).
+- `xr import <file> <json|yaml|xml> <source>` — import (JSON must be the `xr export json` format). This replaces the whole file; if the target already holds nodes, add `--yes`.
 - `xr diff <a.xirang> <b.xirang> [--json]` — added/removed/changed by node id.
 
 **Blobs**
-- `xr blob-import <file> <parent|nil> <src>` / `xr blob-export <file> <node-id> <dest>` / `xr blob-info <file> <node-id>`.
+- `xr blob-import <file> <parent|nil> <src>` / `xr blob-export <file> <node-id> <dest>` / `xr blob-info <file> <node-id>`. Export refuses to overwrite an existing file unless you add `--yes`.
 
 ## Examples
 
@@ -101,6 +102,15 @@ $XR instances data.xirang entry     # still finds it via the @模板 reference
 
 ## If MCP is available
 
-An MCP client can call the `xr-mcp` server instead — tools `info`, `tree`, `find`, `match`, `instances`, `validate`, `diff`, `import_template`, `rename_node` mirror the CLI above (with JSON Schema). See `docs/MCP.md`.
+An MCP client can call the `xr-mcp` server instead of shelling out. Both doors share one implementation (`rust/cli/src/ops.rs`), so the same operation gives the same result and the same guards.
+
+- 10 tools, grouped by domain: `context`, `file_info`, `file_validate`, `file_diff`, `tree`, `query`, `node`, `template`, `convert`, `blob`. Action-style tools take an `action` field (`query`: find/match/instances/refs/history; `node`: create/set/rename/remove/link/copy/fill/revert; `template`: define/list/instantiate/remove; `convert`: export/import/append; `blob`: import/export/info).
+- Start with `context`: it reports the roots you are allowed to touch.
+- **Paths are confined** to the directories given by `--root` / `$XIRANG_MCP_ROOTS` (default: the server's working directory). Anything outside — including absolute paths and `..` escapes — is refused with `path_denied`. Shard library directories are refused with `unsupported`.
+- **Destructive actions need an explicit `force: true`** (template-definition edits, `template` remove, `create` under a missing parent, `link` to a missing/cross-library target, `convert` import over a non-empty file, `blob` export over an existing file). Without it you get `guarded` plus a hint.
+- Errors come back as `isError: true` with `{"error":{"kind","message","hint"}}`; `kind` is one of `invalid_argument` / `not_found` / `guarded` / `path_denied` / `unsupported` / `internal`.
+- Not covered by MCP (use the CLI): `catalog`, `index`, `collection`, `compact`, `ws`. MCP never writes the local catalog, so an MCP-only session won't make `xr ws` find those files.
+
+See `docs/MCP.md` for the full table and client config example.
 
 Full reference: `xr --help` and `docs/CLI.md`.

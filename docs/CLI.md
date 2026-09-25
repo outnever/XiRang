@@ -28,6 +28,12 @@ cargo build --manifest-path rust/Cargo.toml -p xirang-cli
 - **I/O 约定**：数据走 stdout，错误/提示走 stderr，退出码 `0`=成功、`1`=校验失败、`2`=用法/运行错误。命令可安全批处理、供程序解析。
 - `--json`：结构化输出（替代人类可读文本），供程序/大模型消费，后面不再重复说明。
 - `--no-history`：写操作不记 `@history`/`@created`（批量创建、初始数据用）。
+- `--yes`：确认执行被护栏拦下的操作（改模板定义、`tmpl rm`、`import` 覆盖非空文件、`blob-export` 覆盖已有文件）。
+- **给 AI 代理用**：`xr-mcp` 把同一套操作暴露成结构化工具（能力与护栏完全一致，另外限定在允许目录内），见 [MCP](MCP.md)。
+- `XIRANG_INDEX_MODE`：`workspace`（默认，工作区统一索引）/ `sidecar`（旧的每文件侧车索引）。切换后需要重建对应索引。
+- `XIRANG_INDEX_MAINTENANCE`：默认 `auto`——命令跑完（结果已打印）后，若索引日志超过主干 30%，会**另起一个后台进程**去压实；设 `off` 关闭。
+- `XIRANG_INDEX_COMPACT_RATIO` / `XIRANG_INDEX_COMPACT_MIN_BYTES`：压实的触发比例与最小主干体积（默认 0.30 / 1000000），供调参与测试。
+- `xr ws` **不会**把命令行里点名的文件登记进本机目录（登记要把每个文件整份读一遍）；需要登记用 `xr catalog scan`。
 - `--yes`：跳过保护性确认。
 - `--no-index`：读命令默认会把读到的文件登记进**本机目录**（见「本机目录」节），此标志单次关闭；也可用环境变量 `XIRANG_INDEX=off` 全局关闭。
 - 路径寻址：`名/子名/孙名`（`/` 分隔），相对某子树根。
@@ -102,11 +108,37 @@ xr ws <节点ID> a.xirang b.xirang   # 两份都列出，孩子取并集，每�
 xr ws <节点ID> a.xirang --only a.xirang   # 只看 a.xirang 里的那一份（孩子也只来自它）
 ```
 
-### `xr index <file1> [file2…]`
-重建/刷新 sidecar 索引并打印摘要（实现层缓存，`.xirang.idx`，不改动 `.xirang` 本体）。
+### `xr index <子命令> [路径…] [--json] [--verbose] [--stale] [--dry-run] [--yes] [--sample N] [--deep]`
+工作区索引维护（默认走「工作区统一索引」：`<工作区>/.xirang-index/` 下的三本台账——定位 / 关系 / 反向）。
+索引是**实现层缓存**：可整体删除、可重建，不改动 `.xirang` 本体，也不含任何独家数据。
+
+| 子命令 | 作用 |
+|---|---|
+| `status [--verbose]` | 总览：三本台账的块数/条目数/主干与日志体积、代数、文件与编号总数、指纹不符的文件、是否建议压实、索引目录总体积；`--verbose` 再列文件表前几条 |
+| `files [--stale]` | 逐文件：条目数、代号（块基线/最新）、指纹是否一致、磁盘上在不在 |
+| `update` | **增量修复**：只重扫指纹变了的文件（自愈），顺带清掉已删除文件的条目 |
+| `rebuild` | 全量重建（缺省扫工作区全部 `.xirang`） |
+| `compact` | 把日志合并回块（新块写新名字 → 原子换 manifest → 删旧块） |
+| `check [--sample N] [--deep]` | 一致性校验：抽样 N 个编号（默认 5）定位并读出；`--deep` 再对每个文件重扫比对条目数 |
+| `gc` | 清掉已不存在的文件条目（下次压实后真正回收） |
+| `drop --yes` | **删除整个索引目录**（数据文件不受影响） |
+| `forget <文件…> --yes` | 把指定文件的条目从台账移除（数据文件保留） |
+| `unlock` | 清掉写者锁（报出锁里的 pid 及是否还在运行） |
+| `path` | 打印索引目录的绝对路径 |
+
+数据文件写完后，索引由写路径自动追加日志（不原地改块）；体积超过主干 30% 时 `status` 会提示压实。
+`XIRANG_INDEX_MODE=sidecar` 时退化为旧的每文件 `.idx`（`status` / `rebuild` / `gc` 可用）。
+**破坏性命令（`drop` / `forget`）必须加 `--yes`**；任何命令都可加 `--dry-run` 先看会做什么（不动手）。
+所有子命令都支持 `--json`（camelCase 字段），供脚本与 GUI 消费。
 
 ```bash
-xr index 词库.xirang 图.xirang      # 每文件：根数 / 节点数 / 引用边数 / 新建或复用
+xr index status                     # 看当前工作区索引状态
+xr index files --stale              # 哪些文件被外部改过
+xr index update                     # 增量修好它们（自愈）
+xr index rebuild 词库.shards         # 或整库重扫
+xr index compact                     # 压实日志
+xr index check                       # 一致性抽查
+xr index drop --yes                  # 删掉索引（数据不动）
 ```
 
 ### `xr history <file> <node-id>`
@@ -184,6 +216,25 @@ xr fill 词条.xirang <词条ID> 词形=灯 词义/01/释义=照明器具
 ```bash
 xr revert 数据.xirang <节点ID>
 ```
+
+### `xr history prune <file> <node-id> [--keep N] [--before <ISO前缀>] [--dry-run] [--yes]`
+裁剪留痕：只保留最近 N 条快照（默认 20），可选再要求「早于某时刻」。
+
+**为什么需要**：留痕是唯一会让单文件越用越大的东西——实测同一个节点连续改 50 次，默认写法文件 8850 字节、103 个节点，而 `--no-history` 只有 2498 字节、1 个节点（每改一次多 2 个节点：快照 + `@replaced`）。这些快照还会一起进索引。
+
+**注意**：被裁掉的快照是**真正的结构删除**，裁了就失去那部分回滚能力，所以：
+
+- 不带 `--yes` 时只打印「会丢掉多少条、保留多少条」并退出码 2
+- `--dry-run` 先预演（不动文件）
+- 保留的那几条仍可用 `xr revert` 回滚
+
+```bash
+xr history prune 数据.xirang <节点ID> --keep 5            # 先看会裁多少
+xr history prune 数据.xirang <节点ID> --keep 5 --yes      # 真裁
+xr history prune 数据.xirang <节点ID> --before 2026-01-01 --yes   # 只裁 2026 年以前的
+```
+
+跨文件的同一编号**不受影响**：裁剪只动这一个文件里这个节点的留痕，不会去重、也不会碰别的文件。
 
 ## 分片词库（shard）
 
@@ -306,7 +357,7 @@ xr blob-import 资产.xirang nil logo.png
 ```
 
 ### `xr blob-export <file> <node-id> <dest>`
-导出二进制块为文件。
+导出二进制块为文件。**目标文件已存在时拒绝覆盖**，确认要覆盖请加 `--yes`（这条护栏与 MCP 侧一致）。
 
 ```bash
 xr blob-export 资产.xirang <节点ID> out.png
@@ -340,6 +391,8 @@ xr export 数据.xirang json --subtree <节点ID>    # 只导出某子树
 
 ### `xr import <file> <json|yaml|xml> <source>`
 导入（`json` 需是 `xr export json` 的格式；`data.json` 若为记录数组且想按模板实例化，用 `--template`，见上）。
+
+这是**整文件替换**：目标文件里已有节点时会被拦下，确认覆盖请加 `--yes`；想保留原内容请改用 `--append` / `--template`。
 
 ```bash
 xr import 数据.xirang yaml data.yaml

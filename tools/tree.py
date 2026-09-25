@@ -224,6 +224,54 @@ class Store:
         node.value = (codec.EMPTY, None)
         return node
 
+    def prune_history(self, node, keep=20, before=None):
+        """裁剪 node 的 @history 留痕：保留最近 keep 条，可选只裁早于 before 的。
+
+        与 Rust 实现（`Store::prune_history`）语义一致：
+        - `before` 是 ISO 时间前缀（如 "2026-01-01"），与快照上的 @replaced 做字符串比较
+          （同一时间格式下，字符串序就是时间序）；
+        - 被裁掉的快照是**真正的结构删除**（它们只服务于回滚），@history 节点本身保留；
+        - 没有 @replaced 的快照保守留下。
+
+        返回 (removed, kept)：删了几条 / 还剩几条。
+        """
+        hist = None
+        for c in self.children(node):
+            if c.name == "@history":
+                hist = c
+                break
+        if hist is None:
+            return (0, 0)
+        snaps = self.children(hist)
+        total = len(snaps)
+        keep_from = max(0, total - keep)
+        doomed = []
+        for i, s in enumerate(snaps):
+            old_enough = True
+            if before is not None:
+                replaced = None
+                for c in self.children(s):
+                    if c.name == "@replaced" and c.value[0] == codec.TEXT:
+                        replaced = c.value[1]
+                        break
+                old_enough = replaced is not None and str(replaced) < before
+            if i < keep_from and old_enough:
+                doomed.append(s.id)
+        for sid in doomed:
+            # 真正的结构删除：连同该快照的 @replaced 一起摘掉
+            self._remove_subtree(sid)
+        return (len(doomed), total - len(doomed))
+
+    def _remove_subtree(self, root_id):
+        """按编号把一棵子树（含根）从库里真正删掉——只用于管理层（如裁剪留痕）。"""
+        root = self.get(root_id)
+        if root is None:
+            return
+        doomed = {n.id for n in self.subtree(root)}
+        self._order = [i for i in self._order if i not in doomed]
+        for i in doomed:
+            self._nodes.pop(i, None)
+
     def _ensure_history(self, parent):
         """确保 parent 节点下有 @history 辅助节点，返回它（parent 为 None = 顶层）。"""
         if parent is None:

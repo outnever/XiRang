@@ -15,3 +15,4 @@ pub mod shard;
 pub mod validator;
 pub mod tree;
 pub mod workspace;
+pub mod wsidx;

@@ -1,67 +1,161 @@
-//! 息壤 CLI：xr 命令（info / tree / validate），复用 xirang-core。
+//! 息壤 CLI：`xr` 命令。
+//!
+//! 这一层只做三件事：**解析参数 → 调共享操作层（`ops`）→ 把结果渲染成文本**。
+//! 命令实现、护栏、错误语义都在 `ops`，所以 CLI 与 `xr-mcp` 的行为天然一致。
+//! 只有「本机状态」类命令（catalog / index / collection / compact / ws）留在这里——
+//! 它们操作的是你这台电脑的环境，不是文件里的数据，MCP 那边不暴露。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::json;
-use xirang_core::codec::{parse_value, Node, Uuid, Value};
-use xirang_core::{catalog, convert, index, query, shard, tree, validator};
+use xirang_core::codec::Uuid;
+use xirang_core::{catalog, index, shard, tree};
 
 mod ops;
 
+use ops::{ErrKind, Layout, MatchQuery, OpError, Policy, ViewOpts};
+
 /// 读/写命令是否顺带维护本机目录（默认开，可用 `--no-index` 或 `XIRANG_INDEX=off` 关闭）。
 static INDEX_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 本次命令碰过的索引工作区根：退出前据此决定要不要在后台整理。
+static INDEX_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// 记下「这次命令用过哪个工作区的索引」（读命令与写命令都调）。
+pub(crate) fn index_touch(root: PathBuf) {
+    if let Ok(mut g) = INDEX_ROOT.lock() {
+        *g = Some(root);
+    }
+}
+
+/// 先给结果、再整理：需要时分离一个后台进程去压实，本进程立刻退出。
+fn maybe_spawn_maintenance() {
+    if !xirang_core::wsidx::maintenance_enabled() {
+        return;
+    }
+    let root = match INDEX_ROOT.lock() {
+        Ok(g) => match g.clone() {
+            Some(r) => r,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    if xirang_core::wsidx::maintenance_needed(&root).is_none() {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let spawned = std::process::Command::new(exe)
+        .arg("index")
+        .arg("compact")
+        .arg(&root)
+        .env("XIRANG_INDEX_MAINTENANCE", "off") // 防递归
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if spawned.is_ok() {
+        eprintln!("（索引日志偏大，已在后台开始整理；可用 XIRANG_INDEX_MAINTENANCE=off 关闭）");
+    }
+}
 
 fn index_enabled() -> bool {
     INDEX_ENABLED.load(Ordering::Relaxed)
 }
 
-fn fmt_value(store: &tree::Store, node: &Node) -> Option<String> {
-    match &node.value {
-        Value::Empty => None,
-        Value::Int(n) => Some(n.to_string()),
-        Value::Float(f) => Some(f.to_string()),
-        Value::Bool(b) => Some(if *b { "true" } else { "false" }.to_string()),
-        Value::Text(s) => Some(s.clone()),
-        Value::Reference(u) => {
-            let target = store.get(*u);
-            Some(format!("→ {}", target.map(|t| t.name.as_str()).unwrap_or(&u.to_string())))
-        }
-        Value::Blob(b) => Some(format!("[blob {} 字节]", b.len())),
+/// 把一个已加载的 Store 增量登记进本机目录（尽力而为，失败静默）。
+fn index_store(file: &str, store: &tree::Store) {
+    if !index_enabled() {
+        return;
+    }
+    let p = Path::new(file);
+    if p.is_dir() {
+        return;
+    }
+    let fp = match catalog::fingerprint(p) {
+        Some(f) => f,
+        None => return,
+    };
+    let abs = p
+        .canonicalize()
+        .ok()
+        .and_then(|c| c.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| file.to_string());
+    let cpath = catalog::default_path();
+    if catalog::Catalog::is_fresh(&cpath, &abs, fp) {
+        return;
+    }
+    let mut cat = catalog::Catalog::load(&cpath).unwrap_or_default();
+    cat.upsert(&abs, fp, &catalog::Catalog::store_uuids(store));
+    let _ = cat.save(&cpath);
+}
+#[allow(dead_code)]
+fn index_file(file: &str) {
+    if !index_enabled() {
+        return;
+    }
+    let p = Path::new(file);
+    if p.is_dir() {
+        return;
+    }
+    let fp = match catalog::fingerprint(p) {
+        Some(f) => f,
+        None => return,
+    };
+    let abs = p
+        .canonicalize()
+        .ok()
+        .and_then(|c| c.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| file.to_string());
+    if catalog::Catalog::is_fresh(&catalog::default_path(), &abs, fp) {
+        return;
+    }
+    if let Ok(store) = tree::Store::load_view(p) {
+        index_store(file, &store);
     }
 }
 
-fn label(store: &tree::Store, node: &Node) -> String {
-    match fmt_value(store, node) {
-        None => {
-            if node.name.is_empty() {
-                "(空节点)".to_string()
-            } else {
-                node.name.clone()
-            }
-        }
-        Some(v) => {
-            if node.name.is_empty() {
-                v
-            } else {
-                format!("{} = {}", node.name, v)
-            }
-        }
+/// 落盘 + 增量登记目录（CLI 专属写命令用）。
+fn save_store(store: &tree::Store, path: &Path) -> std::io::Result<()> {
+    store.save(path)?;
+    index_store(&path.to_string_lossy(), store);
+    Ok(())
+}
+
+/// 本机状态挂钩：CLI 每读 / 写一次就顺手登记本机目录；MCP 用 `NoHooks` 不碰本机状态。
+struct CliHooks;
+
+impl ops::Hooks for CliHooks {
+    fn on_load(&self, path: &Path, store: &tree::Store) {
+        index_store(&path.to_string_lossy(), store);
+    }
+    fn on_save(&self, path: &Path, store: &tree::Store) {
+        index_store(&path.to_string_lossy(), store);
     }
 }
 
-/// 树视图的输出选项。
-#[derive(Clone, Copy, Default)]
-struct TreeOpts {
-    skip_aux: bool,
-    show_ids: bool,
-    /// 只展开到第 N 层（根算第 1 层）；None = 不限。
-    max_depth: Option<usize>,
+/// 把操作层错误打印成 CLI 文本，返回退出码。
+fn report(e: &OpError) -> i32 {
+    match (&e.kind, &e.hint) {
+        // 护栏 / 边界：沿用括号式提示，读起来像「提醒」而不是「崩了」
+        (ErrKind::Guarded, Some(h)) | (ErrKind::PathDenied, Some(h)) => {
+            eprintln!("（{}；{h}）", e.message)
+        }
+        (ErrKind::Guarded, None) | (ErrKind::PathDenied, None) => eprintln!("（{}）", e.message),
+        _ => eprintln!("错误：{}", e.message),
+    }
+    2
 }
 
-/// 输出目的地：终端直出，或者交给分页器（`$PAGER` / `less -R`）。
+// ============================================================================
+// 输出目的地：终端直出，或者交给分页器（`$PAGER` / `less -R`）
+// ============================================================================
+
 enum Sink {
     Plain(std::io::BufWriter<std::io::Stdout>),
     Paged { child: std::process::Child, w: std::io::BufWriter<std::process::ChildStdin> },
@@ -99,7 +193,6 @@ impl Sink {
 
 /// stdout 是终端（不是管道/重定向）时才考虑分页；`--no-pager` 一律直出。
 fn make_sink(no_pager: bool) -> Sink {
-    use std::io::Write as _;
     use std::process::{Command, Stdio};
     let tty = unsafe { libc::isatty(1) } == 1;
     if no_pager || !tty {
@@ -124,35 +217,14 @@ fn make_sink(no_pager: bool) -> Sink {
     }
 }
 
-/// 打印一棵子树；`budget` 是「还剩几行可打」，打完即停（用于 `--head`）。
-/// 返回本次实际打印的节点数。
-fn print_tree(
+/// 打印一棵子树：缩进 + 连接符（根不缩进，其孩子缩进 3 格）。
+fn render_tree_node(
     out: &mut Sink,
-    store: &tree::Store,
-    node: &Node,
-    opts: &TreeOpts,
-    budget: &mut usize,
-) -> usize {
-    let mut seen = HashSet::new();
-    let before = *budget;
-    let _ = print_tree_rec(out, store, node, "", true, 1, opts, &mut seen, budget);
-    before - *budget
-}
-
-fn print_tree_rec(
-    out: &mut Sink,
-    store: &tree::Store,
-    node: &Node,
+    v: &ops::NodeView,
     prefix: &str,
     is_last: bool,
-    depth: usize,
-    opts: &TreeOpts,
-    seen: &mut HashSet<Uuid>,
-    budget: &mut usize,
-) -> std::io::Result<()> {
-    if *budget == 0 {
-        return Ok(());
-    }
+    include_ids: bool,
+) {
     let connector = if prefix.is_empty() {
         ""
     } else if is_last {
@@ -160,986 +232,487 @@ fn print_tree_rec(
     } else {
         "├─ "
     };
-    let id_suffix = if opts.show_ids { format!(" <{}>", node.id) } else { String::new() };
-    writeln!(out, "{}{}{}{}", prefix, connector, label(store, node), id_suffix)?;
-    *budget -= 1;
-    // 父边成环（E006）时兜底：同一节点只展开一次，避免无限递归/栈溢出。
-    if !seen.insert(node.id) {
-        return Ok(());
-    }
-    // --depth：到层数就不再往下展开
-    if let Some(m) = opts.max_depth {
-        if depth >= m {
-            return Ok(());
-        }
+    let id_suffix = if include_ids { format!(" <{}>", v.id) } else { String::new() };
+    let _ = writeln!(out, "{}{}{}{}", prefix, connector, v.label, id_suffix);
+    if v.children.is_empty() {
+        return;
     }
     let child_prefix = format!("{}{}", prefix, if is_last { "   " } else { "│  " });
-    let children = store.children_opt(node, opts.skip_aux);
-    let n = children.len();
-    for (i, c) in children.iter().enumerate() {
-        if *budget == 0 {
-            break;
-        }
-        print_tree_rec(out, store, c, &child_prefix, i == n - 1, depth + 1, opts, seen, budget)?;
+    let n = v.children.len();
+    for (i, c) in v.children.iter().enumerate() {
+        render_tree_node(out, c, &child_prefix, i == n - 1, include_ids);
     }
-    Ok(())
 }
+
+// ============================================================================
+// 读命令
+// ============================================================================
 
 fn cmd_info(file: &str) -> i32 {
-    let data = match std::fs::read(file) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return 2;
+    match ops::info(&Policy::cli(false), &CliHooks, file) {
+        Ok(i) => {
+            println!("文件: {}", i.file);
+            println!("格式版本: {}", i.version);
+            println!("头文本: {} 字节，首行: {}", i.header_bytes, i.header_first_line);
+            println!("节点数: {}", i.nodes);
+            println!("根节点数: {}", i.roots);
+            0
         }
-    };
-    let (version, header) = match tree::read_header(&data) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-    };
-    let nodes = tree::parse_file(&data).unwrap();
-    let store = tree::Store::decode(nodes).map_err(tree::codec_error).unwrap_or_else(|e| {
-        eprintln!("错误：{e}");
-        std::process::exit(2);
-    });
-    index_store(file, &store);
-    let first_line = header.trim().lines().next().unwrap_or("(空)");
-    println!("文件: {file}");
-    println!("格式版本: {version}");
-    println!("头文本: {} 字节，首行: {first_line}", header.len());
-    println!("节点数: {}", store.len());
-    println!("根节点数: {}", store.roots().len());
-    0
+        Err(e) => report(&e),
+    }
 }
 
-fn cmd_tree(file: &str, node_id: Option<&str>, opts: &TreeOpts, head: Option<usize>, no_pager: bool) -> i32 {
-    let store = match tree::Store::load_view(Path::new(file)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return 2;
-        }
+fn cmd_tree(file: &str, node_id: Option<&str>, opts: &ViewOpts, no_pager: bool) -> i32 {
+    let outcome = match ops::view(
+        &Policy::cli(false),
+        &CliHooks,
+        file,
+        node_id,
+        *opts,
+        Layout::Tree,
+        None,
+    ) {
+        Ok(o) => o,
+        Err(e) => return report(&e),
     };
-    index_store(file, &store);
-    let total = store.nodes().len();
     let mut sink = make_sink(no_pager);
-    let mut budget = head.unwrap_or(usize::MAX);
-    let mut printed = 0usize;
-    if let Some(id) = node_id {
-        let uuid = match xirang_core::codec::Uuid::parse(id) {
-            Some(u) => u,
-            None => {
-                eprintln!("无效节点 ID：{id}");
-                return 2;
-            }
-        };
-        match store.get(uuid) {
-            Some(root) => printed += print_tree(&mut sink, &store, root, opts, &mut budget),
-            None => {
-                eprintln!("节点不存在：{id}");
-                return 2;
-            }
+    for (i, r) in outcome.roots.iter().enumerate() {
+        if i > 0 {
+            let _ = writeln!(sink);
         }
-    } else {
-        let roots = store.roots();
-        for (i, r) in roots.iter().enumerate() {
-            if budget == 0 {
-                break;
-            }
-            if i > 0 {
-                let _ = writeln!(sink);
-            }
-            printed += print_tree(&mut sink, &store, r, opts, &mut budget);
-        }
+        render_tree_node(&mut sink, r, "", true, opts.include_ids);
     }
     sink.finish();
     // 截断是「提示」，走 stderr，保持 stdout 干净（可直接管道给别的工具）
-    if head.is_some() && printed < total {
-        eprintln!("（只打印了前 {printed} 个节点，共 {total} 个；去掉 --head 打印全部）");
+    if opts.limit.is_some() && outcome.truncated() {
+        eprintln!(
+            "（只打印了前 {} 个节点，共 {} 个；去掉 --head 打印全部）",
+            outcome.printed, outcome.total
+        );
     }
-    if opts.max_depth.is_some() {
-        eprintln!("（只展开到第 {} 层；去掉 --depth 显示全部）", opts.max_depth.unwrap_or(0));
+    if let Some(d) = opts.max_depth {
+        eprintln!("（只展开到第 {d} 层；去掉 --depth 显示全部）");
     }
     0
 }
 
 /// 扁平视图：按文件里的存放顺序，一行一个节点（不缩进）。像浏览文本文件一样看。
-fn cmd_cat(file: &str, opts: &TreeOpts, head: Option<usize>, force: bool, no_pager: bool) -> i32 {
+fn cmd_cat(file: &str, opts: &ViewOpts, force: bool, no_pager: bool) -> i32 {
     const GUARD: usize = 100_000;
-    let store = match tree::Store::load_view(Path::new(file)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-    };
-    index_store(file, &store);
-    let nodes = store.nodes();
-    let total = nodes.len();
-    if head.is_none() && !force && total > GUARD {
-        eprintln!("这个文件有 {total} 个节点，全量打印会刷屏（可能上百 MB）。");
-        eprintln!("请改用：xr cat {file} --head 200，或确实要全打时加 --force。");
-        return 2;
-    }
+    let pol = Policy::cli(force);
+    let outcome =
+        match ops::view(&pol, &CliHooks, file, None, *opts, Layout::Flat, Some(GUARD)) {
+            Ok(o) => o,
+            Err(e) => return report(&e),
+        };
     let mut sink = make_sink(no_pager);
-    let mut printed = 0usize;
-    for nd in nodes {
-        if opts.skip_aux && nd.name.starts_with('@') {
-            continue;
-        }
-        if let Some(n) = head {
-            if printed >= n {
-                break;
-            }
-        }
-        let id_suffix = if opts.show_ids { format!(" <{}>", nd.id) } else { String::new() };
-        if writeln!(sink, "{}{}", label(&store, nd), id_suffix).is_err() {
+    for v in &outcome.items {
+        let id_suffix = if opts.include_ids { format!(" <{}>", v.id) } else { String::new() };
+        if writeln!(sink, "{}{}", v.label, id_suffix).is_err() {
             break;
         }
-        printed += 1;
     }
     sink.finish();
-    if let Some(n) = head {
-        if printed >= n && total > printed {
-            eprintln!("（只打印了前 {printed} 个节点，共 {total} 个；去掉 --head 打印全部）");
+    if let Some(n) = opts.limit {
+        if outcome.printed >= n && outcome.total > outcome.printed {
+            eprintln!(
+                "（只打印了前 {} 个节点，共 {} 个；去掉 --head 打印全部）",
+                outcome.printed, outcome.total
+            );
         }
     }
     0
 }
 
 fn cmd_validate(file: &str) -> i32 {
-    let store = match tree::Store::load_view(Path::new(file)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-    };
-    index_store(file, &store);
-    let errs = validator::validate_view(&store);
-    if errs.is_empty() {
-        println!("校验通过：0 错误");
-        return 0;
-    }
-    for e in &errs {
-        println!("{} <{}…> {}", e.code, &e.node_id.to_string()[..8], e.message);
-    }
-    println!("共 {} 个错误", errs.len());
-    1
-}
-
-// 值解析统一走核心库（codec::parse_value），避免 CLI / 桌面 / MCP 三处各写一份、行为分叉。
-
-fn load_store(file: &str) -> Result<tree::Store, i32> {
-    match tree::Store::load_view(Path::new(file)) {
-        Ok(store) => {
-            index_store(file, &store);
-            Ok(store)
-        }
-        Err(e) => {
-            eprintln!("错误：{e}");
-            Err(2)
-        }
-    }
-}
-
-/// 把一个已加载的 Store 增量登记进本机目录（尽力而为，失败静默）。
-fn index_store(file: &str, store: &tree::Store) {
-    if !index_enabled() {
-        return;
-    }
-    let p = Path::new(file);
-    if p.is_dir() {
-        return;
-    }
-    let fp = match catalog::fingerprint(p) {
-        Some(f) => f,
-        None => return,
-    };
-    let abs = p
-        .canonicalize()
-        .ok()
-        .and_then(|c| c.to_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| file.to_string());
-    let cpath = catalog::default_path();
-    if catalog::Catalog::is_fresh(&cpath, &abs, fp) {
-        return;
-    }
-    let mut cat = catalog::Catalog::load(&cpath).unwrap_or_default();
-    cat.upsert(&abs, fp, &catalog::Catalog::store_uuids(store));
-    let _ = cat.save(&cpath);
-}
-
-/// 没有现成 Store 时，读文件后登记（用于 `ws` 等）。
-fn index_file(file: &str) {
-    if !index_enabled() {
-        return;
-    }
-    let p = Path::new(file);
-    if p.is_dir() {
-        return;
-    }
-    let fp = match catalog::fingerprint(p) {
-        Some(f) => f,
-        None => return,
-    };
-    let abs = p
-        .canonicalize()
-        .ok()
-        .and_then(|c| c.to_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| file.to_string());
-    if catalog::Catalog::is_fresh(&catalog::default_path(), &abs, fp) {
-        return;
-    }
-    if let Ok(store) = tree::Store::load_view(p) {
-        index_store(file, &store);
-    }
-}
-
-/// 落盘 + 增量登记目录（写命令用）。
-fn save_store(store: &tree::Store, path: &Path) -> std::io::Result<()> {
-    store.save(path)?;
-    index_store(&path.to_string_lossy(), store);
-    Ok(())
-}
-
-/// 在词库目录里按 UUID 定位分片，读出折叠后的可编辑 Store + 该分片文件路径。
-fn load_shard(dir: &Path, id: Uuid) -> Result<(tree::Store, PathBuf), i32> {
-    let col = match shard::Collection::open(dir) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return Err(2);
-        }
-    };
-    let filename = match col.shard_file_for(id) {
-        Some(f) => f.to_string(),
-        None => {
-            eprintln!("节点不存在于词库：{id}");
-            return Err(2);
-        }
-    };
-    let path = dir.join(&filename);
-    let raw = match tree::Store::load_view(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return Err(2);
-        }
-    };
-    Ok((shard::fold(&raw), path))
-}
-
-/// 模板定义保护：若节点（或其在的最近标注根）属于模板定义，则拒绝直接编辑。
-/// 返回 Ok(()) = 可编辑；Err(2) = 受保护（除非 --yes）。
-fn edit_guard(store: &tree::Store, id: Uuid, yes: bool) -> Result<(), i32> {
-    if yes {
-        return Ok(());
-    }
-    match store.get(id) {
-        Some(n) if !store.is_editable(n) => {
-            eprintln!("（受保护：该节点属于模板定义，不能直接编辑；请用 xr tmpl，或加 --yes 强制）");
-            Err(2)
-        }
-        _ => Ok(()),
-    }
-}
-
-fn cmd_new(file: &str, parent: &str, name: &str, value: Option<&str>, no_history: bool, yes: bool) -> i32 {
-    let p = if parent == "nil" || parent == "root" {
-        None
-    } else {
-        match Uuid::parse(parent) {
-            Some(u) => Some(u),
-            None => {
-                eprintln!("无效父节点 ID：{parent}");
-                return 2;
+    match ops::validate(&Policy::cli(false), &CliHooks, file) {
+        Ok(v) => {
+            if v.errors.is_empty() {
+                println!("校验通过：0 错误");
+                return 0;
             }
-        }
-    };
-    let v = value.map(parse_value).unwrap_or(Value::Empty);
-    let path = Path::new(file);
-    if path.is_dir() {
-        return new_in_collection(path, p, name, v, no_history);
-    }
-
-    // 单文件模式（原有逻辑）
-    let mut store = if path.exists() {
-        match load_store(file) {
-            Ok(s) => s,
-            Err(c) => return c,
-        }
-    } else {
-        tree::Store::new()
-    };
-    // 父节点必须存在，否则会写出父边断裂（E011）的坏数据；--yes 可强制。
-    if let Some(pid) = p {
-        if store.get(pid).is_none() {
-            eprintln!("（父节点不存在：{pid}；加 --yes 仍要创建会留下 E011 父边断裂）");
-            if !yes {
-                return 2;
+            for e in &v.errors {
+                println!("{} <{}…> {}", e.code, &e.node_id.to_string()[..8], e.message);
             }
+            println!("共 {} 个错误", v.errors.len());
+            1
         }
+        Err(e) => report(&e),
     }
-    let parent_name = p.and_then(|pid| store.get(pid)).map(|n| n.name.clone());
-    if !yes {
-        if let Some(pn) = &parent_name {
-            if !pn.starts_with('@') {
-                eprintln!("（提示：在「{pn}」下新增节点会改变该子树形状码，可能影响按结构检索；--yes 跳过）");
-            }
-        }
-    }
-    // no_history = 不挂 @created（初始/批量数据）
-    let n = store.create(p, name, v, !no_history);
-    if let Err(e) = save_store(&store, path) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    println!("已创建：{} <{}>", name, n.id);
-    0
 }
 
-fn new_in_collection(dir: &Path, parent: Option<Uuid>, name: &str, value: Value, no_history: bool) -> i32 {
-    match parent {
-        None => {
-            // 先确认这是一个分片词库：不是就什么都不写，避免留下半成品目录。
-            if let Err(e) = shard::read_manifest(dir) {
-                eprintln!("错误：{e}");
-                return 2;
+fn cmd_find(file: &str, pattern: &str, json_out: bool) -> i32 {
+    match ops::find(&Policy::cli(false), &CliHooks, file, pattern) {
+        Ok(hits) => {
+            if json_out {
+                println!("{}", json!(hits.iter().map(|h| h.to_json()).collect::<Vec<_>>()));
+            } else {
+                for h in &hits {
+                    let name = if h.name.is_empty() { "(空节点)" } else { h.name.as_str() };
+                    println!("{name} <{}>", h.id);
+                }
+                println!("共 {} 个匹配", hits.len());
             }
-            let mut store = tree::Store::new();
-            let n = store.create(None, name, value, !no_history);
-            let filename = format!("{}.xirang", n.id);
-            let path = dir.join(&filename);
-            if let Err(e) = save_store(&store, &path) {
-                eprintln!("错误：{e}");
-                return 2;
-            }
-            let entry = shard::ShardEntry { name: name.to_string(), filename };
-            if let Err(e) = shard::add_shard_entry(dir, entry) {
-                // 清单更新失败 → 回滚刚写的分片，别留半成品
-                let _ = std::fs::remove_file(&path);
-                let _ = std::fs::remove_file(index::sidecar_path(&path));
-                eprintln!("错误：{e}");
-                return 2;
-            }
-            println!("已创建：{name} <{}>（新分片）", n.id);
             0
         }
-        Some(pid) => {
-            let (mut store, path) = match load_shard(dir, pid) {
-                Ok(x) => x,
-                Err(c) => return c,
-            };
-            let before = store.clone();
-            let n = store.create(Some(pid), name, value, !no_history);
-            if let Err(e) = shard::append_changes(&path, &before, &store) {
-                eprintln!("错误：{e}");
-                return 2;
+        Err(e) => report(&e),
+    }
+}
+
+/// 结构/名字/值匹配：`--root` 按节点名锚定、`--shape-of` 按形状码、`--template` 按模板实例；
+/// 三者选一，叠加 `--where 路径=值` 值约束；`--json` 结构化、`--tree` 整树。
+fn cmd_match(
+    file: &str,
+    root: Option<&str>,
+    shape_of: Option<&str>,
+    template: Option<&str>,
+    wheres: &[(String, String)],
+    json_out: bool,
+    tree_out: bool,
+) -> i32 {
+    let q = MatchQuery {
+        root: root.map(|s| s.to_string()),
+        shape_of: shape_of.map(|s| s.to_string()),
+        template: template.map(|s| s.to_string()),
+        wheres: wheres.to_vec(),
+        with_tree: tree_out,
+    };
+    match ops::search(&Policy::cli(false), &CliHooks, file, &q) {
+        Ok(m) => {
+            if json_out {
+                println!("{}", m.to_json());
+            } else {
+                for it in &m.items {
+                    let nm = if it.name.is_empty() { "(空节点)" } else { it.name.as_str() };
+                    println!("{nm} <{}>", it.id);
+                }
+                println!("共 {} 个匹配", m.items.len());
             }
-            println!("已创建：{name} <{}>", n.id);
             0
         }
+        Err(e) => report(&e),
+    }
+}
+
+fn cmd_diff(a: &str, b: &str, json_out: bool) -> i32 {
+    match ops::diff(&Policy::cli(false), &CliHooks, a, b) {
+        Ok(d) => {
+            if json_out {
+                println!("{}", d.to_json());
+            } else {
+                println!(
+                    "新增 {} · 删除 {} · 改动 {}",
+                    d.added.len(),
+                    d.removed.len(),
+                    d.changed.len()
+                );
+                if !d.added.is_empty() {
+                    println!("-- 新增 --");
+                    for it in &d.added {
+                        println!("  + {} <{}>", it.name, it.id);
+                    }
+                }
+                if !d.removed.is_empty() {
+                    println!("-- 删除 --");
+                    for it in &d.removed {
+                        println!("  - {} <{}>", it.name, it.id);
+                    }
+                }
+                if !d.changed.is_empty() {
+                    println!("-- 改动 --");
+                    for c in &d.changed {
+                        println!(
+                            "  ~ {} <{}>: {} = {} → {} = {}",
+                            c.from_name, c.id, c.from_name, c.from_value, c.to_name, c.to_value
+                        );
+                    }
+                }
+            }
+            0
+        }
+        Err(e) => report(&e),
+    }
+}
+
+fn cmd_instances(file: &str, name: &str, no_pager: bool) -> i32 {
+    match ops::instances(&Policy::cli(false), &CliHooks, file, name) {
+        Ok(o) => {
+            if o.instances.is_empty() {
+                println!("（模板 {name} 暂无实例）");
+                return 0;
+            }
+            let mut sink = make_sink(no_pager);
+            for inst in &o.instances {
+                render_tree_node(&mut sink, inst, "", true, false);
+                let _ = writeln!(sink);
+            }
+            sink.finish();
+            0
+        }
+        Err(e) => report(&e),
+    }
+}
+
+fn cmd_refs(file: &str, node_id: &str) -> i32 {
+    match ops::refs(&Policy::cli(false), &CliHooks, file, node_id) {
+        Ok(r) => {
+            let name = if r.name.is_empty() { "(空节点)" } else { r.name.as_str() };
+            println!("节点：{name} <{}>", r.id);
+            if let Some(t) = &r.reference {
+                if t.exists {
+                    println!("  引用 → {} <{}>", t.name, t.id);
+                } else {
+                    println!("  引用 → {} <不存在>", t.name);
+                }
+            }
+            if r.incoming.is_empty() {
+                println!("  （无反向引用）");
+            } else {
+                for inc in &r.incoming {
+                    println!("  ← {} <{}>", inc.name, inc.id);
+                }
+            }
+            0
+        }
+        Err(e) => report(&e),
+    }
+}
+
+fn cmd_history(file: &str, node_id: &str) -> i32 {
+    match ops::history(&Policy::cli(false), &CliHooks, file, node_id) {
+        Ok(h) => {
+            let name = if h.name.is_empty() { "(空节点)" } else { h.name.as_str() };
+            println!("节点：{name} <{}>", h.id);
+            if !h.has_history {
+                println!("（无 @history）");
+            } else {
+                if h.snapshots.is_empty() {
+                    println!("（@history 为空）");
+                }
+                for s in &h.snapshots {
+                    println!("  快照：{} = {}", s.name, s.value.clone().unwrap_or_default());
+                    if let Some(r) = &s.replaced {
+                        println!("    @replaced = {r}");
+                    }
+                }
+            }
+            0
+        }
+        Err(e) => report(&e),
+    }
+}
+
+/// `xr history prune <file> <node-id> [--keep N] [--before <ISO前缀>] [--dry-run] [--yes]`
+/// 裁剪留痕：只保留最近 N 条快照（可选再要求「早于某时刻」），丢掉的是回滚能力。
+fn cmd_history_prune(file: &str, node_id: &str, keep: usize, before: Option<&str>, dry_run: bool, yes: bool) -> i32 {
+    match ops::prune_history(
+        &Policy::cli(yes),
+        &CliHooks,
+        file,
+        node_id,
+        keep,
+        before,
+        dry_run,
+    ) {
+        Ok(o) => {
+            let head = if o.dry_run { "（预演）将裁剪" } else { "已裁剪" };
+            println!(
+                "{head} {} 条留痕 · 保留 {} 条 · 节点 {} → {} · 文件 {} → {} 字节",
+                o.removed, o.kept, o.nodes_before, o.nodes_after, o.bytes_before, o.bytes_after
+            );
+            if o.removed == 0 {
+                println!("（没有可裁剪的快照：可能已被裁过，或 --before 比所有快照都早）");
+            }
+            0
+        }
+        Err(e) => report(&e),
+    }
+}
+
+fn cmd_export(file: &str, format: &str, subtree: Option<&str>) -> i32 {
+    match ops::export_data(&Policy::cli(false), &CliHooks, file, format, subtree) {
+        Ok(o) => {
+            // to_md 自带结尾换行，这里用 print! 避免多一个空行
+            if matches!(o.format.as_str(), "md" | "markdown") {
+                print!("{}", o.text);
+            } else {
+                println!("{}", o.text);
+            }
+            0
+        }
+        Err(e) => report(&e),
+    }
+}
+
+// ============================================================================
+// 写命令
+// ============================================================================
+
+fn cmd_new(
+    file: &str,
+    parent: &str,
+    name: &str,
+    value: Option<&str>,
+    no_history: bool,
+    yes: bool,
+) -> i32 {
+    let v = value.map(ops::parse_value_str).unwrap_or(xirang_core::codec::Value::Empty);
+    match ops::create_node(&Policy::cli(yes), &CliHooks, file, Some(parent), name, v, no_history) {
+        Ok(o) => {
+            for w in &o.warnings {
+                eprintln!("{w}");
+            }
+            if o.new_shard {
+                println!("已创建：{} <{}>（新分片）", o.name, o.id);
+            } else {
+                println!("已创建：{} <{}>", o.name, o.id);
+            }
+            0
+        }
+        Err(e) => report(&e),
     }
 }
 
 fn cmd_set(file: &str, node: &str, value: &str, no_history: bool, yes: bool) -> i32 {
-    let id = match Uuid::parse(node) {
-        Some(u) => u,
-        None => {
-            eprintln!("无效节点 ID：{node}");
-            return 2;
+    let v = ops::parse_value_str(value);
+    match ops::set_value(&Policy::cli(yes), &CliHooks, file, node, v, no_history) {
+        Ok(o) => {
+            println!("已更新：{}", o.id);
+            0
         }
-    };
-    let path = Path::new(file);
-    if path.is_dir() {
-        let (mut store, shard_path) = match load_shard(path, id) {
-            Ok(x) => x,
-            Err(c) => return c,
-        };
-        if let Err(c) = edit_guard(&store, id, yes) {
-            return c;
-        }
-        let before = store.clone();
-        let r = if no_history {
-            store.set_quiet(id, parse_value(value))
-        } else {
-            store.update(id, parse_value(value))
-        };
-        if let Err(e) = r {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-        if let Err(e) = shard::append_changes(&shard_path, &before, &store) {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-        println!("已更新：{node}");
-        return 0;
+        Err(e) => report(&e),
     }
-
-    let mut store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    if let Err(c) = edit_guard(&store, id, yes) {
-        return c;
-    }
-    let r = if no_history {
-        store.set_quiet(id, parse_value(value))
-    } else {
-        store.update(id, parse_value(value))
-    };
-    if let Err(e) = r {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    if let Err(e) = save_store(&store, path) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    println!("已更新：{node}");
-    0
 }
 
-/// 改名：旧名字进 @history（`--no-history` 则不记），编号不变、引用不断。
 fn cmd_rename(file: &str, node: &str, new_name: &str, no_history: bool, yes: bool) -> i32 {
-    let id = match Uuid::parse(node) {
-        Some(u) => u,
-        None => {
-            eprintln!("无效节点 ID：{node}");
-            return 2;
+    match ops::rename_node(&Policy::cli(yes), &CliHooks, file, node, new_name, no_history) {
+        Ok(o) => {
+            println!("已改名：{} → {}", o.id, o.name);
+            0
         }
-    };
-    if new_name.is_empty() {
-        eprintln!("新名字不能为空（要清空名字请用 xr rm）");
-        return 2;
+        Err(e) => report(&e),
     }
-    if new_name.as_bytes().len() > 255 {
-        eprintln!("名字超 255 字节");
-        return 2;
-    }
-    let path = Path::new(file);
-    if path.is_dir() {
-        let (mut store, shard_path) = match load_shard(path, id) {
-            Ok(x) => x,
-            Err(c) => return c,
-        };
-        if let Err(c) = edit_guard(&store, id, yes) {
-            return c;
-        }
-        let before = store.clone();
-        let r = if no_history {
-            store.rename_quiet(id, new_name.to_string())
-        } else {
-            store.rename(id, new_name.to_string())
-        };
-        if let Err(e) = r {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-        if let Err(e) = shard::append_changes(&shard_path, &before, &store) {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-        println!("已改名：{node} → {new_name}");
-        return 0;
-    }
-
-    let mut store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    if let Err(c) = edit_guard(&store, id, yes) {
-        return c;
-    }
-    let r = if no_history {
-        store.rename_quiet(id, new_name.to_string())
-    } else {
-        store.rename(id, new_name.to_string())
-    };
-    if let Err(e) = r {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    if let Err(e) = save_store(&store, path) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    println!("已改名：{node} → {new_name}");
-    0
 }
 
 fn cmd_rm(file: &str, node: &str, yes: bool) -> i32 {
-    let id = match Uuid::parse(node) {
-        Some(u) => u,
-        None => {
-            eprintln!("无效节点 ID：{node}");
-            return 2;
+    match ops::remove_node(&Policy::cli(yes), &CliHooks, file, node) {
+        Ok(o) => {
+            println!("已删除（置空）：{}", o.id);
+            0
         }
-    };
-    let path = Path::new(file);
-    if path.is_dir() {
-        let (mut store, shard_path) = match load_shard(path, id) {
-            Ok(x) => x,
-            Err(c) => return c,
-        };
-        if let Err(c) = edit_guard(&store, id, yes) {
-            return c;
-        }
-        let before = store.clone();
-        if let Err(e) = store.remove(id) {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-        if let Err(e) = shard::append_changes(&shard_path, &before, &store) {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-        println!("已删除（置空）：{node}");
-        return 0;
+        Err(e) => report(&e),
     }
-
-    let mut store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    if let Err(c) = edit_guard(&store, id, yes) {
-        return c;
-    }
-    if let Err(e) = store.remove(id) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    if let Err(e) = save_store(&store, path) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    println!("已删除（置空）：{node}");
-    0
 }
 
 fn cmd_link(file: &str, from: &str, to: &str, no_history: bool, yes: bool) -> i32 {
-    let (f, t) = match (Uuid::parse(from), Uuid::parse(to)) {
-        (Some(f), Some(t)) => (f, t),
-        _ => {
-            eprintln!("无效节点 ID：{from} 或 {to}");
-            return 2;
-        }
-    };
-    let path = Path::new(file);
-    if path.is_dir() {
-        let (mut store, shard_path) = match load_shard(path, f) {
-            Ok(x) => x,
-            Err(c) => return c,
-        };
-        if let Err(c) = edit_guard(&store, f, yes) {
-            return c;
-        }
-        // 目标应存在于该词库；否则会留下 R001 引用断裂。
-        let target_ok = shard::Collection::open(path)
-            .ok()
-            .map(|c| c.find(t).is_some())
-            .unwrap_or(false);
-        if !target_ok && !yes {
-            eprintln!("（引用目标不在该词库：{t}；加 --yes 仍要连边会留下 R001 引用断裂）");
-            return 2;
-        }
-        let before = store.clone();
-        let r = if no_history {
-            store.set_quiet(f, Value::Reference(t))
-        } else {
-            store.update(f, Value::Reference(t))
-        };
-        if let Err(e) = r {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-        if let Err(e) = shard::append_changes(&shard_path, &before, &store) {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-        println!("已连边：{from} → {to}");
-        return 0;
-    }
-
-    let mut store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    if let Err(c) = edit_guard(&store, f, yes) {
-        return c;
-    }
-    if (store.get(f).is_none() || store.get(t).is_none()) && !yes {
-        eprintln!("（from 或 to 节点不存在；加 --yes 仍要连边会留下 R001 引用断裂）");
-        return 2;
-    }
-    let r = if no_history {
-        store.set_quiet(f, Value::Reference(t))
-    } else {
-        store.update(f, Value::Reference(t))
-    };
-    if let Err(e) = r {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    if let Err(e) = save_store(&store, path) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    println!("已连边：{from} → {to}");
-    0
-}
-
-fn cmd_copy(file: &str, node: &str, parent: &str, blank: bool, history: bool, yes: bool) -> i32 {
-    let mut store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let id = match Uuid::parse(node) {
-        Some(u) => u,
-        None => {
-            eprintln!("无效节点 ID：{node}");
-            return 2;
-        }
-    };
-    if store.get(id).is_none() {
-        eprintln!("节点不存在：{node}");
-        return 2;
-    }
-    let name = store.get(id).map(|n| n.name.clone()).unwrap_or_default();
-    let p = if parent == "nil" || parent == "root" {
-        None
-    } else {
-        match Uuid::parse(parent) {
-            Some(u) => Some(u),
-            None => {
-                eprintln!("无效父节点 ID：{parent}");
-                return 2;
-            }
-        }
-    };
-    // 软提示：复制到非辅助父节点下会改变其子树形状码
-    if !yes {
-        if let Some(pid) = p {
-            if let Err(c) = edit_guard(&store, pid, yes) {
-                return c;
-            }
-            if let Some(pn) = store.get(pid) {
-                if !pn.name.starts_with('@') {
-                    eprintln!("（提示：在「{}」下复制子树会改变该子树形状码，可能影响按结构检索；--yes 跳过）", pn.name);
-                }
-            }
-        }
-    }
-    let opts = tree::CopyOptions { blank_values: blank, history };
-    match store.copy_subtree(id, p, &opts) {
-        Ok(new_id) => {
-            if let Err(e) = save_store(&store, Path::new(file)) {
-                eprintln!("错误：{e}");
-                return 2;
-            }
-            println!("已复制：{} <{}> → 新根 <{}>", name, id, new_id);
+    match ops::link_nodes(&Policy::cli(yes), &CliHooks, file, from, to, no_history) {
+        Ok(o) => {
+            println!("已连边：{} → {}", o.from, o.to);
             0
         }
-        Err(e) => {
-            eprintln!("错误：{e}");
-            2
-        }
+        Err(e) => report(&e),
     }
 }
 
-/// 按名字 / 路径映射给节点赋值：`名=值` 或 `名字段/子名=值`。路径相对 root 节点。
-fn cmd_fill(file: &str, root: &str, assigns: &[&str], no_history: bool, yes: bool) -> i32 {
-    let root_id = match Uuid::parse(root) {
-        Some(u) => u,
-        None => {
-            eprintln!("无效节点 ID：{root}");
-            return 2;
+fn cmd_copy(
+    file: &str,
+    node: &str,
+    parent: &str,
+    blank: bool,
+    history: bool,
+    yes: bool,
+) -> i32 {
+    match ops::copy_node(
+        &Policy::cli(yes),
+        &CliHooks,
+        file,
+        node,
+        Some(parent),
+        blank,
+        !history,
+    ) {
+        Ok(o) => {
+            for w in &o.warnings {
+                eprintln!("{w}");
+            }
+            println!("已复制：{} <{}> → 新根 <{}>", o.src_name, o.src_id, o.new_id);
+            0
         }
-    };
-    let path = Path::new(file);
-    let is_collection = path.is_dir();
-    let (mut store, save_path) = if path.is_dir() {
-        match load_shard(path, root_id) {
-            Ok((s, p)) => (s, p),
-            Err(c) => return c,
-        }
-    } else {
-        match load_store(file) {
-            Ok(s) => (s, path.to_path_buf()),
-            Err(c) => return c,
-        }
-    };
-    if store.get(root_id).is_none() {
-        eprintln!("节点不存在：{root}");
-        return 2;
+        Err(e) => report(&e),
     }
-    if let Err(c) = edit_guard(&store, root_id, yes) {
-        return c;
-    }
-    let before = store.clone();
+}
+
+fn cmd_fill(file: &str, root: &str, assigns: &[String], no_history: bool, yes: bool) -> i32 {
+    let mut pairs: Vec<(String, xirang_core::codec::Value)> = Vec::new();
     for a in assigns {
-        let (path, value) = match a.split_once('=') {
-            Some(pp) => pp,
+        match a.split_once('=') {
+            Some((p, v)) => pairs.push((p.to_string(), ops::parse_value_str(v))),
             None => {
-                eprintln!("赋值格式应为 路径=值：{a}");
+                eprintln!("错误：赋值格式应为 路径=值：{a}");
                 return 2;
             }
-        };
-        let segs: Vec<&str> = path.split('/').collect();
-        if segs.is_empty() || segs.iter().any(|s| s.is_empty()) {
-            eprintln!("路径为空：{path}");
-            return 2;
         }
-        // 导航到目标节点的父（前 N-1 段），最后一段是目标名
-        let mut cur_id = root_id;
-        let mut found = true;
-        for seg in &segs[..segs.len() - 1] {
-            let cur = match store.get(cur_id) {
-                Some(c) => c,
-                None => { found = false; break; }
-            };
-            match store.child_by_name(cur, seg) {
-                Some(c) => cur_id = c.id,
-                None => { found = false; break; }
-            }
-        }
-        if !found {
-            eprintln!("路径不存在：{path}");
-            return 2;
-        }
-        let last = segs.last().unwrap();
-        let target_id = store
-            .get(cur_id)
-            .and_then(|c| store.child_by_name(c, last))
-            .map(|c| c.id);
-        let target_id = match target_id {
-            Some(t) => t,
-            None => {
-                eprintln!("路径不存在：{path}");
-                return 2;
-            }
-        };
-        let r = if no_history {
-            store.set_quiet(target_id, parse_value(value))
-        } else {
-            store.update(target_id, parse_value(value))
-        };
-        if let Err(e) = r {
-            eprintln!("错误：{e}（{path}）");
-            return 2;
-        }
-        println!("已赋值：{path} = {value}");
     }
-    let saved = if is_collection {
-        shard::append_changes(&save_path, &before, &store)
-    } else {
-        save_store(&store, &save_path).map_err(|e| e.to_string())
-    };
-    if let Err(e) = saved {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    0
-}
-
-fn type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Empty => "empty",
-        Value::Int(_) => "integer",
-        Value::Float(_) => "float",
-        Value::Bool(_) => "boolean",
-        Value::Text(_) => "text",
-        Value::Reference(_) => "reference",
-        Value::Blob(_) => "blob",
-    }
-}
-
-/// 把一棵子树的根节点转成嵌套 JSON（供 --json --tree 整树返回用）。
-fn node_json(store: &tree::Store, node: &Node) -> serde_json::Value {
-    let mut seen = HashSet::new();
-    node_json_rec(store, node, &mut seen)
-}
-
-fn node_json_rec(
-    store: &tree::Store,
-    node: &Node,
-    seen: &mut HashSet<Uuid>,
-) -> serde_json::Value {
-    // 父边成环（E006）时兜底：同一节点只展开一次。
-    let children: Vec<serde_json::Value> = if seen.insert(node.id) {
-        store
-            .children(node)
-            .into_iter()
-            .map(|c| node_json_rec(store, c, seen))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    json!({
-        "id": node.id.to_string(),
-        "name": node.name,
-        "type": type_name(&node.value),
-        "value": fmt_value(store, node),
-        "isAux": node.name.starts_with('@'),
-        "children": children,
-    })
-}
-
-/// 结构/名字/值匹配：`--root <name>` 按**节点名**锚定候选子树（不要求顶层根）、
-/// `--shape-of <node-id>` 按形状码、`--template <name>` 按模板实例锚定；
-/// 三者选一，叠加 `--where 路径=值` 值约束；`--json` 结构化、`--tree` 整树。
-fn cmd_match(file: &str, root: Option<&str>, shape_of: Option<&str>, template: Option<&str>, wheres: &[(&str, &str)], json: bool, tree: bool) -> i32 {
-    let store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let sindex = query::ShapeIndex::build(&store);
-    let cands: Vec<usize> = if let Some(name) = template {
-        // 注释式：按模板名/编号定位模板，取其所有实例根
-        match ops::resolve_template(&store, name) {
-            Ok(tid) => ops::find_instances_of(&store, tid),
-            Err(e) => {
-                eprintln!("{e}");
-                return 2;
-            }
-        }
-    } else if let Some(name) = root {
-        query::name_index(&store).get(name).cloned().unwrap_or_default()
-    } else if let Some(so) = shape_of {
-        let sid = match Uuid::parse(so) {
-            Some(u) => u,
-            None => {
-                eprintln!("无效节点 ID：{so}");
-                return 2;
-            }
-        };
-        let idx = match store.nodes().iter().position(|x| x.id == sid) {
-            Some(i) => i,
-            None => {
-                eprintln!("节点不存在：{so}");
-                return 2;
-            }
-        };
-        query::by_shape(&sindex, sindex.shapes[idx])
-    } else {
-        eprintln!("需要 --root <name> 或 --shape-of <node-id> 或 --template <name>");
-        return 2;
-    };
-    let cands: Vec<usize> = cands
-        .into_iter()
-        .filter(|&i| query::matches_where(&store, i, wheres))
-        .collect();
-    if json {
-        let arr: Vec<serde_json::Value> = cands
-            .iter()
-            .map(|&i| {
-                let nd = &store.nodes()[i];
-                if tree {
-                    node_json(&store, nd)
-                } else {
-                    json!({
-                        "id": nd.id.to_string(),
-                        "name": nd.name,
-                        "type": type_name(&nd.value),
-                        "value": fmt_value(&store, nd),
-                    })
+    match ops::fill_values(&Policy::cli(yes), &CliHooks, file, root, &pairs, no_history) {
+        Ok(_) => {
+            // 回显用户原样输入的值（不是解析后的形式），与老输出一致
+            for a in assigns {
+                if let Some((p, v)) = a.split_once('=') {
+                    println!("已赋值：{p} = {v}");
                 }
-            })
-            .collect();
-        println!("{}", json!(arr));
-    } else {
-        for &i in &cands {
-            let nd = &store.nodes()[i];
-            let nm = if nd.name.is_empty() { "(空节点)" } else { nd.name.as_str() };
-            println!("{nm} <{}>", nd.id);
+            }
+            0
         }
-        println!("共 {} 个匹配", cands.len());
+        Err(e) => report(&e),
     }
-    0
 }
 
-/// 命令：`xr tmpl add <file> <name> --from-json <sample>` —— 建一棵模板定义（自由根，挂 @模板 空标记 + 结构）。
-fn cmd_tmpl_add(file: &str, name: &str, sample_path: Option<&str>) -> i32 {
-    // 与 `xr new` 一致：文件不存在就新建空库。
-    let mut store = if Path::new(file).exists() {
-        match load_store(file) {
-            Ok(s) => s,
-            Err(c) => return c,
-        }
-    } else {
-        tree::Store::new()
-    };
-    // 同名模板已存在则报错
-    if store
-        .nodes()
-        .iter()
-        .any(|n| n.name == name && store.is_template_root(n))
-    {
-        eprintln!("模板已存在：{name}（用 xr tmpl rm 删除再建）");
-        return 2;
+fn cmd_revert(file: &str, node_id: &str) -> i32 {
+    match ops::revert_node(&Policy::cli(false), &CliHooks, file, node_id) {
+        Ok(o) => match o.no_snapshot {
+            // 老行为：没有可回滚的快照时提示一行，但退出码仍是 0
+            Some(reason) => {
+                println!("（{reason}）");
+                0
+            }
+            None => {
+                println!("已回滚到最近快照：{}", o.name);
+                0
+            }
+        },
+        Err(e) => report(&e),
     }
-    let sample_path = match sample_path {
-        Some(p) => p,
-        None => {
-            eprintln!("需要 --from-json <样例.json> 来定模板结构");
-            return 2;
-        }
-    };
-    let text = match std::fs::read_to_string(sample_path) {
+}
+
+fn cmd_import(file: &str, format: &str, source: &str, yes: bool) -> i32 {
+    let text = match std::fs::read_to_string(source) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("错误：{e}");
             return 2;
         }
     };
-    let sample: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("JSON 解析失败：{e}");
-            return 2;
+    match ops::import_data(&Policy::cli(yes), &CliHooks, file, format, &text) {
+        Ok(o) => {
+            match o.previous_nodes {
+                Some(n) => println!(
+                    "已替换：{source} → {file}（原 {n} 节点 → {} 节点；import 是整文件替换，要追加请用 --append / --template）",
+                    o.nodes
+                ),
+                None => println!("已导入：{source} → {file}（{} 节点）", o.nodes),
+            }
+            0
         }
-    };
-    let tpl_id = match ops::build_template(&mut store, None, name, &sample) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-    };
-    if let Err(e) = save_store(&store, Path::new(file)) {
-        eprintln!("错误：{e}");
-        return 2;
+        Err(e) => report(&e),
     }
-    println!("已创建模板：{name} <{tpl_id}>（自由根，挂 @模板 标记）");
-    0
 }
 
-/// 命令：`xr import <file> --append <parent|nil> <source-json>` —— 把嵌套 JSON 作为子树追加。
+/// `xr import <file> --append <parent|nil> <source-json>`：把嵌套 JSON 作为子树追加。
 fn cmd_import_append(file: &str, parent: &str, source: &str) -> i32 {
-    let mut store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let p = if parent == "nil" || parent == "root" {
-        None
-    } else {
-        match Uuid::parse(parent) {
-            Some(u) => Some(u),
-            None => {
-                eprintln!("无效父节点 ID：{parent}");
-                return 2;
-            }
-        }
-    };
     let text = if source == "-" {
         let mut s = String::new();
         if std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).is_err() {
-            eprintln!("读取 stdin 失败");
+            eprintln!("错误：读取 stdin 失败");
             return 2;
         }
         s
@@ -1155,46 +728,21 @@ fn cmd_import_append(file: &str, parent: &str, source: &str) -> i32 {
     let val: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("JSON 解析失败：{e}");
+            eprintln!("错误：JSON 解析失败：{e}");
             return 2;
         }
     };
-    if let Err(e) = ops::build_json_tree(&mut store, p, &val) {
-        eprintln!("错误：{e}");
-        return 2;
+    match ops::import_append(&Policy::cli(false), &CliHooks, file, Some(parent), &val) {
+        Ok(_) => {
+            println!("已导入子树");
+            0
+        }
+        Err(e) => report(&e),
     }
-    if let Err(e) = save_store(&store, Path::new(file)) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    println!("已导入子树");
-    0
 }
 
-/// 命令：`xr import <file> --template <name> <data.json> [--under <parent|nil>]`。
-/// 注释式：每条记录 → 一棵实例树（挂 @实例 + @模板 引用），可自由挂在任意父节点下。
+/// `xr import <file> --template <name> <data.json> [--under <parent|nil>]`。
 fn cmd_import_template(file: &str, name: &str, data_path: &str, under: Option<&str>) -> i32 {
-    let mut store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let tpl_id = match ops::resolve_template(&store, name) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("{e}");
-            return 2;
-        }
-    };
-    let inst_parent = match under {
-        Some("nil") | Some("root") | None => None,
-        Some(p) => match Uuid::parse(p) {
-            Some(u) => Some(u),
-            None => {
-                eprintln!("无效父节点 ID：{p}");
-                return 2;
-            }
-        },
-    };
     let text = match std::fs::read_to_string(data_path) {
         Ok(t) => t,
         Err(e) => {
@@ -1205,227 +753,129 @@ fn cmd_import_template(file: &str, name: &str, data_path: &str, under: Option<&s
     let data: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("JSON 解析失败：{e}");
+            eprintln!("错误：JSON 解析失败：{e}");
             return 2;
         }
     };
-    let records: Vec<&serde_json::Value> = match &data {
-        serde_json::Value::Array(a) => a.iter().collect(),
-        other => std::slice::from_ref(other).iter().collect(),
+    let records: Vec<serde_json::Value> = match data {
+        serde_json::Value::Array(a) => a,
+        other => vec![other],
     };
-    for rec in &records {
-        if let Err(e) = ops::instantiate(&mut store, tpl_id, inst_parent, rec) {
+    match ops::import_instances(&Policy::cli(false), &CliHooks, file, name, &records, under) {
+        Ok(o) => {
+            println!(
+                "已导入 {} 棵实例（模板 {} <{}>）",
+                o.count, o.template_name, o.template_id
+            );
+            0
+        }
+        Err(e) => report(&e),
+    }
+}
+
+/// `xr tmpl add <file> <name> --from-json <sample>`：建模板定义。
+fn cmd_tmpl_add(file: &str, name: &str, sample_path: Option<&str>) -> i32 {
+    let sample_path = match sample_path {
+        Some(p) => p,
+        None => {
+            eprintln!("错误：需要 --from-json <样例.json> 来定模板结构");
+            return 2;
+        }
+    };
+    let text = match std::fs::read_to_string(sample_path) {
+        Ok(t) => t,
+        Err(e) => {
             eprintln!("错误：{e}");
             return 2;
         }
+    };
+    let sample: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("错误：JSON 解析失败：{e}");
+            return 2;
+        }
+    };
+    match ops::template_define(&Policy::cli(false), &CliHooks, file, name, &sample) {
+        Ok(o) => {
+            println!("已创建模板：{} <{}>（自由根，挂 @模板 标记）", o.name, o.id);
+            0
+        }
+        Err(e) => report(&e),
     }
-    if let Err(e) = save_store(&store, Path::new(file)) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    println!("已导入 {} 棵实例（模板 {name} <{tpl_id}>）", records.len());
-    0
 }
 
-/// 命令：`xr tmpl list <file>` —— 列出所有模板及其实例数。
 fn cmd_tmpl_list(file: &str) -> i32 {
-    let store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let tpls = ops::find_template_roots(&store);
-    if tpls.is_empty() {
-        println!("（无模板）");
-        return 0;
+    match ops::template_list(&Policy::cli(false), &CliHooks, file) {
+        Ok(items) => {
+            if items.is_empty() {
+                println!("（无模板）");
+                return 0;
+            }
+            for t in &items {
+                let nm = if t.name.is_empty() { "(空)" } else { t.name.as_str() };
+                println!("{nm} <{}>（{} 实例）", t.id, t.instances);
+            }
+            0
+        }
+        Err(e) => report(&e),
     }
-    for &i in &tpls {
-        let t = &store.nodes()[i];
-        let inst_count = ops::find_instances_of(&store, t.id).len();
-        let nm = if t.name.is_empty() { "(空)" } else { t.name.as_str() };
-        println!("{nm} <{}>（{inst_count} 实例）", t.id);
-    }
-    0
 }
 
-/// 命令：`xr tmpl rm <file> <name> [--yes]` —— 受保护删除模板定义（连同其所有实例）。
+/// `xr tmpl rm <file> <name> [--yes]`：受保护删除模板定义（连同其所有实例）。
 fn cmd_tmpl_rm(file: &str, name: &str, yes: bool) -> i32 {
-    let mut store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let tpl_id = match ops::resolve_template(&store, name) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("{e}");
-            return 2;
+    match ops::template_remove(&Policy::cli(yes), &CliHooks, file, name) {
+        Ok(o) => {
+            println!("已删除模板：{}（连同 {} 棵实例）", o.name, o.removed_instances);
+            0
         }
-    };
-    if !yes {
-        eprintln!("（保护：删除模板 {name} 会连同其结构 + 所有实例一并移除；用 --yes 确认）");
-        return 2;
+        Err(e) => report(&e),
     }
-    // 先收集实例根（删了模板子树后索引会变），连同实例树一起删除，
-    // 否则会留下指向已删模板根的悬挂 @模板 引用（R001）与找不到的孤儿实例。
-    let inst_ids: Vec<Uuid> = ops::find_instances_of(&store, tpl_id)
-        .into_iter()
-        .map(|i| store.nodes()[i].id)
-        .collect();
-    for id in &inst_ids {
-        if let Err(e) = store.remove_subtree(*id) {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-    }
-    if let Err(e) = store.remove_subtree(tpl_id) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    if let Err(e) = save_store(&store, Path::new(file)) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    println!("已删除模板：{name}（连同 {} 棵实例）", inst_ids.len());
-    0
 }
 
-/// 命令：`xr diff <a.xirang> <b.xirang> [--json]` —— 按节点编号对比两文件（增/删/改）。
-fn cmd_diff(a: &str, b: &str, json: bool) -> i32 {
-    let sa = match load_store(a) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let sb = match load_store(b) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let map_a: HashMap<Uuid, &Node> = sa.nodes().iter().map(|n| (n.id, n)).collect();
-    let map_b: HashMap<Uuid, &Node> = sb.nodes().iter().map(|n| (n.id, n)).collect();
-
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
-    let mut changed = Vec::new();
-    for (id, n) in &map_a {
-        match map_b.get(id) {
-            None => removed.push((n.id, n.name.clone())),
-            Some(m) => {
-                if m.name != n.name || m.value != n.value {
-                    let va = fmt_value(&sa, n).unwrap_or_default();
-                    let vb = fmt_value(&sb, m).unwrap_or_default();
-                    changed.push((n.id, (n.name.clone(), va), (m.name.clone(), vb)));
-                }
-            }
+fn cmd_blob_import(file: &str, parent: &str, source: &str) -> i32 {
+    match ops::blob_import(&Policy::cli(false), &CliHooks, file, Some(parent), source) {
+        Ok(o) => {
+            println!("已导入 blob：{} <{}>", o.name, o.id);
+            0
         }
+        Err(e) => report(&e),
     }
-    for (id, n) in &map_b {
-        if !map_a.contains_key(id) {
-            added.push((n.id, n.name.clone()));
-        }
-    }
-    // HashMap 迭代序不稳定 → 输出前按 UUID 排序，保证 --json 可回归对比。
-    added.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
-    removed.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
-    changed.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
-    if json {
-        let out = json!({
-            "added": added.iter().map(|(i, n)| json!({"id": i.to_string(), "name": n})).collect::<Vec<_>>(),
-            "removed": removed.iter().map(|(i, n)| json!({"id": i.to_string(), "name": n})).collect::<Vec<_>>(),
-            "changed": changed.iter().map(|(i, (an, av), (bn, bv))| json!({"id": i.to_string(), "from": {"name": an, "value": av}, "to": {"name": bn, "value": bv}})).collect::<Vec<_>>(),
-        });
-        println!("{}", out);
-    } else {
-        println!("新增 {} · 删除 {} · 改动 {}", added.len(), removed.len(), changed.len());
-        if !added.is_empty() {
-            println!("-- 新增 --");
-            for (i, n) in &added {
-                println!("  + {} <{}>", n, i);
-            }
-        }
-        if !removed.is_empty() {
-            println!("-- 删除 --");
-            for (i, n) in &removed {
-                println!("  - {} <{}>", n, i);
-            }
-        }
-        if !changed.is_empty() {
-            println!("-- 改动 --");
-            for (i, (an, av), (bn, bv)) in &changed {
-                println!("  ~ {} <{}>: {} = {} → {} = {}", an, i, an, av, bn, bv);
-            }
-        }
-    }
-    0
 }
 
-/// 命令：`xr instances <file> <name>` —— 列出某模板的实例根（@实例 下的节点）。
-fn cmd_instances(file: &str, name: &str) -> i32 {
-    let store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let tpl_id = match ops::resolve_template(&store, name) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("{e}");
-            return 2;
+fn cmd_blob_export(file: &str, node_id: &str, dest: &str, yes: bool) -> i32 {
+    match ops::blob_export(&Policy::cli(yes), &CliHooks, file, node_id, dest) {
+        Ok(o) => {
+            println!("已导出 {} 字节 → {}", o.bytes, o.dest);
+            0
         }
-    };
-    let insts = ops::find_instances_of(&store, tpl_id);
-    if insts.is_empty() {
-        println!("（模板 {name} 暂无实例）");
-        return 0;
+        Err(e) => report(&e),
     }
-    let mut sink = make_sink(has_flag(&std::env::args().collect::<Vec<_>>(), "--no-pager"));
-    for &i in &insts {
-        let mut budget = usize::MAX;
-        print_tree(&mut sink, &store, &store.nodes()[i], &TreeOpts::default(), &mut budget);
-        let _ = writeln!(sink);
-    }
-    sink.finish();
-    0
 }
 
-fn cmd_refs(file: &str, node_id: &str) -> i32 {
-    let store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let id = match Uuid::parse(node_id) {
-        Some(u) => u,
-        None => {
-            eprintln!("无效节点 ID：{node_id}");
-            return 2;
+fn cmd_blob_info(file: &str, node_id: &str) -> i32 {
+    match ops::blob_info(&Policy::cli(false), &CliHooks, file, node_id) {
+        Ok(b) => {
+            println!("二进制块：{} 字节", b.bytes);
+            if let Some(f) = &b.format {
+                println!("@format = {f}");
+            }
+            match &b.preview {
+                Some(s) => println!("文本预览：{s}"),
+                None => println!("（非文本，无法预览）"),
+            }
+            0
         }
-    };
-    let node = match store.get(id) {
-        Some(n) => n,
-        None => {
-            eprintln!("节点不存在：{node_id}");
-            return 2;
-        }
-    };
-    let name = if node.name.is_empty() { "(空节点)" } else { node.name.as_str() };
-    println!("节点：{name} <{}>", node.id);
-    // 出边（我引用谁）
-    if let Value::Reference(t) = &node.value {
-        match store.get(*t) {
-            Some(target) => println!("  引用 → {} <{}>", target.name, target.id),
-            None => println!("  引用 → {t} <不存在>"),
-        }
+        Err(e) => report(&e),
     }
-    // 入边（谁引用我）
-    let incoming = store.references_to(node);
-    if incoming.is_empty() {
-        println!("  （无反向引用）");
-    } else {
-        for r in incoming {
-            println!("  ← {} <{}>", r.name, r.id);
-        }
-    }
-    0
 }
 
-/// 只看值本身（不查引用目标），用于跨文件视图里的简述。
-fn value_brief(node: &Node) -> Option<String> {
+// ============================================================================
+// 本机状态命令（CLI 专属：MCP 不暴露）
+// ============================================================================
+
+fn value_brief(node: &xirang_core::codec::Node) -> Option<String> {
+    use xirang_core::codec::Value;
     match &node.value {
         Value::Empty => None,
         Value::Int(n) => Some(n.to_string()),
@@ -1437,10 +887,22 @@ fn value_brief(node: &Node) -> Option<String> {
     }
 }
 
-fn label_brief(node: &Node) -> String {
+fn label_brief(node: &xirang_core::codec::Node) -> String {
     match value_brief(node) {
-        None => if node.name.is_empty() { "(空节点)".to_string() } else { node.name.clone() },
-        Some(v) => if node.name.is_empty() { v } else { format!("{} = {}", node.name, v) },
+        None => {
+            if node.name.is_empty() {
+                "(空节点)".to_string()
+            } else {
+                node.name.clone()
+            }
+        }
+        Some(v) => {
+            if node.name.is_empty() {
+                v
+            } else {
+                format!("{} = {}", node.name, v)
+            }
+        }
     }
 }
 
@@ -1450,7 +912,7 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
     let id = match Uuid::parse(node_id) {
         Some(u) => u,
         None => {
-            eprintln!("无效节点 ID：{node_id}");
+            eprintln!("错误：无效节点 ID：{node_id}");
             return 2;
         }
     };
@@ -1459,9 +921,10 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
         Some(o) => vec![o.to_string()],
         None => files.to_vec(),
     };
-    for f in all.clone() {
-        index_file(&f);
-    }
+    // 注意：这里**不**把这批文件登记进本机目录。
+    // 它们是用户明确给的，`ws` 本来就知道该看哪里；登记要把每个文件整份读一遍
+    // （445 个文件≈450 ms），而目录的用途恰恰是「找到你没点名的文件」。
+    // 需要登记时用 `xr catalog scan` / 让其它命令自然登记。
     if only.is_none() && index_enabled() {
         if let Ok(mut r) = catalog::CatalogReader::open(&catalog::default_path()) {
             if let Ok(paths) = r.lookup_all(id) {
@@ -1474,22 +937,24 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
         }
     }
     // 目录里可能记着已被删 / 挪走的文件：跳过并提示，不因此失败。
-    // 又因目录里存的是规范路径、命令行可能给符号链接路径，此处按规范路径去重，避免同一文件算两份。
+    // 又因目录里存的是规范路径、命令行可能给符号链接路径，此处按规范路径去重。
     let mut usable: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     for p in &all {
         let path = Path::new(p);
         if !path.is_file() {
             eprintln!("（跳过：{p} 已不存在）");
             continue;
         }
+        // 去重必须按真实路径（macOS 上 /var 是 /private/var 的符号链接，
+        // 词法归一会把同一份文件当成两份）；这里每文件一次 canonicalize 是可接受的代价。
         let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if seen.insert(key) {
             usable.push(p.clone());
         }
     }
     if usable.is_empty() {
-        eprintln!("没有可读的文件");
+        eprintln!("错误：没有可读的文件");
         return 2;
     }
     let mut ws = match index::LazyWorkspace::from_paths(&usable) {
@@ -1499,10 +964,15 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
             return 2;
         }
     };
+    // 索引不可用时说清楚为什么（绝不静默换成另一条路）
+    if let Some(why) = ws.fallback_reason() {
+        eprintln!("（提示：本次未走索引，改用整份载入——{why}；可跑 xr index rebuild）");
+    }
+    index_touch(xirang_core::wsidx::workspace_root(Path::new(&usable[0])));
 
     let views = ws.node_views(id);
     if views.is_empty() {
-        eprintln!("节点不存在于任何文件：{node_id}");
+        eprintln!("错误：节点不存在于任何文件：{node_id}");
         return 2;
     }
     let kids = ws.children_union(id);
@@ -1513,13 +983,13 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
         let out = json!({
             "id": id.to_string(),
             "name": node.name,
-            "type": type_name(&node.value),
+            "type": ops::type_name(&node.value),
             "value": value_brief(node),
             "sources": views.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(),
             "children": kids.iter().map(|(f, n)| json!({
                 "id": n.id.to_string(),
                 "name": n.name,
-                "type": type_name(&n.value),
+                "type": ops::type_name(&n.value),
                 "value": value_brief(n),
                 "source": f,
             })).collect::<Vec<_>>(),
@@ -1543,7 +1013,7 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
             println!("    {} <{}>  （{f}）", label_brief(n), n.id);
         }
     }
-    if let Value::Reference(t) = &views[0].1.value {
+    if let xirang_core::codec::Value::Reference(t) = &views[0].1.value {
         match ws.find(*t) {
             Some((tfile, target)) => {
                 println!("  引用 → {} <{}>  （在 {tfile}）", label_brief(&target), target.id);
@@ -1561,23 +1031,601 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
     0
 }
 
-fn cmd_index(files: &[String]) -> i32 {
-    for f in files {
-        let idx_path = index::sidecar_path(Path::new(f));
-        let fresh = index::is_fresh(Path::new(f));
-        let sc = match index::Sidecar::open_for(Path::new(f)) {
-            Ok(s) => s,
+/// `xr index <子命令> [路径…] [--json] [--verbose] [--stale] [--dry-run] [--yes] [--sample N] [--deep]`
+/// 索引是缓存：看得清（status / files）、修得动（update / rebuild / compact）、
+/// 删得掉（drop / forget / gc）、救得回（unlock / path）。数据文件永远不动。
+fn cmd_index(sub: &str, paths: &[String], flags: &[String]) -> i32 {
+    let has = |f: &str| flags.iter().any(|x| x == f);
+    let json_out = has("--json");
+    let verbose = has("--verbose");
+    let dry_run = has("--dry-run");
+    let yes = has("--yes");
+    let stale_only = has("--stale");
+    let deep = has("--deep");
+    let sample = flags
+        .iter()
+        .position(|x| x == "--sample")
+        .and_then(|i| flags.get(i + 1))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(5);
+    let real_paths: Vec<String> = paths.iter().filter(|p| !p.starts_with("--")).cloned().collect();
+    let first = real_paths.first().map(|s| s.as_str()).unwrap_or(".");
+    let ws_root = xirang_core::wsidx::workspace_root(Path::new(first));
+    let dir = xirang_core::wsidx::index_dir(&ws_root);
+
+    if xirang_core::index::index_mode() == xirang_core::index::IndexMode::Sidecar {
+        return cmd_index_sidecar(sub, &real_paths, &ws_root, dry_run, yes, json_out);
+    }
+
+    match sub {
+        "path" => {
+            if json_out {
+                println!("{}", json!({"indexDir": dir.display().to_string(), "workspace": ws_root.display().to_string()}));
+            } else {
+                println!("{}", dir.display());
+            }
+            0
+        }
+        "status" => match xirang_core::wsidx::info(&ws_root) {
+            Ok(s) => {
+                if json_out {
+                    println!(
+                        "{}",
+                        json!({
+                            "mode": "workspace", "protocol": format!("wsidx-v{}", s.version),
+                            "indexDir": dir.display().to_string(), "workspace": ws_root.display().to_string(),
+                            "generation": s.generation, "files": s.files, "uuidTotal": s.uuid_total,
+                            "indexBytes": s.index_bytes, "baseBytes": s.base_bytes, "logBytes": s.log_bytes,
+                            "ledgers": {
+                                "loc": {"blocks": s.loc_blocks, "entries": s.loc_entries},
+                                "rel": {"blocks": s.rel_blocks, "entries": s.rel_entries},
+                                "rev": {"blocks": s.rev_blocks, "entries": s.rev_entries},
+                            },
+                            "staleFiles": s.stale_files.len(),
+                            "needCompact": s.need_compact,
+                        })
+                    );
+                    return 0;
+                }
+                println!("索引模式: workspace（工作区台账 wsidx-v{}）", s.version);
+                println!("索引目录: {}", dir.display());
+                println!(
+                    "文件 {} 个 · 编号 {} 条 · 代数 {}",
+                    s.files, s.uuid_total, s.generation
+                );
+                println!(
+                    "定位本: 块 {} · 条目 {} · 关系本: 块 {} · 条目 {} · 反向本: 块 {} · 条目 {}",
+                    s.loc_blocks, s.loc_entries, s.rel_blocks, s.rel_entries, s.rev_blocks, s.rev_entries
+                );
+                println!(
+                    "主干 {:.2} MB · 日志 {:.2} MB（占主干 {:.0}%）· 索引目录共 {:.2} MB",
+                    s.base_bytes as f64 / 1e6,
+                    s.log_bytes as f64 / 1e6,
+                    if s.base_bytes > 0 { s.log_bytes as f64 / s.base_bytes as f64 * 100.0 } else { 0.0 },
+                    s.index_bytes as f64 / 1e6
+                );
+                if !s.stale_files.is_empty() {
+                    println!("指纹不符（读时回退整份载入）{} 个，例如：", s.stale_files.len());
+                    for p in s.stale_files.iter().take(3) {
+                        println!("  {p}");
+                    }
+                    println!("  修：xr index update");
+                }
+                if s.need_compact {
+                    println!("日志已超过主干 30%，建议：xr index compact");
+                }
+                if verbose {
+                    match xirang_core::wsidx::files_status(&ws_root) {
+                        Ok(list) => {
+                            println!("块清单（每本台账前几个块）:");
+                            for (name, entries) in [
+                                ("定位", s.loc_entries),
+                                ("关系", s.rel_entries),
+                                ("反向", s.rev_entries),
+                            ] {
+                                println!("  {name}本 共 {entries} 条");
+                            }
+                            println!("文件清单（前 10 个，共 {} 个）:", list.len());
+                            for f in list.iter().take(10) {
+                                println!(
+                                    "  {} · {} 条 · 代号 {}/{} · {}",
+                                    f.path,
+                                    f.entries,
+                                    f.gen,
+                                    f.cur_gen,
+                                    if f.fresh { "已同步" } else { "指纹不符" }
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!("（提示：读文件表失败：{e}）"),
+                    }
+                }
+                0
+            }
             Err(e) => {
-                eprintln!("错误：{f}：{e}");
+                eprintln!("错误：{e}");
+                2
+            }
+        },
+        "files" => match xirang_core::wsidx::files_status(&ws_root) {
+            Ok(list) => {
+                let shown: Vec<&xirang_core::wsidx::FileStatus> = if stale_only {
+                    list.iter().filter(|f| !f.fresh || !f.exists).collect()
+                } else {
+                    list.iter().collect()
+                };
+                if json_out {
+                    println!(
+                        "{}",
+                        json!({
+                            "count": list.len(), "shown": shown.len(),
+                            "files": shown.iter().map(|f| json!({
+                                "path": f.path, "entries": f.entries, "gen": f.gen,
+                                "curGen": f.cur_gen, "exists": f.exists, "fresh": f.fresh,
+                            })).collect::<Vec<_>>(),
+                        })
+                    );
+                    return 0;
+                }
+                for f in &shown {
+                    println!(
+                        "{} · {} 条 · 代号 {}/{} · {}{}",
+                        f.path,
+                        f.entries,
+                        f.gen,
+                        f.cur_gen,
+                        if f.exists { "" } else { "文件已不存在 · " },
+                        if f.fresh { "已同步" } else { "指纹不符（跑 xr index update）" }
+                    );
+                }
+                println!("共 {} 个文件，其中 {} 个需要处理", list.len(), list.iter().filter(|f| !f.fresh).count());
+                0
+            }
+            Err(e) => {
+                eprintln!("错误：{e}");
+                2
+            }
+        },
+        "update" => {
+            let stale = xirang_core::wsidx::files_status(&ws_root)
+                .map(|l| l.into_iter().filter(|f| f.exists && !f.fresh).count())
+                .unwrap_or(0);
+            if dry_run {
+                if json_out {
+                    println!("{}", json!({"dryRun": true, "staleFiles": stale}));
+                } else {
+                    println!("（预演）将重扫 {stale} 个被改动过的文件并清理已删除文件的条目");
+                }
+                return 0;
+            }
+            match xirang_core::wsidx::update(&ws_root) {
+                Ok((n, entries, removed)) => {
+                    if json_out {
+                        println!("{}", json!({"updatedFiles": n, "entries": entries, "removedFiles": removed}));
+                    } else {
+                        println!("已更新 {n} 个文件（追加 {entries} 条）· 清理 {removed} 个已删除文件");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("错误：{e}");
+                    2
+                }
+            }
+        }
+        "rebuild" => {
+            let files: Vec<PathBuf> = real_paths.iter().map(PathBuf::from).collect();
+            match xirang_core::wsidx::rebuild(&ws_root, &files) {
+                Ok(s) => {
+                    if json_out {
+                        println!(
+                            "{}",
+                            json!({"files": s.files, "loc": s.loc, "rel": s.rel, "rev": s.rev, "blocks": s.blocks})
+                        );
+                    } else {
+                        println!(
+                            "已重建索引：{} 个文件 · 定位 {} · 关系 {} · 反向 {} · 块 {}",
+                            s.files, s.loc, s.rel, s.rev, s.blocks
+                        );
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("错误：{e}");
+                    2
+                }
+            }
+        }
+        "compact" => {
+            if dry_run {
+                match xirang_core::wsidx::info(&ws_root) {
+                    Ok(s) => {
+                        if json_out {
+                            println!("{}", json!({"dryRun": true, "baseBytes": s.base_bytes, "logBytes": s.log_bytes}));
+                        } else {
+                            println!(
+                                "（预演）将把 {:.2} MB 日志合并回 {:.2} MB 主干（重写三本台账）",
+                                s.log_bytes as f64 / 1e6,
+                                s.base_bytes as f64 / 1e6
+                            );
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("错误：{e}");
+                        2
+                    }
+                }
+            } else {
+                match xirang_core::wsidx::compact(&ws_root) {
+                    Ok(s) => {
+                        if json_out {
+                            println!("{}", json!({"files": s.files, "loc": s.loc, "rel": s.rel, "rev": s.rev, "blocks": s.blocks}));
+                        } else {
+                            println!(
+                                "已压实：{} 个文件 · 定位 {} · 关系 {} · 反向 {} · 块 {}",
+                                s.files, s.loc, s.rel, s.rev, s.blocks
+                            );
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("错误：{e}");
+                        2
+                    }
+                }
+            }
+        }
+        "gc" => {
+            let gone = xirang_core::wsidx::files_status(&ws_root)
+                .map(|l| l.into_iter().filter(|f| !f.exists).count())
+                .unwrap_or(0);
+            if dry_run {
+                if json_out {
+                    println!("{}", json!({"dryRun": true, "missingFiles": gone}));
+                } else {
+                    println!("（预演）将清理 {gone} 个已不存在的文件条目");
+                }
+                return 0;
+            }
+            match xirang_core::wsidx::gc(&ws_root) {
+                Ok(n) => {
+                    if json_out {
+                        println!("{}", json!({"removedFiles": n}));
+                    } else {
+                        println!("已清理 {n} 个已不存在的文件条目（下次压实后生效）");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("错误：{e}");
+                    2
+                }
+            }
+        }
+        "check" => {
+            let mut bad = 0usize;
+            let st = match xirang_core::wsidx::info(&ws_root) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("错误：{e}");
+                    return 2;
+                }
+            };
+            let mut detail: Vec<String> = Vec::new();
+            if !st.stale_files.is_empty() {
+                detail.push(format!("指纹不符 {} 个", st.stale_files.len()));
+                bad += st.stale_files.len();
+            }
+            let mut reader = match xirang_core::wsidx::Reader::open(&ws_root) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("错误：{e}");
+                    return 2;
+                }
+            };
+            for n in reader.sample_nodes(sample) {
+                match reader.locate(n) {
+                    Ok(hits) if !hits.is_empty() => {
+                        if hits.iter().any(|h| xirang_core::wsidx::read_node_at_hit(h).is_err()) {
+                            detail.push(format!("抽样读取失败：{n}"));
+                            bad += 1;
+                        }
+                    }
+                    _ => {
+                        detail.push(format!("抽样定位失败：{n}"));
+                        bad += 1;
+                    }
+                }
+            }
+            if deep {
+                match xirang_core::wsidx::files_status(&ws_root) {
+                    Ok(list) => {
+                        for f in list.iter().filter(|f| f.exists) {
+                            match xirang_core::wsidx::scan_file(Path::new(&f.path), 0) {
+                                Ok(e) if e.loc.len() as u64 == f.entries => {}
+                                Ok(e) => {
+                                    detail.push(format!(
+                                        "{} 条目数不符：台账 {} / 实际 {}",
+                                        f.path,
+                                        f.entries,
+                                        e.loc.len()
+                                    ));
+                                    bad += 1;
+                                }
+                                Err(err) => {
+                                    detail.push(format!("{} 重扫失败：{err}", f.path));
+                                    bad += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("错误：{e}");
+                        return 2;
+                    }
+                }
+            }
+            if json_out {
+                println!("{}", json!({"ok": bad == 0, "problems": bad, "details": detail}));
+            } else if bad == 0 {
+                println!(
+                    "索引一致：抽样 {} 个编号都能定位并读出{}",
+                    sample,
+                    if deep { "；全量条目数比对通过" } else { "" }
+                );
+            } else {
+                for d in &detail {
+                    println!("  {d}");
+                }
+                println!("发现 {bad} 处问题；可跑 xr index update（增量）或 xr index rebuild（全量）");
+            }
+            if bad == 0 {
+                0
+            } else {
+                1
+            }
+        }
+        "drop" => {
+            let bytes = xirang_core::wsidx::info(&ws_root).map(|s| s.index_bytes).unwrap_or(0);
+            let files = xirang_core::wsidx::files_status(&ws_root).map(|l| l.len()).unwrap_or(0);
+            if !yes {
+                eprintln!(
+                    "（保护：将删除整个索引目录 {}（{:.2} MB，登记 {} 个文件）；数据文件不受影响）",
+                    dir.display(),
+                    bytes as f64 / 1e6,
+                    files
+                );
+                eprintln!("（确认请加 --yes；先看看会删什么可以加 --dry-run）");
                 return 2;
             }
-        };
-        println!("{f}");
-        println!("  索引: {}", idx_path.display());
-        println!("  状态: {}", if fresh { "复用" } else { "新建/重建" });
-        println!("  根: {} · 节点: {} · 引用边: {}", sc.root_count, sc.node_count, sc.edge_count);
+            if dry_run {
+                if json_out {
+                    println!("{}", json!({"dryRun": true, "indexDir": dir.display().to_string(), "bytes": bytes, "files": files}));
+                } else {
+                    println!("（预演）将删除 {}（{:.2} MB）", dir.display(), bytes as f64 / 1e6);
+                }
+                return 0;
+            }
+            match xirang_core::wsidx::drop_index(&ws_root) {
+                Ok((b, n)) => {
+                    if json_out {
+                        println!("{}", json!({"removedBytes": b, "removedFiles": n}));
+                    } else {
+                        println!("已删除索引目录（释放 {:.2} MB，原登记 {n} 个文件）；数据文件未动", b as f64 / 1e6);
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("错误：{e}");
+                    2
+                }
+            }
+        }
+        "forget" => {
+            let targets: Vec<String> = real_paths
+                .iter()
+                .filter(|p| !matches!(p.as_str(), "" | "."))
+                .cloned()
+                .collect();
+            if targets.is_empty() {
+                eprintln!("错误：forget 需要给出要移除的文件（例：xr index forget 词库.xirang）");
+                return 2;
+            }
+            if !yes {
+                eprintln!("（保护：将从台账移除 {} 个文件的条目；数据文件保留）", targets.len());
+                eprintln!("（确认请加 --yes；先看看会删什么可以加 --dry-run）");
+                return 2;
+            }
+            if dry_run {
+                if json_out {
+                    println!("{}", json!({"dryRun": true, "forget": targets}));
+                } else {
+                    println!("（预演）将移除这些文件的条目：{}", targets.join("、"));
+                }
+                return 0;
+            }
+            match xirang_core::wsidx::forget_files(&ws_root, &targets) {
+                Ok(n) => {
+                    if json_out {
+                        println!("{}", json!({"forgotten": n, "files": targets}));
+                    } else if n == 0 {
+                        println!("台账里没有这些文件（可能没被索引过，或用的是别的路径写法）");
+                    } else {
+                        println!("已从台账移除 {n} 个文件的条目（数据文件未动）");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("错误：{e}");
+                    2
+                }
+            }
+        }
+        "unlock" => match xirang_core::wsidx::unlock(&ws_root) {
+            Ok(None) => {
+                if json_out {
+                    println!("{}", json!({"lock": null}));
+                } else {
+                    println!("没有锁文件（索引没在被写）");
+                }
+                0
+            }
+            Ok(Some((pid, alive))) => {
+                if json_out {
+                    println!("{}", json!({"removedPid": pid, "alive": alive}));
+                } else {
+                    println!(
+                        "已删除锁文件（原记录 pid {pid}，该进程{}）",
+                        if alive { "仍在运行——若它确实在写索引，请留意" } else { "已不存在" }
+                    );
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("错误：{e}");
+                2
+            }
+        },
+        other => {
+            eprintln!("错误：未知子命令：{other}");
+            eprintln!("可用：status / files / update / rebuild / compact / check / gc / drop / forget / unlock / path");
+            2
+        }
     }
-    0
+}
+
+/// 侧车模式下的 `xr index ...`：保持旧行为（每文件一份 `.idx`）。
+fn cmd_index_sidecar(
+    sub: &str,
+    paths: &[String],
+    _ws_root: &Path,
+    dry_run: bool,
+    yes: bool,
+    json_out: bool,
+) -> i32 {
+    let files: Vec<String> =
+        if paths.is_empty() { vec![".".to_string()] } else { paths.to_vec() };
+    match sub {
+        "path" => {
+            println!("（侧车模式没有单一索引目录：每个 .xirang 旁边一个 <文件>.xirang.idx）");
+            0
+        }
+        "unlock" => {
+            println!("（侧车模式没有写者锁）");
+            0
+        }
+        "compact" | "update" => {
+            println!("（侧车模式无需{}：每次保存都会重写该文件的 .idx；要修复就 xr index rebuild）",
+                if sub == "compact" { "压实" } else { "增量更新" });
+            0
+        }
+        "files" => {
+            let mut n = 0;
+            for f in &files {
+                let p = Path::new(f);
+                if p.is_file() {
+                    let idx = index::sidecar_path(p);
+                    println!(
+                        "{} · {}（{} 字节）",
+                        f,
+                        if idx.exists() { "有侧车" } else { "无侧车" },
+                        idx.metadata().map(|m| m.len()).unwrap_or(0)
+                    );
+                    n += 1;
+                }
+            }
+            println!("共 {n} 个文件（侧车模式；改用 XIRANG_INDEX_MODE=workspace 可看台账详情）");
+            0
+        }
+        "drop" | "forget" => {
+            if !yes {
+                eprintln!("（保护：将删除对应文件的 .xirang.idx；数据文件不受影响）");
+                return 2;
+            }
+            if dry_run {
+                println!("（预演）将删除 {} 个文件对应的 .idx", files.len());
+                return 0;
+            }
+            let mut n = 0;
+            for f in &files {
+                let idx = index::sidecar_path(Path::new(f));
+                if idx.exists() && std::fs::remove_file(&idx).is_ok() {
+                    n += 1;
+                }
+            }
+            if json_out {
+                println!("{}", json!({"removed": n}));
+            } else {
+                println!("已删除 {n} 个侧车索引（数据文件未动）");
+            }
+            0
+        }
+        "status" | "check" => {
+            for f in &files {
+                let p = Path::new(f);
+                if p.is_dir() {
+                    continue;
+                }
+                let idx_path = index::sidecar_path(p);
+                let fresh = index::is_fresh(p);
+                let sc = match index::Sidecar::open_for(p) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("错误：{f}：{e}");
+                        return 2;
+                    }
+                };
+                println!("{f}");
+                println!("  索引: {}", idx_path.display());
+                println!("  状态: {}", if fresh { "复用" } else { "新建/重建" });
+                println!(
+                    "  根: {} · 节点: {} · 引用边: {}",
+                    sc.root_count, sc.node_count, sc.edge_count
+                );
+            }
+            0
+        }
+        "rebuild" => {
+            let mut n = 0;
+            for f in &files {
+                let p = Path::new(f);
+                if p.is_file() {
+                    if let Err(e) = index::rebuild(p) {
+                        eprintln!("错误：{f}：{e}");
+                        return 2;
+                    }
+                    n += 1;
+                }
+            }
+            println!("已重建 {n} 个侧车索引");
+            0
+        }
+        "gc" => {
+            let mut n = 0;
+            for f in &files {
+                // 目录：删掉没有对应数据文件的孤儿 .idx
+                if let Ok(rd) = std::fs::read_dir(f) {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        let name = p.to_string_lossy().into_owned();
+                        if let Some(base) = name.strip_suffix(".idx") {
+                            if !Path::new(base).exists() {
+                                let _ = std::fs::remove_file(&p);
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            println!("已清理 {n} 个孤儿侧车索引");
+            0
+        }
+        other => {
+            eprintln!("错误：未知子命令：{other}（可用：status / rebuild / compact / check / gc）");
+            2
+        }
+    }
 }
 
 fn cmd_collection_split(file: &str, rule: &str, out: &Path) -> i32 {
@@ -1649,6 +1697,7 @@ fn cmd_compact(dir: &str, all: bool) -> i32 {
             }
         };
     }
+
     let mstore = match tree::Store::load_view(&Path::new(dir).join(shard::MANIFEST_NAME)) {
         Ok(s) => s,
         Err(e) => {
@@ -1729,7 +1778,7 @@ fn cmd_catalog_scan(paths: &[String]) -> i32 {
         }
     }
     if targets.is_empty() {
-        eprintln!("没有可扫描的 .xirang 文件");
+        eprintln!("错误：没有可扫描的 .xirang 文件");
         return 2;
     }
     let mut indexed = 0usize;
@@ -1775,8 +1824,6 @@ fn cmd_catalog_list() -> i32 {
 }
 
 /// 跨文件一致性检查：只看「同编号多文件」里**节点自身（名字 / 值）不一致**的那些编号。
-/// 两个库各留各的「猫」是正常现象；只有自身内容对不上时才需要人来裁决。
-/// 每条都列出两边各自的来源文件、自身内容差异，以及**两边各自的孩子列表**（判断时的上下文）。
 fn cmd_catalog_check() -> i32 {
     let cat = match catalog::Catalog::load(&catalog::default_path()) {
         Ok(c) => c,
@@ -1790,7 +1837,6 @@ fn cmd_catalog_check() -> i32 {
         println!("（没有同编号多文件的情况）");
         return 0;
     }
-    // 一次性把所有相关文件开成一个懒工作区（只读节点片段，不整读）。
     let mut all_files: Vec<String> = Vec::new();
     for (_u, files) in &dup {
         for f in files {
@@ -1815,15 +1861,12 @@ fn cmd_catalog_check() -> i32 {
             continue;
         }
         let first = &views[0].1;
-        let mismatch = views
-            .iter()
-            .any(|(_, n)| n.name != first.name || n.value != first.value);
+        let mismatch = views.iter().any(|(_, n)| n.name != first.name || n.value != first.value);
         if !mismatch {
             continue; // 自身一致；孩子不同属正常，不算冲突
         }
         diffs += 1;
         println!("{u}  （同编号，自身内容不一致）");
-        // 按来源文件归拢这一编号在各文件里的孩子（孩子差异只作上下文，不参与判定）。
         let kids = ws.children_union(*u);
         for (path, n) in &views {
             println!("  - {path}");
@@ -1854,7 +1897,7 @@ fn cmd_catalog_check_sync(uuid_str: &str, base: &str) -> i32 {
     let id = match Uuid::parse(uuid_str) {
         Some(u) => u,
         None => {
-            eprintln!("无效节点 ID：{uuid_str}");
+            eprintln!("错误：无效节点 ID：{uuid_str}");
             return 2;
         }
     };
@@ -1869,7 +1912,7 @@ fn cmd_catalog_check_sync(uuid_str: &str, base: &str) -> i32 {
     let base_node = match base_store.get(id) {
         Some(n) => n.clone(),
         None => {
-            eprintln!("基准文件里没有该编号：{base_abs}");
+            eprintln!("错误：基准文件里没有该编号：{base_abs}");
             return 2;
         }
     };
@@ -1941,7 +1984,7 @@ fn cmd_catalog_forget(path: &str) -> i32 {
     let before = cat.files().len();
     cat.remove_file(&abs);
     if cat.files().len() == before {
-        eprintln!("目录里没有：{abs}");
+        eprintln!("错误：目录里没有：{abs}");
         return 2;
     }
     if let Err(e) = cat.save(&cpath) {
@@ -1975,7 +2018,7 @@ fn trash_dest(p: &Path) -> PathBuf {
 fn cmd_catalog_trash(path: &str) -> i32 {
     let p = Path::new(path);
     if !p.is_file() {
-        eprintln!("文件不存在：{path}");
+        eprintln!("错误：文件不存在：{path}");
         return 2;
     }
     let abs = abs_str(p);
@@ -1994,313 +2037,9 @@ fn cmd_catalog_trash(path: &str) -> i32 {
     0
 }
 
-fn cmd_blob_import(file: &str, parent: &str, source: &str) -> i32 {
-    let mut store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let bytes = match std::fs::read(source) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-    };
-    let p = if parent == "nil" || parent == "root" {
-        None
-    } else {
-        match Uuid::parse(parent) {
-            Some(u) => Some(u),
-            None => {
-                eprintln!("无效父节点 ID：{parent}");
-                return 2;
-            }
-        }
-    };
-    let name = Path::new(source)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "blob".to_string());
-    let n = store.create(p, &name, Value::Blob(bytes), true);
-    if let Err(e) = save_store(&store, Path::new(file)) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    println!("已导入 blob：{name} <{}>", n.id);
-    0
-}
-
-fn cmd_blob_export(file: &str, node_id: &str, dest: &str) -> i32 {
-    let store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let id = match Uuid::parse(node_id) {
-        Some(u) => u,
-        None => {
-            eprintln!("无效节点 ID：{node_id}");
-            return 2;
-        }
-    };
-    let node = match store.get(id) {
-        Some(n) => n,
-        None => {
-            eprintln!("节点不存在：{node_id}");
-            return 2;
-        }
-    };
-    match &node.value {
-        Value::Blob(b) => {
-            if let Err(e) = std::fs::write(dest, b) {
-                eprintln!("错误：{e}");
-                return 2;
-            }
-            println!("已导出 {} 字节 → {dest}", b.len());
-            0
-        }
-        _ => {
-            eprintln!("节点不是二进制块：{node_id}");
-            2
-        }
-    }
-}
-
-fn cmd_revert(file: &str, node_id: &str) -> i32 {
-    let mut store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let id = match Uuid::parse(node_id) {
-        Some(u) => u,
-        None => {
-            eprintln!("无效节点 ID：{node_id}");
-            return 2;
-        }
-    };
-    if store.get(id).is_none() {
-        eprintln!("节点不存在：{node_id}");
-        return 2;
-    }
-    // 回滚也留痕（Store::revert 会把回滚前的状态快照进 @history）。
-    if let Err(e) = store.revert(id) {
-        println!("（{e}）");
-        return 0;
-    }
-    if let Err(e) = save_store(&store, Path::new(file)) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    let name = store.get(id).map(|n| n.name.clone()).unwrap_or_default();
-    println!("已回滚到最近快照：{name}");
-    0
-}
-
-fn cmd_blob_info(file: &str, node_id: &str) -> i32 {
-    let store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let id = match Uuid::parse(node_id) {
-        Some(u) => u,
-        None => {
-            eprintln!("无效节点 ID：{node_id}");
-            return 2;
-        }
-    };
-    let node = match store.get(id) {
-        Some(n) => n,
-        None => {
-            eprintln!("节点不存在：{node_id}");
-            return 2;
-        }
-    };
-    match &node.value {
-        Value::Blob(b) => {
-            println!("二进制块：{} 字节", b.len());
-            if let Some(f) = store.child_by_name(node, "@format") {
-                if let Value::Text(t) = &f.value {
-                    println!("@format = {t}");
-                }
-            }
-            // 若可判为 UTF-8 文本，预览前 200 字符
-            match std::str::from_utf8(&b[..b.len().min(200)]) {
-                Ok(s) if !s.contains('\0') => println!("文本预览：{s}"),
-                _ => println!("（非文本，无法预览）"),
-            }
-        }
-        _ => {
-            eprintln!("节点不是二进制块：{node_id}");
-            return 2;
-        }
-    }
-    0
-}
-
-fn cmd_history(file: &str, node_id: &str) -> i32 {
-    let store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let id = match Uuid::parse(node_id) {
-        Some(u) => u,
-        None => {
-            eprintln!("无效节点 ID：{node_id}");
-            return 2;
-        }
-    };
-    let node = match store.get(id) {
-        Some(n) => n,
-        None => {
-            eprintln!("节点不存在：{node_id}");
-            return 2;
-        }
-    };
-    let name = if node.name.is_empty() { "(空节点)" } else { node.name.as_str() };
-    println!("节点：{name} <{}>", node.id);
-    match store.child_by_name(node, "@history") {
-        None => println!("（无 @history）"),
-        Some(hist) => {
-            let snaps = store.children(hist);
-            if snaps.is_empty() {
-                println!("（@history 为空）");
-            }
-            for snap in snaps {
-                let sv = fmt_value(&store, &snap).unwrap_or_default();
-                println!("  快照：{} = {}", snap.name, sv);
-                if let Some(r) = store.child_by_name(&snap, "@replaced") {
-                    if let Value::Text(t) = &r.value {
-                        println!("    @replaced = {t}");
-                    }
-                }
-            }
-        }
-    }
-    0
-}
-
-fn cmd_find(file: &str, pattern: &str, json: bool) -> i32 {
-    let store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    let mut hits: Vec<&Node> = Vec::new();
-    for n in store.nodes() {
-        let text_val = match &n.value {
-            Value::Text(s) => s.clone(),
-            Value::Int(i) => i.to_string(),
-            Value::Float(f) => f.to_string(),
-            Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-            _ => String::new(),
-        };
-        if n.name.contains(pattern) || text_val.contains(pattern) {
-            hits.push(n);
-        }
-    }
-    if json {
-        let arr: Vec<serde_json::Value> = hits
-            .iter()
-            .map(|n| {
-                json!({
-                    "id": n.id.to_string(),
-                    "name": n.name,
-                    "type": type_name(&n.value),
-                    "value": fmt_value(&store, n),
-                })
-            })
-            .collect();
-        println!("{}", json!(arr));
-    } else {
-        for n in &hits {
-            let name = if n.name.is_empty() { "(空节点)" } else { n.name.as_str() };
-            println!("{name} <{}>", n.id);
-        }
-        println!("共 {} 个匹配", hits.len());
-    }
-    0
-}
-
-fn cmd_export(file: &str, format: &str, subtree: Option<&str>) -> i32 {
-    let store = match load_store(file) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    // 若指定子树，只导出该子树
-    let store = match subtree {
-        None => store,
-        Some(id_str) => {
-            let id = match Uuid::parse(id_str) {
-                Some(u) => u,
-                None => {
-                    eprintln!("无效节点 ID：{id_str}");
-                    return 2;
-                }
-            };
-            let root = match store.get(id) {
-                Some(n) => n,
-                None => {
-                    eprintln!("节点不存在：{id_str}");
-                    return 2;
-                }
-            };
-            let mut sub = store.sub_store(root);
-            // 子树重新扎根：把根父指针置 nil，导出的子树才能直接再导入（否则 E011）。
-            let _ = sub.set_parent(id, None);
-            sub
-        }
-    };
-    match format {
-        "json" => println!("{}", convert::to_json(&store)),
-        "yaml" => println!("{}", convert::to_yaml(&store)),
-        "xml" => println!("{}", convert::to_xml(&store)),
-        // to_md 自带结尾换行，这里用 print! 避免多一个空行
-        "md" | "markdown" => print!("{}", convert::to_md(&store)),
-        _ => {
-            eprintln!("未知格式：{format}（支持 json / yaml / xml / md）");
-            return 2;
-        }
-    }
-    0
-}
-
-fn cmd_import(file: &str, format: &str, source: &str) -> i32 {
-    // 导入是「整文件替换」：先记下原节点数，输出里说清楚，避免静默覆盖。
-    let before = tree::Store::load_view(Path::new(file)).ok().map(|s| s.len());
-    let text = match std::fs::read_to_string(source) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-    };
-    let store = match format {
-        "json" => convert::from_json(&text),
-        "yaml" => convert::from_yaml(&text),
-        "xml" => convert::from_xml(&text),
-        _ => {
-            eprintln!("未知格式：{format}（支持 json / yaml / xml）");
-            return 2;
-        }
-    };
-    let store = match store {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return 2;
-        }
-    };
-    if let Err(e) = save_store(&store, Path::new(file)) {
-        eprintln!("错误：{e}");
-        return 2;
-    }
-    match before {
-        Some(n) => println!(
-            "已替换：{source} → {file}（原 {n} 节点 → {} 节点；import 是整文件替换，要追加请用 --append / --template）",
-            store.len()
-        ),
-        None => println!("已导入：{source} → {file}（{} 节点）", store.len()),
-    }
-    0
-}
+// ============================================================================
+// 参数解析与分发
+// ============================================================================
 
 /// 参数里是否出现某个标志（如 `--no-history`）。
 fn has_flag(args: &[String], flag: &str) -> bool {
@@ -2355,7 +2094,7 @@ fn usage() {
     println!("      结构/名字/值匹配（按根名/形状码/模板实例；--json 结构化、--tree 整树）");
     println!("  （--no-history：不写 @history / @created，适合批量创建 & 初始数据）");
     println!("  xr export <file> <json|yaml|xml|md> [--subtree <id>]  导出");
-    println!("  xr import <file> <json|yaml|xml> <source>  导入");
+    println!("  xr import <file> <json|yaml|xml> <source>  导入（整文件替换；原文件非空要加 --yes 确认）");
     println!("  xr import <file> --append <parent|nil> <source-json>  把嵌套 JSON 追加为子树（数组→0,1,2；{{\"@ref\":\"名\"}}→引用边）");
     println!("  xr import <file> --template <name> <data.json>  按模板批量导入实例");
     println!("  xr tmpl add <file> <name> --from-json <sample>  创建模板（@模板/<name> + 结构 + @实例）");
@@ -2367,7 +2106,11 @@ fn usage() {
     println!("  xr refs <file> <node-id>            查看引用边（出 / 入）");
     println!("  xr ws <node-id> <file1> [file2...] [--only <file>] [--json]");
     println!("      按编号跨文件解析：默认列出该编号在各相关文件里的每一份、孩子取并集（每条标来源）；--only 只看一个文件");
-    println!("  xr index <file1> [file2...]          重建 / 刷新 sidecar 索引并打印摘要");
+    println!("  xr index <子命令> [路径…] [--json] [--verbose] [--stale] [--dry-run] [--yes] [--sample N] [--deep]");
+    println!("      status 看总览 · files 逐文件状态 · update 增量修复（自愈 + gc）· rebuild 全量重建");
+    println!("      compact 压实日志 · check 一致性校验 · gc 清理已删文件 · drop 删整个索引目录（要 --yes）");
+    println!("      forget 从台账移除指定文件（要 --yes）· unlock 清写者锁 · path 打印索引目录");
+    println!("      （XIRANG_INDEX_MODE=sidecar 时退化为每文件 .idx 的维护；默认是工作区台账）");
     println!("  xr collection split <file> --rule <规则> [--out <dir>]   无损拆成 shard 词库");
     println!("  xr collection list <dir>            列出 shard 词库分片");
     println!("  xr compact <dir> [--all]            合并分片的覆盖日志");
@@ -2379,15 +2122,22 @@ fn usage() {
     println!("  xr catalog trash <路径>             移文件到回收站并从目录移除");
     println!("  （读命令默认维护本机目录；--no-index 或 XIRANG_INDEX=off 关闭）");
     println!("  xr history <file> <node-id>          查看 @history 快照");
+    println!("  xr history prune <file> <node-id> [--keep N] [--before <ISO前缀>] [--dry-run] [--yes]");
+    println!("      裁剪留痕：只保留最近 N 条（默认 20）快照，可选只裁早于某时刻的；丢掉的是回滚能力，故要 --yes");
     println!("  xr blob-import <file> <parent|nil> <src>   导入文件为二进制块");
-    println!("  xr blob-export <file> <node-id> <dest>    导出二进制块为文件");
+    println!("  xr blob-export <file> <node-id> <dest>    导出二进制块为文件（目标已存在要加 --yes 覆盖）");
     println!("  xr blob-info <file> <node-id>           二进制块信息 / 预览");
     println!("  xr revert <file> <node-id>              回滚到最近 @history 快照");
+    println!();
+    println!("本机状态类命令（catalog / index / collection / compact / ws）只在 CLI 提供；");
+    println!("MCP 侧（xr-mcp）覆盖文件里的数据，见 docs/MCP.md。");
 }
 
 fn main() {
     // 管道关闭（如 | head）时静默退出，不 panic（标准 Unix 工具行为）
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+    // 写命令也会让 ops 记下工作区，退出前统一决定要不要后台压实
+    ops::ON_INDEX_TOUCH.set(index_touch).ok();
 
     let args: Vec<String> = std::env::args().collect();
     // --help / --version：不要求 3 个参数，退出码 0（SKILL.md 里承诺了 `xr --help`）。
@@ -2422,38 +2172,39 @@ fn main() {
     INDEX_ENABLED.store(env_on && !has_flag(&args, "--no-index"), Ordering::Relaxed);
     warn_unknown_flags(&args);
 
+    let yes = has_flag(&args, "--yes");
+    let no_pager = has_flag(&args, "--no-pager");
+
     let code = match cmd {
         "info" | "open" => cmd_info(file),
         "tree" => {
             let mut node_id = None;
-            let mut opts = TreeOpts::default();
-            let mut head: Option<usize> = None;
+            let mut opts = ViewOpts::default();
             let mut it = args[3..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--node" => node_id = it.next().map(|s| s.as_str()),
                     "--skip-aux" => opts.skip_aux = true,
-                    "--ids" => opts.show_ids = true,
-                    "--head" => head = it.next().and_then(|v| v.parse::<usize>().ok()),
+                    "--ids" => opts.include_ids = true,
+                    "--head" => opts.limit = it.next().and_then(|v| v.parse::<usize>().ok()),
                     "--depth" => opts.max_depth = it.next().and_then(|v| v.parse::<usize>().ok()),
                     _ => {}
                 }
             }
-            cmd_tree(file, node_id, &opts, head, has_flag(&args, "--no-pager"))
+            cmd_tree(file, node_id, &opts, no_pager)
         }
         "cat" => {
-            let mut opts = TreeOpts::default();
-            let mut head: Option<usize> = None;
+            let mut opts = ViewOpts::default();
             let mut it = args[3..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--skip-aux" => opts.skip_aux = true,
-                    "--ids" => opts.show_ids = true,
-                    "--head" => head = it.next().and_then(|v| v.parse::<usize>().ok()),
+                    "--ids" => opts.include_ids = true,
+                    "--head" => opts.limit = it.next().and_then(|v| v.parse::<usize>().ok()),
                     _ => {}
                 }
             }
-            cmd_cat(file, &opts, head, has_flag(&args, "--force"), has_flag(&args, "--no-pager"))
+            cmd_cat(file, &opts, has_flag(&args, "--force") || yes, no_pager)
         }
         "validate" => cmd_validate(file),
         "new" => {
@@ -2461,11 +2212,9 @@ fn main() {
                 usage();
                 2
             } else {
-                let nh = has_flag(&args, "--no-history");
-                let yes = has_flag(&args, "--yes");
-                // 只把「已知标志」当标志；`--待办` 这类文本值要保留（P28）。
+                // 只把「已知标志」当标志；`--待办` 这类文本值要保留。
                 let value = args.get(5).map(|s| s.as_str()).filter(|v| !is_known_flag(v));
-                cmd_new(file, &args[3], &args[4], value, nh, yes)
+                cmd_new(file, &args[3], &args[4], value, has_flag(&args, "--no-history"), yes)
             }
         }
         "set" => {
@@ -2473,7 +2222,7 @@ fn main() {
                 usage();
                 2
             } else {
-                cmd_set(file, &args[3], &args[4], has_flag(&args, "--no-history"), has_flag(&args, "--yes"))
+                cmd_set(file, &args[3], &args[4], has_flag(&args, "--no-history"), yes)
             }
         }
         "rename" => {
@@ -2481,7 +2230,7 @@ fn main() {
                 usage();
                 2
             } else {
-                cmd_rename(file, &args[3], &args[4], has_flag(&args, "--no-history"), has_flag(&args, "--yes"))
+                cmd_rename(file, &args[3], &args[4], has_flag(&args, "--no-history"), yes)
             }
         }
         "rm" => {
@@ -2489,7 +2238,7 @@ fn main() {
                 usage();
                 2
             } else {
-                cmd_rm(file, &args[3], has_flag(&args, "--yes"))
+                cmd_rm(file, &args[3], yes)
             }
         }
         "link" => {
@@ -2497,7 +2246,7 @@ fn main() {
                 usage();
                 2
             } else {
-                cmd_link(file, &args[3], &args[4], has_flag(&args, "--no-history"), has_flag(&args, "--yes"))
+                cmd_link(file, &args[3], &args[4], has_flag(&args, "--no-history"), yes)
             }
         }
         "copy" => {
@@ -2507,11 +2256,13 @@ fn main() {
             } else {
                 let mut blank = false;
                 let mut history = true;
-                let yes = has_flag(&args, "--yes");
                 let mut it = args[5..].iter();
                 while let Some(a) = it.next() {
-                    if a == "--blank" { blank = true; }
-                    else if a == "--no-history" { history = false; }
+                    if a == "--blank" {
+                        blank = true;
+                    } else if a == "--no-history" {
+                        history = false;
+                    }
                 }
                 cmd_copy(file, &args[3], &args[4], blank, history, yes)
             }
@@ -2521,12 +2272,9 @@ fn main() {
                 usage();
                 2
             } else {
-                let assigns: Vec<&str> = args[4..]
-                    .iter()
-                    .map(|s| s.as_str())
-                    .filter(|a| !is_known_flag(a))
-                    .collect();
-                cmd_fill(file, &args[3], &assigns, has_flag(&args, "--no-history"), has_flag(&args, "--yes"))
+                let assigns: Vec<String> =
+                    args[4..].iter().filter(|a| !is_known_flag(a)).cloned().collect();
+                cmd_fill(file, &args[3], &assigns, has_flag(&args, "--no-history"), yes)
             }
         }
         "match" => {
@@ -2537,9 +2285,9 @@ fn main() {
                 let mut root: Option<&str> = None;
                 let mut shape_of: Option<&str> = None;
                 let mut template: Option<&str> = None;
-                let mut json = false;
-                let mut tree = false;
-                let mut wheres: Vec<(&str, &str)> = Vec::new();
+                let mut json_out = false;
+                let mut tree_out = false;
+                let mut wheres: Vec<(String, String)> = Vec::new();
                 let mut i = 3;
                 while i < args.len() {
                     match args[i].as_str() {
@@ -2549,17 +2297,17 @@ fn main() {
                         "--where" => {
                             if let Some(w) = args.get(i + 1) {
                                 if let Some((p, v)) = w.split_once('=') {
-                                    wheres.push((p, v));
+                                    wheres.push((p.to_string(), v.to_string()));
                                 }
                             }
                         }
-                        "--json" => json = true,
-                        "--tree" => tree = true,
+                        "--json" => json_out = true,
+                        "--tree" => tree_out = true,
                         _ => {}
                     }
                     i += 1;
                 }
-                cmd_match(file, root, shape_of, template, &wheres, json, tree)
+                cmd_match(file, root, shape_of, template, &wheres, json_out, tree_out)
             }
         }
         "tmpl" => {
@@ -2586,7 +2334,7 @@ fn main() {
                         usage();
                         2
                     } else {
-                        cmd_tmpl_rm(&args[3], &args[4], has_flag(&args, "--yes"))
+                        cmd_tmpl_rm(&args[3], &args[4], yes)
                     }
                 }
                 "list" => {
@@ -2616,7 +2364,7 @@ fn main() {
                 usage();
                 2
             } else {
-                cmd_instances(file, &args[3])
+                cmd_instances(file, &args[3], no_pager)
             }
         }
         "export" => {
@@ -2624,7 +2372,6 @@ fn main() {
                 usage();
                 2
             } else {
-                // 支持 --subtree <id>
                 let mut subtree = None;
                 let mut it = args[4..].iter();
                 while let Some(a) = it.next() {
@@ -2658,7 +2405,7 @@ fn main() {
                 }
                 cmd_import_template(file, name, data, under)
             } else {
-                cmd_import(file, &args[3], &args[4])
+                cmd_import(file, &args[3], &args[4], yes)
             }
         }
         "find" => {
@@ -2701,12 +2448,37 @@ fn main() {
             }
         }
         "index" => {
-            if args.len() < 3 {
-                usage();
-                2
+            const SUBS: [&str; 11] = [
+                "status", "files", "update", "rebuild", "compact", "check", "gc", "drop",
+                "forget", "unlock", "path",
+            ];
+            let maybe_sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            let (sub, paths) = if SUBS.contains(&maybe_sub) {
+                (maybe_sub, args[3..].to_vec())
             } else {
-                cmd_index(&args[2..])
+                // 兼容老写法 `xr index <file>`：默认看状态（路径与标志都从这里继续解析）
+                ("status", args[2..].to_vec())
+            };
+            // 标志与路径分开：`--sample N` 的值也算标志的一部分
+            let mut paths_only: Vec<String> = Vec::new();
+            let mut flags: Vec<String> = Vec::new();
+            let mut i = 0;
+            while i < paths.len() {
+                let a = &paths[i];
+                if a.starts_with("--") {
+                    flags.push(a.clone());
+                    if a == "--sample" {
+                        if let Some(v) = paths.get(i + 1) {
+                            flags.push(v.clone());
+                            i += 1;
+                        }
+                    }
+                } else {
+                    paths_only.push(a.clone());
+                }
+                i += 1;
             }
+            cmd_index(sub, &paths_only, &flags)
         }
         "collection" => {
             let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
@@ -2787,7 +2559,7 @@ fn main() {
                     match (sync, base) {
                         (Some(u), Some(b)) => cmd_catalog_check_sync(u, b),
                         (Some(_), None) => {
-                            eprintln!("--sync 需要一并给出 --base <文件>");
+                            eprintln!("错误：--sync 需要一并给出 --base <文件>");
                             2
                         }
                         (None, _) => cmd_catalog_check(),
@@ -2796,14 +2568,14 @@ fn main() {
                 "forget" => match args.get(3) {
                     Some(p) => cmd_catalog_forget(p),
                     None => {
-                        eprintln!("需要 <路径>");
+                        eprintln!("错误：需要 <路径>");
                         2
                     }
                 },
                 "trash" => match args.get(3) {
                     Some(p) => cmd_catalog_trash(p),
                     None => {
-                        eprintln!("需要 <路径>");
+                        eprintln!("错误：需要 <路径>");
                         2
                     }
                 },
@@ -2817,6 +2589,34 @@ fn main() {
             if args.len() < 4 {
                 usage();
                 2
+            } else if args[2] == "prune" {
+                // xr history prune <file> <node-id> [--keep N] [--before T] [--dry-run] [--yes]
+                if args.len() < 5 {
+                    eprintln!("错误：用法 xr history prune <file> <node-id> [--keep N] [--before <ISO前缀>] [--dry-run] [--yes]");
+                    2
+                } else {
+                    let keep = args
+                        .iter()
+                        .position(|a| a == "--keep")
+                        .and_then(|i| args.get(i + 1))
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(20);
+                    let before = args
+                        .iter()
+                        .position(|a| a == "--before")
+                        .and_then(|i| args.get(i + 1))
+                        .map(|s| s.as_str());
+                    cmd_history_prune(
+                        // 注意：这里的 `file`（args[2]）是子命令 "prune"，
+                        // 真正的文件名在 args[3]、节点在 args[4]
+                        &args[3],
+                        &args[4],
+                        keep,
+                        before,
+                        has_flag(&args, "--dry-run"),
+                        yes,
+                    )
+                }
             } else {
                 cmd_history(file, &args[3])
             }
@@ -2834,7 +2634,7 @@ fn main() {
                 usage();
                 2
             } else {
-                cmd_blob_export(file, &args[3], &args[4])
+                cmd_blob_export(file, &args[3], &args[4], yes)
             }
         }
         "blob-info" => {
@@ -2854,10 +2654,12 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("未知命令：{cmd}");
+            eprintln!("错误：未知命令：{cmd}");
             usage();
             2
         }
     };
+    // 先给结果（此时 stdout 已经写完），再在后台把索引整理掉
+    maybe_spawn_maintenance();
     std::process::exit(code);
 }

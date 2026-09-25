@@ -1,12 +1,13 @@
 [package]
 name = "xirang-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "息壤（XiRang）核心库：节点编解码 / 校验 / 树处理 / 格式转换"
 
 [dependencies]
 base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["clock"] }
+libc = "0.2.189"
 quick-xml = "0.42.0"
 serde_json = "1.0.151"
 serde_yaml = "0.9.34"

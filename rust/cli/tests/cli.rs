@@ -238,21 +238,50 @@ fn ws_and_index_lazy_cross_file() {
     sa.create(Some(a_root.id), "指向", Value::Reference(child.id), false);
     sa.save(&a).unwrap();
 
-    let out = xr().args(["index", a.to_str().unwrap(), b.to_str().unwrap()]).output().unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains("根:"), "index 输出：{stdout}");
+    // 两种索引模式都要能跨文件解析（默认工作区台账 / XIRANG_INDEX_MODE=sidecar）
+    for mode in ["workspace", "sidecar"] {
+        let mut c = xr();
+        c.env("XIRANG_INDEX_MODE", mode);
+        // 工作区台账模式需要先建索引；侧车模式按需自建
+        if mode == "workspace" {
+            let out = c
+                .args(["index", "rebuild", a.to_str().unwrap(), b.to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rebuild 输出：{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let mut c = xr();
+        c.env("XIRANG_INDEX_MODE", mode);
+        let out = c
+            .args(["ws", &child.id.to_string(), a.to_str().unwrap(), b.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(stdout.contains("词义") && stdout.contains("指向"), "{mode} 模式 ws 输出：{stdout}");
+    }
 
-    let out = xr().args(["ws", &child.id.to_string(), a.to_str().unwrap(), b.to_str().unwrap()]).output().unwrap();
+    // 工作区台账模式的索引命令
+    let out = xr().args(["index", "status", a.to_str().unwrap()]).output().unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains("词义") && stdout.contains("指向"), "ws 输出：{stdout}");
+    assert!(stdout.contains("索引模式: workspace"), "status 输出：{stdout}");
+    let out = xr().args(["index", "compact", a.to_str().unwrap()]).output().unwrap();
+    assert!(out.status.success());
+    let out = xr().args(["index", "check", a.to_str().unwrap()]).output().unwrap();
+    assert!(out.status.success());
+    let out = xr().args(["index", "gc", a.to_str().unwrap()]).output().unwrap();
+    assert!(out.status.success());
 
     for p in [&a, &b] {
         std::fs::remove_file(p).ok();
         let mut sp = p.as_os_str().to_os_string();
         sp.push(".idx");
         std::fs::remove_file(std::path::PathBuf::from(sp)).ok();
+    }
+    // 清掉工作区索引目录
+    if let Some(dir) = a.parent() {
+        std::fs::remove_dir_all(dir.join(".xirang-index")).ok();
     }
 }
 

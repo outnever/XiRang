@@ -34,3 +34,4 @@ jobs:
 
       - name: 桌面端逻辑测试（懒加载 / 摊平 / 追加编辑）
         run: cargo test --manifest-path app/Cargo.toml
+

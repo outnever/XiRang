@@ -241,11 +241,28 @@ fn save(
     if in_collection {
         let before = before.ok_or_else(|| OpError::internal("词库写入缺少改动前快照"))?;
         shard::append_changes(path, before, store).map_err(OpError::internal)?;
-        return Ok(());
+    } else {
+        store.save(path).map_err(|e| OpError::internal(e.to_string()))?;
     }
-    store.save(path).map_err(|e| OpError::internal(e.to_string()))?;
     hooks.on_save(path, store);
+    update_index(path);
     Ok(())
+}
+
+/// 数据落盘后的索引维护：台账模式追加日志（侧车模式由 `Store::save` 自己写侧车）。
+/// 尽力而为——索引只是缓存，失败不影响数据写入，可由 `xr index rebuild` 重建。
+/// 两个 bin 共用一个入口；「碰过哪个工作区」由调用方通过 [`ON_INDEX_TOUCH`] 挂钩接收。
+pub static ON_INDEX_TOUCH: std::sync::OnceLock<fn(std::path::PathBuf)> = std::sync::OnceLock::new();
+
+pub fn update_index(path: &Path) {
+    if xirang_core::index::sidecar_enabled() {
+        return;
+    }
+    let ws_root = xirang_core::wsidx::workspace_root(path);
+    let _ = xirang_core::wsidx::append_file(&ws_root, path);
+    if let Some(f) = ON_INDEX_TOUCH.get() {
+        f(ws_root);
+    }
 }
 
 /// 在词库目录里按 UUID 定位分片，读出折叠后的可编辑 Store + 该分片文件路径。
@@ -1077,6 +1094,7 @@ pub fn create_node(
                 let filename = format!("{}.xirang", n.id);
                 let shard_path = path.join(&filename);
                 store.save(&shard_path).map_err(|e| OpError::internal(e.to_string()))?;
+                update_index(&shard_path);
                 let entry = shard::ShardEntry { name: name.to_string(), filename };
                 if let Err(e) = shard::add_shard_entry(&path, entry) {
                     // 清单更新失败 → 回滚刚写的分片，别留半成品
@@ -1139,6 +1157,7 @@ pub fn create_node(
     let n = store.create(p, name, value, !no_history);
     store.save(&path).map_err(|e| OpError::internal(e.to_string()))?;
     hooks.on_save(&path, &store);
+    update_index(&path);
     Ok(CreateOutcome { id: n.id, name: name.to_string(), new_shard: false, warnings })
 }
 
@@ -1391,6 +1410,63 @@ pub fn fill_values(
     }
     save(hooks, &store, &path, in_collection, Some(&before))?;
     Ok(FillOutcome { count: assigns.len() })
+}
+
+pub struct PruneHistoryOutcome {
+    pub removed: usize,
+    pub kept: usize,
+    pub nodes_before: usize,
+    pub nodes_after: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// 预演：只算不落盘
+    pub dry_run: bool,
+}
+
+/// 裁剪某节点的 `@history` 留痕：保留最近 `keep` 条，可选只裁早于 `before` 的。
+/// 破坏性（丢掉回滚能力）→ 没有 `force` 时若确实有东西可裁，返回 `guarded` 让调用方决定。
+pub fn prune_history(
+    pol: &Policy,
+    hooks: &dyn Hooks,
+    file: &str,
+    node: &str,
+    keep: usize,
+    before: Option<&str>,
+    dry_run: bool,
+) -> OpResult<PruneHistoryOutcome> {
+    let id = parse_uuid("节点 ID", node)?;
+    let (mut store, path, in_collection) = load_target(pol, hooks, file, Some(id))?;
+    if store.get(id).is_none() {
+        return Err(OpError::not_found(format!("节点不存在：{node}")));
+    }
+    guard_editable(pol, &store, id)?;
+    let bytes_before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let nodes_before = store.len();
+    let report = store.prune_history(id, keep, before).map_err(OpError::internal)?;
+    if report.removed > 0 && !pol.force {
+        return Err(OpError::guarded(
+            format!(
+                "裁剪留痕会丢掉这 {} 条快照的回滚能力（保留 {} 条）",
+                report.removed, report.kept
+            ),
+            "确认要裁就带 force（CLI：--yes）",
+        ));
+    }
+    let bytes_after = if dry_run || report.removed == 0 {
+        bytes_before
+    } else {
+        save(hooks, &store, &path, in_collection, None)?;
+        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+    };
+    Ok(PruneHistoryOutcome {
+        removed: report.removed,
+        kept: report.kept,
+        nodes_before,
+        nodes_after: report.after_nodes,
+        bytes_before,
+        bytes_after,
+        dry_run,
+    })
 }
 
 pub struct RevertOutcome {
@@ -1690,6 +1766,7 @@ pub fn template_define(
     let id = build_template(&mut store, None, name, sample).map_err(OpError::invalid)?;
     store.save(&path).map_err(|e| OpError::internal(e.to_string()))?;
     hooks.on_save(&path, &store);
+    update_index(&path);
     Ok(TemplateDefineOutcome { id, name: name.to_string() })
 }
 
@@ -1874,6 +1951,7 @@ pub fn import_data(
     let nodes = store.len();
     store.save(&path).map_err(|e| OpError::internal(e.to_string()))?;
     hooks.on_save(&path, &store);
+    update_index(&path);
     Ok(ImportOutcome { nodes, previous_nodes: before })
 }
 
@@ -1897,7 +1975,7 @@ pub const MCP_TOOLS: &[&str] = &[
 
 pub const QUERY_ACTIONS: &[&str] = &["find", "match", "instances", "refs", "history"];
 pub const NODE_ACTIONS: &[&str] =
-    &["create", "set", "rename", "remove", "link", "copy", "fill", "revert"];
+    &["create", "set", "rename", "remove", "link", "copy", "fill", "revert", "prune_history"];
 pub const TEMPLATE_ACTIONS: &[&str] = &["define", "list", "instantiate", "remove"];
 pub const CONVERT_ACTIONS: &[&str] = &["export", "import", "append"];
 pub const BLOB_ACTIONS: &[&str] = &["import", "export", "info"];

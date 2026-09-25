@@ -86,7 +86,12 @@ fn prune_keeps_the_newest_and_shrinks_the_file() {
     let (code, out, _) = run(&root, &["revert", &file, &id]);
     assert_eq!(code, 0, "{out}");
     let (_, out, _) = run(&root, &["cat", &file]);
-    assert!(out.contains("根 = 值19"), "应回滚到最近一条快照：{out}");
+    // 快照存的是「改之前的值」：20 次修改留下 [空, 值0 … 值18]，
+    // 裁到最近 5 条后回滚应落到 值18（cat 的第一行就是节点本身）
+    assert!(
+        out.lines().next().unwrap_or("").contains("根 = 值18"),
+        "应回滚到最近一条保留下来的快照：{out}"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

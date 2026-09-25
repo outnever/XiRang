@@ -21,6 +21,49 @@ use ops::{ErrKind, Layout, MatchQuery, OpError, Policy, ViewOpts};
 /// 读/写命令是否顺带维护本机目录（默认开，可用 `--no-index` 或 `XIRANG_INDEX=off` 关闭）。
 static INDEX_ENABLED: AtomicBool = AtomicBool::new(true);
 
+/// 本次命令碰过的索引工作区根：退出前据此决定要不要在后台整理。
+static INDEX_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// 记下「这次命令用过哪个工作区的索引」（读命令与写命令都调）。
+pub(crate) fn index_touch(root: PathBuf) {
+    if let Ok(mut g) = INDEX_ROOT.lock() {
+        *g = Some(root);
+    }
+}
+
+/// 先给结果、再整理：需要时分离一个后台进程去压实，本进程立刻退出。
+fn maybe_spawn_maintenance() {
+    if !xirang_core::wsidx::maintenance_enabled() {
+        return;
+    }
+    let root = match INDEX_ROOT.lock() {
+        Ok(g) => match g.clone() {
+            Some(r) => r,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    if xirang_core::wsidx::maintenance_needed(&root).is_none() {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let spawned = std::process::Command::new(exe)
+        .arg("index")
+        .arg("compact")
+        .arg(&root)
+        .env("XIRANG_INDEX_MAINTENANCE", "off") // 防递归
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if spawned.is_ok() {
+        eprintln!("（索引日志偏大，已在后台开始整理；可用 XIRANG_INDEX_MAINTENANCE=off 关闭）");
+    }
+}
+
 fn index_enabled() -> bool {
     INDEX_ENABLED.load(Ordering::Relaxed)
 }
@@ -51,7 +94,6 @@ fn index_store(file: &str, store: &tree::Store) {
     cat.upsert(&abs, fp, &catalog::Catalog::store_uuids(store));
     let _ = cat.save(&cpath);
 }
-
 /// 没有现成 Store 时，读文件后登记（用于 `ws` 等）。
 fn index_file(file: &str) {
     if !index_enabled() {
@@ -852,9 +894,10 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
         Some(o) => vec![o.to_string()],
         None => files.to_vec(),
     };
-    for f in all.clone() {
-        index_file(&f);
-    }
+    // 注意：这里**不**把这批文件登记进本机目录。
+    // 它们是用户明确给的，`ws` 本来就知道该看哪里；登记要把每个文件整份读一遍
+    // （445 个文件≈450 ms），而目录的用途恰恰是「找到你没点名的文件」。
+    // 需要登记时用 `xr catalog scan` / 让其它命令自然登记。
     if only.is_none() && index_enabled() {
         if let Ok(mut r) = catalog::CatalogReader::open(&catalog::default_path()) {
             if let Ok(paths) = r.lookup_all(id) {
@@ -876,6 +919,8 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
             eprintln!("（跳过：{p} 已不存在）");
             continue;
         }
+        // 去重必须按真实路径（macOS 上 /var 是 /private/var 的符号链接，
+        // 词法归一会把同一份文件当成两份）；这里每文件一次 canonicalize 是可接受的代价。
         let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if seen.insert(key) {
             usable.push(p.clone());
@@ -892,6 +937,11 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
             return 2;
         }
     };
+    // 索引不可用时说清楚为什么（绝不静默换成另一条路）
+    if let Some(why) = ws.fallback_reason() {
+        eprintln!("（提示：本次未走索引，改用整份载入——{why}；可跑 xr index rebuild）");
+    }
+    index_touch(xirang_core::wsidx::workspace_root(Path::new(&usable[0])));
 
     let views = ws.node_views(id);
     if views.is_empty() {
@@ -1646,6 +1696,8 @@ fn usage() {
 fn main() {
     // 管道关闭（如 | head）时静默退出，不 panic（标准 Unix 工具行为）
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+    // 写命令也会让 ops 记下工作区，退出前统一决定要不要后台压实
+    ops::ON_INDEX_TOUCH.set(index_touch).ok();
 
     let args: Vec<String> = std::env::args().collect();
     // --help / --version：不要求 3 个参数，退出码 0（SKILL.md 里承诺了 `xr --help`）。
@@ -2117,5 +2169,7 @@ fn main() {
             2
         }
     };
+    // 先给结果（此时 stdout 已经写完），再在后台把索引整理掉
+    maybe_spawn_maintenance();
     std::process::exit(code);
 }

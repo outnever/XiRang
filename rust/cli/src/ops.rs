@@ -251,12 +251,18 @@ fn save(
 
 /// 数据落盘后的索引维护：台账模式追加日志（侧车模式由 `Store::save` 自己写侧车）。
 /// 尽力而为——索引只是缓存，失败不影响数据写入，可由 `xr index rebuild` 重建。
+/// 两个 bin 共用一个入口；「碰过哪个工作区」由调用方通过 [`ON_INDEX_TOUCH`] 挂钩接收。
+pub static ON_INDEX_TOUCH: std::sync::OnceLock<fn(std::path::PathBuf)> = std::sync::OnceLock::new();
+
 pub fn update_index(path: &Path) {
     if xirang_core::index::sidecar_enabled() {
         return;
     }
     let ws_root = xirang_core::wsidx::workspace_root(path);
     let _ = xirang_core::wsidx::append_file(&ws_root, path);
+    if let Some(f) = ON_INDEX_TOUCH.get() {
+        f(ws_root);
+    }
 }
 
 /// 在词库目录里按 UUID 定位分片，读出折叠后的可编辑 Store + 该分片文件路径。

@@ -638,6 +638,18 @@ fn main() {
         }
     };
 
+    // 常驻进程的空闲时间：后台线程按需压实（不阻塞主循环，也不占工具面）
+    if xirang_core::wsidx::maintenance_enabled() {
+        let roots = cfg.roots.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let Some(root) = roots.first() else { continue };
+            if xirang_core::wsidx::maintenance_needed(root).is_some() {
+                let _ = xirang_core::wsidx::compact(root);
+            }
+        });
+    }
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for line in stdin.lock().lines() {

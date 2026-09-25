@@ -292,6 +292,7 @@ fn bench_entrypoints(
             let mut c = Command::new(&xr);
             c.current_dir(root)
                 .env("XIRANG_INDEX_MODE", index_mode)
+                .env("XIRANG_INDEX_MAINTENANCE", "off") // 基准里不让后台压实干扰
                 .env("XIRANG_CATALOG", root.join("bench-catalog.idx"))
                 .arg("ws")
                 .arg(&target);
@@ -323,6 +324,7 @@ fn bench_entrypoints(
             let mut c = Command::new(&xr);
             c.current_dir(root)
                 .env("XIRANG_INDEX_MODE", index_mode)
+                .env("XIRANG_INDEX_MAINTENANCE", "off")
                 .env("XIRANG_CATALOG", root.join("bench-catalog.idx"))
                 .arg("refs")
                 .arg(files.first().cloned().unwrap_or_default())
@@ -404,7 +406,15 @@ struct ScaleResult {
     entries: Vec<EntryResult>,
 }
 
-fn run_scale(out_dir: &Path, target: usize, kind: fixture::FixtureKind, bin_dir: &Path, reps: usize) -> ScaleResult {
+fn run_scale(
+    out_dir: &Path,
+    target: usize,
+    kind: fixture::FixtureKind,
+    bin_dir: &Path,
+    reps: usize,
+    clean: bool,
+    keep: bool,
+) -> ScaleResult {
     let kind_name = match kind {
         fixture::FixtureKind::Multi => "multi",
         fixture::FixtureKind::Single => "single",
@@ -433,7 +443,7 @@ fn run_scale(out_dir: &Path, target: usize, kind: fixture::FixtureKind, bin_dir:
         entries.extend(bench_entrypoints(&root, &info, bin_dir, m, reps.max(3)));
     }
 
-    ScaleResult {
+    let result = ScaleResult {
         target_nodes: target,
         nodes: info.nodes,
         files: info.files.len(),
@@ -441,7 +451,11 @@ fn run_scale(out_dir: &Path, target: usize, kind: fixture::FixtureKind, bin_dir:
         data_bytes,
         modes,
         entries,
+    };
+    if clean && !keep {
+        let _ = std::fs::remove_dir_all(&root);
     }
+    result
 }
 
 fn print_scale(s: &ScaleResult) {
@@ -534,6 +548,8 @@ fn chrono_stamp() -> String {
 }
 
 fn main() {
+    // 基准自身不触发后台整理（避免测量被干扰）
+    std::env::set_var("XIRANG_INDEX_MAINTENANCE", "off");
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("run");
     let mut opts: BTreeMap<String, String> = BTreeMap::new();
@@ -598,8 +614,10 @@ fn main() {
                 _ => fixture::FixtureKind::Multi,
             };
             let mut scales = Vec::new();
+            let clean = opts.contains_key("clean");
+            let keep = opts.contains_key("keep");
             for t in targets {
-                let s = run_scale(&out_dir, t, kind, &bin_dir, reps);
+                let s = run_scale(&out_dir, t, kind, &bin_dir, reps, clean, keep);
                 print_scale(&s);
                 std::fs::write(out_dir.join("raw").join(format!("{t}.json")), to_json(&s)).unwrap();
                 scales.push(s);

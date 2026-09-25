@@ -635,6 +635,10 @@ pub trait Backend {
     }
     /// 后端名字：workspace / sidecar / memory。
     fn kind(&self) -> &'static str;
+    /// 上一次查询是否因索引本身损坏而失败（正常工作返回 None）。
+    fn last_error(&self) -> Option<String> {
+        None
+    }
 }
 
 /// 侧车后端：每文件一份 XRIDX，逐个文件查（旧行为）。
@@ -716,37 +720,49 @@ impl Backend for SidecarBackend {
 /// 工作区台账后端：三本 wsidx 台账，一次二分命中，不逐个文件扫。
 pub struct WorkspaceBackend {
     reader: crate::wsidx::Reader,
+    last_error: Option<String>,
 }
 
 impl WorkspaceBackend {
     pub fn open(ws_root: &Path) -> Result<Self, String> {
-        Ok(Self { reader: crate::wsidx::Reader::open(ws_root)? })
+        Ok(Self { reader: crate::wsidx::Reader::open(ws_root)?, last_error: None })
+    }
+
+    /// 出错时记下来（供调用方提示），同时返回空结果避免整体失败
+    fn note<T>(&mut self, r: Result<T, String>) -> T
+    where
+        T: Default,
+    {
+        match r {
+            Ok(v) => v,
+            Err(e) => {
+                self.last_error = Some(e);
+                T::default()
+            }
+        }
     }
 }
 
 impl Backend for WorkspaceBackend {
     fn locate(&mut self, id: Uuid) -> Vec<FileNode> {
-        let hits = match self.reader.locate(id) {
-            Ok(h) => h,
-            Err(_) => return Vec::new(),
-        };
+        let located = self.reader.locate(id);
+        let hits = self.note(located);
         hits.into_iter()
             .filter_map(|h| crate::wsidx::read_node_at_hit(&h).ok().map(|n| (h.file, n)))
             .collect()
     }
 
     fn children(&mut self, parent: Uuid) -> Vec<FileNode> {
-        let hits = match self.reader.children_of(parent) {
-            Ok(h) => h,
-            Err(_) => return Vec::new(),
-        };
+        let kids = self.reader.children_of(parent);
+        let hits = self.note(kids);
         hits.into_iter()
             .filter_map(|h| crate::wsidx::read_node_at_hit(&h).ok().map(|n| (h.file, n)))
             .collect()
     }
 
     fn references(&mut self, target: Uuid) -> Vec<(String, Uuid)> {
-        self.reader.references(target).unwrap_or_default()
+        let refs = self.reader.references(target);
+        self.note(refs)
     }
 
     fn subtree(&mut self, root: Uuid) -> Vec<FileNode> {
@@ -767,6 +783,10 @@ impl Backend for WorkspaceBackend {
 
     fn kind(&self) -> &'static str {
         "workspace"
+    }
+
+    fn last_error(&self) -> Option<String> {
+        self.last_error.clone()
     }
 }
 
@@ -841,29 +861,62 @@ impl Backend for MemoryBackend {
 /// 跨文件工作区：只索引 + 按偏移读，节点数据不常驻；支持「同编号多文件」取并集。
 pub struct LazyWorkspace {
     backend: Box<dyn Backend>,
+    /// 索引不可用而回退到「整份载入」时的原因（正常走索引时为 None）。
+    fallback: Option<String>,
+    /// 本次查询里索引读失败的原因（块缺失等）。
+    index_error: Option<String>,
 }
 
 impl LazyWorkspace {
     /// 按当前索引模式打开。工作区模式下若索引缺失或不覆盖给定文件，回退到整份载入。
     pub fn from_paths(paths: &[String]) -> Result<Self, String> {
+        let mut fallback = None;
         let backend: Box<dyn Backend> = match index_mode() {
             IndexMode::Sidecar => Box::new(SidecarBackend::open(paths)?),
             IndexMode::Workspace => {
                 let ws_root = crate::wsidx::workspace_root(Path::new(&paths[0]));
                 let dir = crate::wsidx::index_dir(&ws_root);
                 let mut covered = dir.exists();
+                let mut why = String::new();
                 if covered {
-                    let r = crate::wsidx::Reader::open(&ws_root)?;
-                    covered = paths.iter().all(|p| r.covers(p));
+                    match crate::wsidx::Reader::open(&ws_root) {
+                        Ok(r) => {
+                            covered = paths.iter().all(|p| r.covers(p));
+                            if !covered {
+                                why = "索引未覆盖这些文件".into();
+                            }
+                        }
+                        Err(e) => {
+                            covered = false;
+                            why = e;
+                        }
+                    }
+                } else {
+                    why = "工作区还没有索引".into();
                 }
                 if covered {
                     Box::new(WorkspaceBackend::open(&ws_root)?)
                 } else {
+                    fallback = Some(why);
                     Box::new(MemoryBackend::load(paths)?)
                 }
             }
         };
-        Ok(Self { backend })
+        Ok(Self { backend, fallback, index_error: None })
+    }
+
+    /// 索引不可用、本次改用「整份载入」时的原因。
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.fallback.as_deref()
+    }
+
+    /// 查询过程中索引报错的原因（下一次调用会刷新）。
+    pub fn index_error(&mut self) -> Option<String> {
+        let e = self.backend.last_error();
+        if e.is_some() {
+            self.index_error = e.clone();
+        }
+        e
     }
 
     /// 当前后端名字：workspace / sidecar / memory（回退时是 memory）。

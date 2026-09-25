@@ -31,6 +31,9 @@ cargo build --manifest-path rust/Cargo.toml -p xirang-cli
 - `--yes`：确认执行被护栏拦下的操作（改模板定义、`tmpl rm`、`import` 覆盖非空文件、`blob-export` 覆盖已有文件）。
 - **给 AI 代理用**：`xr-mcp` 把同一套操作暴露成结构化工具（能力与护栏完全一致，另外限定在允许目录内），见 [MCP](MCP.md)。
 - `XIRANG_INDEX_MODE`：`workspace`（默认，工作区统一索引）/ `sidecar`（旧的每文件侧车索引）。切换后需要重建对应索引。
+- `XIRANG_INDEX_MAINTENANCE`：默认 `auto`——命令跑完（结果已打印）后，若索引日志超过主干 30%，会**另起一个后台进程**去压实；设 `off` 关闭。
+- `XIRANG_INDEX_COMPACT_RATIO` / `XIRANG_INDEX_COMPACT_MIN_BYTES`：压实的触发比例与最小主干体积（默认 0.30 / 1000000），供调参与测试。
+- `xr ws` **不会**把命令行里点名的文件登记进本机目录（登记要把每个文件整份读一遍）；需要登记用 `xr catalog scan`。
 - `--yes`：跳过保护性确认。
 - `--no-index`：读命令默认会把读到的文件登记进**本机目录**（见「本机目录」节），此标志单次关闭；也可用环境变量 `XIRANG_INDEX=off` 全局关闭。
 - 路径寻址：`名/子名/孙名`（`/` 分隔），相对某子树根。

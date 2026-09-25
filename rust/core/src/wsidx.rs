@@ -178,6 +178,8 @@ pub struct BlockInfo {
 pub struct LedgerInfo {
     pub blocks: Vec<BlockInfo>,
     pub log_bytes: u64,
+    /// 主干（所有块）的字节总量——`maintenance_needed` 用它做 O(1) 判断。
+    pub base_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -235,6 +237,35 @@ pub fn index_dir(ws_root: &Path) -> PathBuf {
     ws_root.join(INDEX_DIR)
 }
 
+/// 词法绝对路径：不做 canonicalize（那是几十微秒级的系统调用，几百个文件就吃掉几十毫秒），
+/// 只把相对路径接上当前目录、折叠 `.` 与 `..`。用于「命令行给的路径在不在台账里」的比对。
+pub fn lexical_abs(raw: &str) -> String {
+    use std::sync::OnceLock;
+    static CWD: OnceLock<PathBuf> = OnceLock::new();
+    let p = Path::new(raw);
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        CWD.get_or_init(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .join(p)
+    };
+    normalize(&joined).to_string_lossy().into_owned()
+}
+
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn ledger_name(kind: u8) -> &'static str {
     match kind {
         KIND_LOC => "loc",
@@ -251,8 +282,10 @@ fn log_path(dir: &Path, kind: u8) -> PathBuf {
     dir.join(format!("{}.log", ledger_name(kind)))
 }
 
-fn block_path(dir: &Path, kind: u8, index_v: u32) -> PathBuf {
-    dir.join(format!("{}-{index_v:04}.blk", ledger_name(kind)))
+/// 块文件名带「代数」前缀：压实写新代数的块，换完 manifest 才删旧代数。
+/// 这样中断在任何时刻都不会出现「manifest 指着一半新一半旧的块」。
+fn block_path(dir: &Path, kind: u8, generation: u64, index_v: u32) -> PathBuf {
+    dir.join(format!("{}-g{generation}-{index_v:04}.blk", ledger_name(kind)))
 }
 
 fn lock_path(dir: &Path) -> PathBuf {
@@ -386,6 +419,7 @@ fn enc_manifest(m: &Manifest) -> Vec<u8> {
             o.extend_from_slice(b.name.as_bytes());
         }
         o.extend_from_slice(&l.log_bytes.to_be_bytes());
+        o.extend_from_slice(&l.base_bytes.to_be_bytes());
     }
     o
 }
@@ -416,7 +450,8 @@ fn dec_manifest(b: &[u8]) -> Result<Manifest, String> {
             blocks.push(BlockInfo { index: index_v, first, last, count, name });
         }
         let log_bytes = rd_u64(b, &mut off)?;
-        *ledger_mut(&mut m, kind) = LedgerInfo { blocks, log_bytes };
+        let base_bytes = rd_u64(b, &mut off)?;
+        *ledger_mut(&mut m, kind) = LedgerInfo { blocks, log_bytes, base_bytes };
     }
     Ok(m)
 }
@@ -604,9 +639,15 @@ fn collect_inner(dir: &Path, out: &mut Vec<PathBuf>) {
 
 // ---------------------------------------------------------------- 写：块与日志
 
-fn write_blocks(dir: &Path, kind: u8, entries: &[Vec<u8>]) -> Result<LedgerInfo, String> {
-    // 旧块先留着；新块用同名覆盖（原子写），多出来的旧块由调用方清理
+fn write_blocks(
+    dir: &Path,
+    kind: u8,
+    generation: u64,
+    entries: &[Vec<u8>],
+) -> Result<LedgerInfo, String> {
+    // 新块写新名字（带代数），旧块由调用方在 manifest 切换后删除
     let mut blocks = Vec::new();
+    let mut base_bytes = 0u64;
     for (i, chunk) in entries.chunks(BLOCK_ENTRIES).enumerate() {
         let mut o = Vec::new();
         write_prefix(&mut o, kind, PART_BLOCK);
@@ -622,17 +663,19 @@ fn write_blocks(dir: &Path, kind: u8, entries: &[Vec<u8>]) -> Result<LedgerInfo,
         if let Some(e) = chunk.last() {
             last.copy_from_slice(&e[..32]);
         }
-        write_file_atomic(&block_path(dir, kind, i as u32), &o).map_err(|e| e.to_string())?;
+        let path = block_path(dir, kind, generation, i as u32);
+        write_file_atomic(&path, &o).map_err(|e| e.to_string())?;
+        base_bytes += o.len() as u64;
         blocks.push(BlockInfo {
             index: i as u32,
             first,
             last,
             count: chunk.len() as u64,
-            name: block_path(dir, kind, i as u32).file_name().unwrap().to_string_lossy().into_owned(),
+            name: path.file_name().unwrap().to_string_lossy().into_owned(),
         });
     }
     ensure_log(dir, kind)?;
-    Ok(LedgerInfo { blocks, log_bytes: 0 })
+    Ok(LedgerInfo { blocks, log_bytes: 0, base_bytes })
 }
 
 fn ensure_log(dir: &Path, kind: u8) -> Result<(), String> {
@@ -655,17 +698,16 @@ fn append_rec(f: &mut File, kind: u8, payload: &[u8]) -> std::io::Result<u64> {
     Ok(o.len() as u64)
 }
 
-fn remove_stale_blocks(dir: &Path, kind: u8, keep: usize) {
+/// 删掉某一本里「不属于当前 manifest」的块（换完 manifest 之后调用）。
+fn remove_other_blocks(dir: &Path, kind: u8, keep: &LedgerInfo) {
     let prefix = format!("{}-", ledger_name(kind));
+    let keep_names: HashSet<&str> = keep.blocks.iter().map(|b| b.name.as_str()).collect();
     if let Ok(rd) = fs::read_dir(dir) {
-        let mut names: Vec<String> = rd
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(&prefix) && n.ends_with(".blk"))
-            .collect();
-        names.sort();
-        for n in names.into_iter().skip(keep) {
-            let _ = fs::remove_file(dir.join(n));
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with(&prefix) && n.ends_with(".blk") && !keep_names.contains(n.as_str()) {
+                let _ = fs::remove_file(e.path());
+            }
         }
     }
 }
@@ -683,7 +725,7 @@ pub struct Stats {
     pub log_bytes: u64,
 }
 
-/// 全量重建：扫描给定文件（缺省 = 工作区全部 `.xirang`），重写块与 manifest，清空日志。
+/// 全量重建：扫描给定文件（缺省 = 工作区全部 `.xirang`），重写块与 manifest。
 pub fn rebuild(ws_root: &Path, files: &[PathBuf]) -> Result<Stats, String> {
     let dir = index_dir(ws_root);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -700,25 +742,45 @@ pub fn rebuild(ws_root: &Path, files: &[PathBuf]) -> Result<Stats, String> {
     if targets.is_empty() && files.is_empty() {
         targets = collect_data_files(ws_root);
     }
-    build_ledgers(&dir, &targets, 1)
+    let generation = read_manifest(&dir).map(|m| m.generation + 1).unwrap_or(1);
+    let (prepared, changed) = build_ledgers(&dir, &targets, generation, true)?;
+    if !changed.is_empty() {
+        eprintln!("（提示：{} 个文件在重建期间被改动，它们的索引本次标记为待重建）", changed.len());
+    }
+    prepared.map(|(_, s)| s).ok_or_else(|| "重建未完成".to_string())
 }
 
 /// 无锁地重扫目标文件、重写三本块与 manifest（日志由调用方处理）。
-fn build_ledgers(dir: &Path, targets: &[PathBuf], generation: u64) -> Result<Stats, String> {
+///
+/// 返回 `(备好的 manifest + 统计, 扫描期间被改动的文件)`。指纹一律取「扫描前」的值，
+/// 所以即使扫描期间文件被改，读者的指纹校验也会把它判为过期 → 回退，不会读到错数据。
+/// `commit` = false 时只写出新块与 manifest 内容，不落地、不删旧块（交给压实决定）。
+fn build_ledgers(
+    dir: &Path,
+    targets: &[PathBuf],
+    generation: u64,
+    commit: bool,
+) -> Result<(Option<(Manifest, Stats)>, Vec<String>), String> {
     let mut m = Manifest { generation, next_file_id: 1, ..Default::default() };
     let mut loc: Vec<Vec<u8>> = Vec::new();
     let mut rel: Vec<Vec<u8>> = Vec::new();
     let mut rev: Vec<Vec<u8>> = Vec::new();
     let mut counts = (0u64, 0u64, 0u64);
+    let mut changed: Vec<String> = Vec::new();
     for p in targets {
         let abs = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        let (size, sec, nsec) = match fingerprint_of(&abs) {
+        // 指纹取扫描前的值：万一扫描期间被改，读者会因指纹不符而回退（安全）
+        let before = match fingerprint_of(&abs) {
             Some(f) => f,
             None => continue,
         };
         let id = m.next_file_id;
         m.next_file_id += 1;
         let e = scan_file(&abs, id)?;
+        if fingerprint_of(&abs) != Some(before) {
+            changed.push(abs.to_string_lossy().into_owned());
+        }
+        let (size, sec, nsec) = before;
         counts.0 += e.loc.len() as u64;
         counts.1 += e.rel.len() as u64;
         counts.2 += e.rev.len() as u64;
@@ -741,18 +803,21 @@ fn build_ledgers(dir: &Path, targets: &[PathBuf], generation: u64) -> Result<Sta
     rel.sort();
     rev.sort();
     let mut blocks = 0usize;
+    let mut infos: Vec<(u8, LedgerInfo)> = Vec::new();
     for (kind, es) in [(KIND_LOC, &loc), (KIND_REL, &rel), (KIND_REV, &rev)] {
-        let info = write_blocks(dir, kind, es)?;
+        let info = write_blocks(dir, kind, generation, es)?;
         blocks += info.blocks.len();
-        remove_stale_blocks(dir, kind, info.blocks.len());
+        infos.push((kind, info));
+    }
+    for (kind, info) in infos {
         let lp = log_path(dir, kind);
         let log_bytes = fs::metadata(&lp).map(|x| x.len()).unwrap_or(0);
         let l = ledger_mut(&mut m, kind);
         l.blocks = info.blocks;
+        l.base_bytes = info.base_bytes;
         l.log_bytes = log_bytes;
     }
-    write_file_atomic(&manifest_path(dir), &enc_manifest(&m)).map_err(|e| e.to_string())?;
-    Ok(Stats {
+    let stats = Stats {
         files: m.files.len(),
         loc: counts.0,
         rel: counts.1,
@@ -760,7 +825,28 @@ fn build_ledgers(dir: &Path, targets: &[PathBuf], generation: u64) -> Result<Sta
         blocks,
         bytes_written: 0,
         log_bytes: m.loc.log_bytes + m.rel.log_bytes + m.rev.log_bytes,
-    })
+    };
+    if commit {
+        commit_manifest(dir, &m)?;
+    }
+    Ok((Some((m, stats)), changed))
+}
+
+/// 落地 manifest 并清掉不属于它的旧块（调用方负责持锁）。
+fn commit_manifest(dir: &Path, m: &Manifest) -> Result<(), String> {
+    write_file_atomic(&manifest_path(dir), &enc_manifest(m)).map_err(|e| e.to_string())?;
+    for kind in [KIND_LOC, KIND_REL, KIND_REV] {
+        remove_other_blocks(dir, kind, ledger_ref(m, kind));
+    }
+    Ok(())
+}
+
+fn discard_blocks(dir: &Path, m: &Manifest) {
+    for kind in [KIND_LOC, KIND_REL, KIND_REV] {
+        for b in &ledger_ref(m, kind).blocks {
+            let _ = fs::remove_file(dir.join(&b.name));
+        }
+    }
 }
 
 /// 一个数据文件写完后调用：重扫该文件，追加「新一代」记录到三本日志。
@@ -847,10 +933,10 @@ fn append_file_locked(dir: &Path, data_path: &Path) -> Result<Stats, String> {
     })
 }
 
-/// 压实：按当前数据重扫、重写块与 manifest、清空日志。
+/// 压实：**扫描不持锁**（写者照常写），只在最后「换 manifest + 清日志」的瞬间持锁；
+/// 扫描期间若有文件被改动，本轮整体放弃、下次再来（绝不写出半新半旧的状态）。
 pub fn compact(ws_root: &Path) -> Result<Stats, String> {
     let dir = index_dir(ws_root);
-    let _guard = lock_writer(&dir)?;
     let m = read_manifest(&dir)?;
     let targets: Vec<PathBuf> = m
         .files
@@ -859,13 +945,73 @@ pub fn compact(ws_root: &Path) -> Result<Stats, String> {
         .filter(|p| p.exists())
         .collect();
     let generation = m.generation + 1;
-    // 先把日志清空，再重建块：即使中途崩了，也只是「块过期」而不丢数据
+    let (prepared, changed) = build_ledgers(&dir, &targets, generation, false)?;
+    let Some((mut prepared, stats)) = prepared else {
+        return Err(format!(
+            "本次跳过压实：{} 个文件在扫描期间被改动，稍后重试",
+            changed.len()
+        ));
+    };
+    if !changed.is_empty() {
+        discard_blocks(&dir, &prepared);
+        return Err(format!(
+            "本次跳过压实：{} 个文件在扫描期间被改动，稍后重试",
+            changed.len()
+        ));
+    }
+    // 拿锁这一段只有毫秒级：再核一次指纹，然后落 manifest、清日志
+    let _guard = lock_writer(&dir)?;
+    for f in &prepared.files {
+        if fingerprint_of(Path::new(&f.path))
+            != Some((f.size, f.mtime_sec, f.mtime_nsec))
+        {
+            discard_blocks(&dir, &prepared);
+            return Err("本次跳过压实：扫描结束后又有文件被改动，稍后重试".into());
+        }
+    }
     for kind in [KIND_LOC, KIND_REL, KIND_REV] {
         let mut o = Vec::new();
         write_prefix(&mut o, kind, PART_LOG);
+        ledger_mut(&mut prepared, kind).log_bytes = o.len() as u64;
         write_file_atomic(&log_path(&dir, kind), &o).map_err(|e| e.to_string())?;
     }
-    build_ledgers(&dir, &targets, generation)
+    commit_manifest(&dir, &prepared)?;
+    Ok(stats)
+}
+
+/// 自动整理开关（`XIRANG_INDEX_MAINTENANCE=off` 关闭，默认开）。
+pub fn maintenance_enabled() -> bool {
+    !matches!(
+        std::env::var("XIRANG_INDEX_MAINTENANCE").ok().as_deref(),
+        Some("off") | Some("0") | Some("false") | Some("no")
+    )
+}
+
+fn compact_ratio() -> f64 {
+    std::env::var("XIRANG_INDEX_COMPACT_RATIO")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(COMPACT_HINT_RATIO)
+}
+
+fn compact_min_bytes() -> u64 {
+    std::env::var("XIRANG_INDEX_COMPACT_MIN_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000_000)
+}
+
+/// O(1) 判断要不要整理：只读 manifest（每本台账的主干 / 日志字节数都在里面）。
+/// 返回需要整理时日志的字节数。
+pub fn maintenance_needed(ws_root: &Path) -> Option<u64> {
+    let m = read_manifest(&index_dir(ws_root)).ok()?;
+    let base = m.loc.base_bytes + m.rel.base_bytes + m.rev.base_bytes;
+    let log = m.loc.log_bytes + m.rel.log_bytes + m.rev.log_bytes;
+    if base >= compact_min_bytes() && (log as f64) > (base as f64) * compact_ratio() {
+        Some(log)
+    } else {
+        None
+    }
 }
 
 /// 清理工作区里已不存在的文件条目。
@@ -1019,6 +1165,14 @@ impl Reader {
     pub fn open(ws_root: &Path) -> Result<Reader, String> {
         let dir = index_dir(ws_root);
         let manifest = read_manifest(&dir)?;
+        // 打开时就核对块文件在不在：宁可大声报错，也不要静默返回「查不到」
+        for kind in [KIND_LOC, KIND_REL, KIND_REV] {
+            for b in &ledger_ref(&manifest, kind).blocks {
+                if !dir.join(&b.name).is_file() {
+                    return Err(format!("F012：索引块缺失（{}）", b.name));
+                }
+            }
+        }
         let path_ids = manifest.files.iter().map(|f| (f.path.clone(), f.id)).collect();
         let mut r = Reader {
             dir,
@@ -1158,12 +1312,16 @@ impl Reader {
 
     /// 台账是否覆盖这个文件且指纹一致（工作区模式用来判断能不能直接用索引）。
     pub fn covers(&self, path: &str) -> bool {
-        let abs = Path::new(path)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(path))
-            .to_string_lossy()
-            .into_owned();
-        match self.path_ids.get(&abs).and_then(|id| self.manifest.files.iter().find(|f| f.id == *id)) {
+        // 词法归一化（不 canonicalize）：几百个文件时这一句省掉几十毫秒
+        let abs = lexical_abs(path);
+        let id = self.path_ids.get(&abs).copied().or_else(|| {
+            // 只有词法路径没命中时才退回 canonicalize（例如路径里有符号链接）
+            Path::new(path)
+                .canonicalize()
+                .ok()
+                .and_then(|c| self.path_ids.get(&c.to_string_lossy().into_owned()).copied())
+        });
+        match id.and_then(|id| self.manifest.files.iter().find(|f| f.id == id)) {
             Some(f) => match fingerprint_of(Path::new(&f.path)) {
                 Some((s, sec, nsec)) => s == f.size && sec == f.mtime_sec && nsec == f.mtime_nsec,
                 None => false,

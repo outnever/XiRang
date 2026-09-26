@@ -10,6 +10,7 @@ pub mod codec;
 pub mod fixture;
 pub mod catalog;
 pub mod convert;
+pub mod edit;
 pub mod index;
 pub mod query;
 pub mod scan;

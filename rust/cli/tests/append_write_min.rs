@@ -101,6 +101,73 @@ fn set_appends_instead_of_rewriting() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// 「按编号直读」快路：台账可用时 `xr set` 不整份载入（`via_index = true`）；
+/// 台账不可用时退回整份载入（`via_index = false`），两条路写出来的结果一样。
+#[test]
+fn set_uses_the_direct_path_once_the_ledger_is_ready() {
+    std::env::remove_var("XIRANG_INDEX_MODE");
+    let root = tmp_root("direct");
+    let (code, out, err) = run(&root, &["new", "a.xirang", "nil", "根"]);
+    assert_eq!(code, 0, "{err}");
+    let id = out
+        .split('<')
+        .nth(1)
+        .and_then(|s| s.split('>').next())
+        .expect("取节点编号")
+        .to_string();
+
+    let path = root.join("a.xirang");
+    let f = path.display().to_string();
+    let pol = xirang_cli::ops::Policy::cli(false);
+    let idv = xirang_core::codec::Uuid::parse(&id).unwrap();
+
+    // 台账已经在（`xr new` 写完就建了）→ 直读那一条记录
+    let out = xirang_cli::ops::set_value(
+        &pol,
+        &xirang_cli::ops::NoHooks,
+        &f,
+        &id,
+        xirang_core::codec::Value::Text("第一次".into()),
+        false,
+    )
+    .unwrap();
+    assert!(out.via_index, "台账可用就该直读，不整份载入");
+    assert_eq!(idv, out.id);
+
+    // 把台账删掉：快路走不通 → 退回整份载入，并且顺手把台账建回来
+    std::fs::remove_dir_all(xirang_core::wsidx::index_dir(&root)).unwrap();
+    let out = xirang_cli::ops::set_value(
+        &pol,
+        &xirang_cli::ops::NoHooks,
+        &f,
+        &id,
+        xirang_core::codec::Value::Text("第二次".into()),
+        false,
+    )
+    .unwrap();
+    assert!(!out.via_index, "没有台账时应当退回整份载入");
+
+    // 台账回来了 → 又走快路；两条路写出来的结果一致
+    let out = xirang_cli::ops::set_value(
+        &pol,
+        &xirang_cli::ops::NoHooks,
+        &f,
+        &id,
+        xirang_core::codec::Value::Text("第三次".into()),
+        false,
+    )
+    .unwrap();
+    assert!(out.via_index, "台账回来后应当又走直读");
+    let (_, out, _) = run(&root, &["find", "a.xirang", "第三次"]);
+    assert!(out.contains(&id), "{out}");
+    let (code, out, err) = run(&root, &["validate", "a.xirang", "--no-pager"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("0 错误"), "{out}");
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(xirang_core::wsidx::index_dir(&root)).ok();
+}
+
 /// 物理删除（裁剪留痕）必须退回整份重写：追加写表达不了「记录真的没了」。
 #[test]
 fn prune_still_rewrites_and_keeps_index_honest() {

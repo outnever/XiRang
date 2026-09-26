@@ -187,7 +187,9 @@ fn normalize(p: &Path) -> PathBuf {
 /// 本机状态挂钩：CLI 用它登记本机目录 / 索引；MCP 用 [`NoHooks`]（不碰本机状态）。
 pub trait Hooks {
     fn on_load(&self, _path: &Path, _store: &tree::Store) {}
-    fn on_save(&self, _path: &Path, _store: &tree::Store) {}
+    /// 数据落盘后。`store` 可能是 `None`：写路径走了「按编号直读单节点」的快路，
+    /// 没有整份载入。这时实现方要按「拿不到编号表」处理（CLI 会转后台扫描）。
+    fn on_save(&self, _path: &Path, _store: Option<&tree::Store>) {}
 }
 
 pub struct NoHooks;
@@ -258,7 +260,7 @@ fn save(
         // 没有任何改动（例如把值设成同一个）：一个字节都不用写
     }
     store.clear_journal();
-    hooks.on_save(path, store);
+    hooks.on_save(path, Some(store));
     update_index(path);
     Ok(())
 }
@@ -288,6 +290,44 @@ fn mark_append_protocol(store: &mut tree::Store) -> OpResult<()> {
         }
     }
     Ok(())
+}
+
+/// 「按编号直读单节点」的快路：普通文件 + 台账可用时，改一个词**不用整份载入**。
+///
+/// - `Ok(Some(()))`：已经按护栏判断过并落盘；
+/// - `Ok(None)`：这条路走不通（没台账 / 台账对不上 / 编号不在这个文件里 /
+///   写失败），调用方退回「整份载入 → 只追加写」的老路；
+/// - `Err(护栏)`：模板定义被拦下——与老路同一条护栏、同一句提示。
+fn try_direct_edit(
+    pol: &Policy,
+    hooks: &dyn Hooks,
+    path: &Path,
+    id: Uuid,
+    new_name: Option<String>,
+    new_value: Option<XValue>,
+    history: bool,
+) -> OpResult<Option<()>> {
+    match xirang_core::edit::under_template(path, id) {
+        Ok(false) => {}
+        Ok(true) => {
+            if !pol.force {
+                return Err(OpError::guarded(
+                    "该节点属于模板定义，不能直接编辑",
+                    "模板定义请用 template 操作修改；确需直接改请显式强制（CLI：--yes，MCP：force）",
+                ));
+            }
+        }
+        // 台账不可用：护栏留给老路（它会整份载入后判断）
+        Err(_) => return Ok(None),
+    }
+    match xirang_core::edit::edit_node(path, id, new_name, new_value, history) {
+        Ok(_out) => {
+            hooks.on_save(path, None); // 没有编号表：目录登记转后台
+            update_index(path);
+            Ok(Some(()))
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 /// 数据落盘后的索引维护：台账模式追加日志（侧车模式由 `Store::save` 自己写侧车）。
@@ -1294,6 +1334,8 @@ pub fn create_node(
 
 pub struct SetOutcome {
     pub id: Uuid,
+    /// 走的是「按编号直读单节点」快路吗（true = 没有整份载入文件）。
+    pub via_index: bool,
 }
 
 pub fn set_value(
@@ -1305,18 +1347,35 @@ pub fn set_value(
     no_history: bool,
 ) -> OpResult<SetOutcome> {
     let id = parse_uuid("节点 ID", node)?;
+    let raw_path = pol.resolve(file)?;
+    if !raw_path.is_dir()
+        && try_direct_edit(
+            pol,
+            hooks,
+            &raw_path,
+            id,
+            None,
+            Some(value.clone()),
+            !no_history,
+        )?
+        .is_some()
+    {
+        return Ok(SetOutcome { id, via_index: true });
+    }
     let (mut store, path, in_collection) = load_target(pol, hooks, file, Some(id))?;
     guard_editable(pol, &store, id)?;
     let before = store.clone();
     let r = if no_history { store.set_quiet(id, value) } else { store.update(id, value) };
     r.map_err(OpError::internal)?;
     save(hooks, &mut store, &path, in_collection, Some(&before))?;
-    Ok(SetOutcome { id })
+    Ok(SetOutcome { id, via_index: false })
 }
 
 pub struct RenameOutcome {
     pub id: Uuid,
     pub name: String,
+    /// 走的是「按编号直读单节点」快路吗。
+    pub via_index: bool,
 }
 
 pub fn rename_node(
@@ -1334,6 +1393,22 @@ pub fn rename_node(
     if new_name.as_bytes().len() > 255 {
         return Err(OpError::invalid("名字超 255 字节"));
     }
+    // 快路：普通文件 + 台账可用 → 按编号直读那一条，不整份载入
+    let raw_path = pol.resolve(file)?;
+    if !raw_path.is_dir()
+        && try_direct_edit(
+            pol,
+            hooks,
+            &raw_path,
+            id,
+            Some(new_name.to_string()),
+            None,
+            !no_history,
+        )?
+        .is_some()
+    {
+        return Ok(RenameOutcome { id, name: new_name.to_string(), via_index: true });
+    }
     let (mut store, path, in_collection) = load_target(pol, hooks, file, Some(id))?;
     guard_editable(pol, &store, id)?;
     let before = store.clone();
@@ -1344,11 +1419,13 @@ pub fn rename_node(
     };
     r.map_err(OpError::internal)?;
     save(hooks, &mut store, &path, in_collection, Some(&before))?;
-    Ok(RenameOutcome { id, name: new_name.to_string() })
+    Ok(RenameOutcome { id, name: new_name.to_string(), via_index: false })
 }
 
 pub struct RemoveOutcome {
     pub id: Uuid,
+    /// 走的是「按编号直读单节点」快路吗。
+    pub via_index: bool,
 }
 
 pub fn remove_node(
@@ -1358,12 +1435,28 @@ pub fn remove_node(
     node: &str,
 ) -> OpResult<RemoveOutcome> {
     let id = parse_uuid("节点 ID", node)?;
+    // 快路：普通文件 + 台账可用 → 按编号直读那一条，不整份载入
+    let raw_path = pol.resolve(file)?;
+    if !raw_path.is_dir()
+        && try_direct_edit(
+            pol,
+            hooks,
+            &raw_path,
+            id,
+            Some(String::new()),
+            Some(XValue::Empty),
+            true,
+        )?
+        .is_some()
+    {
+        return Ok(RemoveOutcome { id, via_index: true });
+    }
     let (mut store, path, in_collection) = load_target(pol, hooks, file, Some(id))?;
     guard_editable(pol, &store, id)?;
     let before = store.clone();
     store.remove(id).map_err(OpError::internal)?;
     save(hooks, &mut store, &path, in_collection, Some(&before))?;
-    Ok(RemoveOutcome { id })
+    Ok(RemoveOutcome { id, via_index: false })
 }
 
 pub struct LinkOutcome {
@@ -1406,6 +1499,34 @@ pub fn link_nodes(
         r.map_err(OpError::internal)?;
         save(hooks, &mut store, &shard_path, true, Some(&before))?;
         return Ok(LinkOutcome { from: f, to: t });
+    }
+
+    // 快路：两端的编号能用台账查到、且这条边落在同文件里 → 不整份载入
+    let plain = pol.resolve(file)?;
+    if !plain.is_dir() {
+        let f_here = matches!(xirang_core::edit::read_node(&plain, f), Ok(Some(_)));
+        let t_here = matches!(xirang_core::edit::read_node(&plain, t), Ok(Some(_)));
+        if f_here {
+            if !t_here && !pol.force {
+                return Err(OpError::guarded(
+                    "from 或 to 节点不存在",
+                    "继续连边会留下 R001 引用断裂；确实要连请显式强制（CLI：--yes，MCP：force）",
+                ));
+            }
+            if try_direct_edit(
+                pol,
+                hooks,
+                &plain,
+                f,
+                None,
+                Some(XValue::Reference(t)),
+                !no_history,
+            )?
+            .is_some()
+            {
+                return Ok(LinkOutcome { from: f, to: t });
+            }
+        }
     }
 
     let (mut store, path) = load(pol, hooks, file)?;
@@ -2079,7 +2200,7 @@ pub fn import_data(
     let store = store.map_err(OpError::invalid)?;
     let nodes = store.len();
     store.save(&path).map_err(|e| OpError::internal(e.to_string()))?;
-    hooks.on_save(&path, &store);
+    hooks.on_save(&path, Some(&store));
     update_index(&path);
     Ok(ImportOutcome { nodes, previous_nodes: before })
 }

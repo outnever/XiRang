@@ -189,6 +189,7 @@ Three things you will notice:
 1. **The file grows**: several records accumulate for the same id. Fold them once in a while with `xr compact <file>` (see "Fold / compact").
 2. **The first edit adds one auxiliary node**: the root you edited gets an `@protocol = append-v1` marker (added once). Without it, `xr validate` would report those normal duplicate ids as an E002 error — see `spec/协议.md`.
 3. **Old content cannot be corrupted**: appending never rewrites existing bytes; a crash mid-write leaves only a trailing fragment (F015), which reads ignore with a note.
+4. **No full load**: single-node writes (`set` / `rename` / `rm` / `link`) read that one record by id straight from the workspace ledger — about **10 ms** for one word in a 3.47-million-node file. If the ledger is missing or out of sync it falls back to loading the whole file; the result is the same, just slower.
 
 Exceptions: whole-file `import`, `history prune` and `tmpl rm` still rewrite the whole file — they are supposed to make it actually smaller, or need to express "the record is really gone" (which appending cannot express). `--no-history` only affects history recording, not this rule.
 

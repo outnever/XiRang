@@ -38,6 +38,7 @@
    All node UUIDs are sorted into a local dictionary, and that dictionary supports global cross-file lookup. Lookups can be served straight from disk without loading everything into memory.
 
    - Measured (local SSD): for a 30,000-node file, fetching one node by id takes under 10 ms; for a 3.47-million-node (179 MB) file it takes about **28 ms** — throughout, only the on-disk index is read, never the whole file (for comparison: reading the 179 MB off disk takes ~0.6 s, and decoding all 3.47 million nodes into objects takes ~3 s — the index route exists to avoid the latter);
+   - Writes take the same route: changing one word **appends just those few records** to the end of the file (a newer record with the same id overrides the old one) — about **10 ms** on a 3.47-million-node file, with no whole-file rewrite;
    - Size: for the same data, XiRang is about **1/4 to 1/5 of JSON** (measured: 179 MB of XiRang ≈ 800 MB of JSON).
 
 ### Characteristics

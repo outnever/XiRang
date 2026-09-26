@@ -2,13 +2,17 @@
 //!
 //! 每次编辑 = 往文件末尾追加一条记录（同编号 = 修订，新编号 = 新增），毫秒级；
 //! 撤销 / 重做同样以追加记录表达，所以整个会话的历史都留在文件里，随时可回滚。
+//!
+//! **落盘规则与 CLI 共用同一实现**（`xirang_core::edit`）：追加、幂等补
+//! `@protocol = append-v1`、写前截掉尾部残片，都在那一层；索引由界面在每次
+//! 编辑后调 `xirang_cli::ops::update_index` 跟上（CLI 写完调的是同一个入口）。
+//! 这里的撤销栈是**界面里的**临时功能，与数据里的 `@history` 是两回事。
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use xirang_core::codec::{Node, Uuid, Value};
-use xirang_core::index::AppendWriter;
-use xirang_core::tree::{self};
+use xirang_core::{edit, tree};
 
 /// 一次编辑的前后状态（撤销 = 追加「前」态，重做 = 追加「后」态）。
 #[derive(Clone, Debug)]
@@ -53,7 +57,7 @@ impl Edit {
 }
 
 pub struct Editor {
-    writer: AppendWriter,
+    path: PathBuf,
     undo_stack: Vec<Edit>,
     redo_stack: Vec<Edit>,
     marked: HashSet<Uuid>,
@@ -63,9 +67,11 @@ pub struct Editor {
 
 impl Editor {
     pub fn open(path: &Path) -> Result<Editor, String> {
-        let (writer, _report) = AppendWriter::open(path)?;
+        // 写之前让台账跟上文件、顺手截掉尾部残片（F015）。
+        // 台账还没建好就跳过——它只是缓存，界面每次编辑后都会 `update_index` 补上。
+        let _ = edit::prepare(path);
         Ok(Editor {
-            writer,
+            path: path.to_path_buf(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             marked: HashSet::new(),
@@ -73,10 +79,13 @@ impl Editor {
         })
     }
 
-    /// 首次在某根下编辑时，挂 `@protocol = append-v1`（重复挂无害）。
+    /// 首次在某根下编辑时，挂 `@protocol = append-v1`（幂等：文件里已经有就不加）。
     fn ensure_marker(&mut self, root: Option<Uuid>) -> Result<(), String> {
         let Some(root) = root else { return Ok(()) };
         if !self.marked.insert(root) {
+            return Ok(());
+        }
+        if edit::declares_protocol(&self.path, root, tree::PROTOCOL_APPEND).unwrap_or(false) {
             return Ok(());
         }
         let marker = Node {
@@ -85,7 +94,7 @@ impl Editor {
             name: "@protocol".into(),
             value: Value::Text(tree::PROTOCOL_APPEND.into()),
         };
-        self.writer.append_node(&marker)?;
+        edit::append_records(&self.path, &[marker])?;
         self.appended += 1;
         Ok(())
     }
@@ -93,9 +102,8 @@ impl Editor {
     /// 执行一次编辑并立即落盘。
     pub fn apply(&mut self, edit: Edit) -> Result<(), String> {
         self.ensure_marker(edit.root)?;
-        self.writer.append_node(&edit.to_node(true, false))?;
+        self.append(&[edit.to_node(true, false)])?;
         self.appended += 1;
-        self.writer.sync()?;
         self.redo_stack.clear();
         self.undo_stack.push(edit);
         Ok(())
@@ -114,9 +122,8 @@ impl Editor {
         let Some(edit) = self.undo_stack.pop() else {
             return Ok(false);
         };
-        self.writer.append_node(&edit.to_node(false, edit.created))?;
+        self.append(&[edit.to_node(false, edit.created)])?;
         self.appended += 1;
-        self.writer.sync()?;
         self.redo_stack.push(edit);
         Ok(true)
     }
@@ -126,13 +133,16 @@ impl Editor {
         let Some(edit) = self.redo_stack.pop() else {
             return Ok(false);
         };
-        self.writer.append_node(&edit.to_node(true, false))?;
+        self.append(&[edit.to_node(true, false)])?;
         self.appended += 1;
-        self.writer.sync()?;
         self.undo_stack.push(edit);
         Ok(true)
     }
 
+    /// 只追加（与 CLI 共用 `xirang_core::edit`）。
+    fn append(&mut self, records: &[Node]) -> Result<(), String> {
+        edit::append_records(&self.path, records).map(|_| ())
+    }
 }
 
 /// 改值：老值 → 新值。

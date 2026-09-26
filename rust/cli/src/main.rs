@@ -169,8 +169,38 @@ impl ops::Hooks for CliHooks {
     fn on_load(&self, path: &Path, store: &tree::Store) {
         index_store(&path.to_string_lossy(), store);
     }
-    fn on_save(&self, path: &Path, store: &tree::Store) {
-        index_store(&path.to_string_lossy(), store);
+    fn on_save(&self, path: &Path, store: Option<&tree::Store>) {
+        match store {
+            Some(s) => index_store(&path.to_string_lossy(), s),
+            // 快路（按编号直读单节点）没有编号表：让后台扫描去登记。
+            // 后台转不动（XIRANG_INDEX_MAINTENANCE=off / 缺 xr）就同步整份读一遍。
+            None => index_file_without_store(path),
+        }
+    }
+}
+
+/// 拿不到编号表时登记本机目录：优先转后台 `xr catalog scan`；
+/// 转不动（`XIRANG_INDEX_MAINTENANCE=off` / 旁边没有 xr）又要整份读一遍的话——
+/// 大文件就不读（目录只是缓存，晚点用 `xr catalog scan` 补上；绝不能为了这本
+/// 小册子把「改一个词」重新拖回整份载入），小文件才顺手读一遍登记。
+fn index_file_without_store(path: &Path) {
+    if !index_enabled() {
+        return;
+    }
+    if spawn_background_catalog_scan(path) {
+        eprintln!("（本机目录登记已在后台进行，命令先返回；XIRANG_INDEX=off 可关闭本机目录）");
+        return;
+    }
+    let big = std::fs::metadata(path)
+        .map(|m| m.len() >= BACKGROUND_CATALOG_MIN_BYTES)
+        .unwrap_or(false);
+    if big {
+        eprintln!("（本机目录没登记：文件较大，稍后 `xr catalog scan` 补上即可；XIRANG_INDEX=off 可关掉本机目录）");
+        return;
+    }
+    match tree::Store::load_view(path) {
+        Ok(store) => index_store(&path.to_string_lossy(), &store),
+        Err(_) => {} // 只是缓存：读不回来就下次再说
     }
 }
 

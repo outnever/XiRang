@@ -1612,8 +1612,14 @@ impl Reader {
     }
 
     /// 编号 → 位置（可能多份：同编号多文件）。
+    ///
+    /// **去重口径**：按「编号 + 文件」去重、**日志优先**。
+    /// 追加写落地后，同一个编号在同一个文件里会既有块里的旧位置、又有日志里的新位置；
+    /// 若按「文件 + 偏移」去重，同一个节点会被返回两次（`xr ws` 会显示「2 处」，
+    /// 其实是一处），而且可能读到旧内容。日志里的那条才是当前状态，所以它覆盖块里的。
     pub fn locate(&mut self, id: Uuid) -> Result<Vec<Hit>, String> {
-        let mut out: Vec<Hit> = Vec::new();
+        // 键 = 文件路径；块先放，日志后放（后写覆盖 = 日志优先）
+        let mut by_file: std::collections::BTreeMap<String, Hit> = std::collections::BTreeMap::new();
         let key = key_uuid(id);
         let hits: Vec<LocEntry> = self
             .collect_match(KIND_LOC, &key, 16)?
@@ -1622,16 +1628,16 @@ impl Reader {
             .filter(|e| self.block_valid(e.file_id) && self.file_fresh(e.file_id))
             .collect();
         for e in hits {
-            out.push(self.hit(e.file_id, e.off, e.len)?);
+            let h = self.hit(e.file_id, e.off, e.len)?;
+            by_file.insert(h.file.clone(), h);
         }
         for ((u, fid), e) in self.loc_over.clone() {
             if u == id && self.file_fresh(fid) {
-                out.push(self.hit(fid, e.off, e.len)?);
+                let h = self.hit(fid, e.off, e.len)?;
+                by_file.insert(h.file.clone(), h); // 日志优先
             }
         }
-        out.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.off.cmp(&b.off)));
-        out.dedup_by(|a, b| a.file == b.file && a.off == b.off);
-        Ok(out)
+        Ok(by_file.into_values().collect())
     }
 
     /// 孩子（并集）：先由父编号定位它的树根，再查关系本。

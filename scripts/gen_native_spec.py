@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from tools import codec
 from tools.codec import Node, EMPTY, INT, FLOAT, BOOL, TEXT, REFERENCE, BLOB
+from tools.tree import Store
 
 REPO = "https://github.com/outnever/XiRang"
 
@@ -57,62 +58,147 @@ def to_value(v):
     return (TEXT, str(v))
 
 
-def build(nodes, refs, labels, parent, spec):
-    n = Node(id=uuid.uuid4(), parent=parent.id if parent else None,
+class KeyGen:
+    """按「父路径 + 名字 + 同名序号」给节点起一个结构键。
+
+    读旧文件时用同一套走法（从根开始、按文件里的孩子顺序递归），
+    于是「结构没变」的节点能对上同一个键，重新生成时可以沿用原编号。
+    """
+
+    def __init__(self):
+        self.counters = {}
+
+    def key(self, parent_key, name):
+        full = f"{parent_key}/{name}"
+        n = self.counters.get(full, 0)
+        self.counters[full] = n + 1
+        return f"{full}[{n}]"
+
+
+def load_previous(path):
+    """读上一次生成的文件 → {结构键: 编号}、{结构键: 记录时间}。
+
+    没有旧文件（或读不动）就返回空表，全部当新节点。
+    """
+    ids, created = {}, {}
+    if not path.exists():
+        return ids, created
+    try:
+        store = Store.load(path)
+    except Exception:
+        return ids, created
+    roots = store.roots()
+    if not roots:
+        return ids, created
+    kg = KeyGen()
+
+    def walk(node, parent_key):
+        k = kg.key(parent_key, node.name)
+        ids[k] = node.id
+        tag, data = node.value
+        if node.name == "@created" and tag == TEXT:
+            created[k] = data
+        for child in store.children(node):
+            walk(child, k)
+
+    walk(roots[0], "")
+    return ids, created
+
+
+def node_id(key, old_ids):
+    """结构没变就沿用原编号；新节点才发新号。
+
+    编号必须在**建节点的那一刻**定下来：父指针直接引用父节点的编号，
+    事后统一换号会把父边指到不存在的编号上。
+    """
+    return old_ids.get(key) or uuid.uuid4()
+
+
+def build(nodes, keys, kg, old, refs, labels, parent, spec, key):
+    old_ids, old_created = old
+    n = Node(id=node_id(key, old_ids), parent=parent.id if parent else None,
              name=spec["name"], value=(EMPTY, None))
     if "ref" in spec:
         refs.append((n, spec["ref"]))
     elif "value" in spec:
         n.value = to_value(spec["value"])
     nodes.append(n)
+    keys.append(key)
     if "label" in spec:
-        labels[spec["label"]] = n.id
+        labels[spec["label"]] = n
     for c in spec.get("children", []):
-        build(nodes, refs, labels, n, c)
+        build(nodes, keys, kg, old, refs, labels, n, c, kg.key(key, c["name"]))
     return n
 
 
 def resolve_refs(refs, labels):
     for n, target in refs:
-        tid = labels.get(target)
-        if tid is None:
+        node = labels.get(target)
+        if node is None:
             raise ValueError(f"引用目标不存在：{target}")
-        n.value = (REFERENCE, tid)
+        n.value = (REFERENCE, node.id)
 
 
-def add_aux(nodes, parent, name, text):
-    nodes.append(Node(id=uuid.uuid4(), parent=parent.id, name=name, value=(TEXT, text)))
+def add_aux(nodes, keys, old_ids, parent, name, text, key):
+    nodes.append(
+        Node(id=node_id(key, old_ids), parent=parent.id, name=name, value=(TEXT, text))
+    )
+    keys.append(key)
 
 
-def add_history(nodes, parent, entries, now):
-    h = Node(id=uuid.uuid4(), parent=parent.id, name="@history", value=(EMPTY, None))
+def add_history(nodes, keys, kg, old, parent, parent_key, entries, now):
+    old_ids, old_created = old
+    hkey = kg.key(parent_key, "@history")
+    h = Node(id=node_id(hkey, old_ids), parent=parent.id, name="@history", value=(EMPTY, None))
     nodes.append(h)
+    keys.append(hkey)
     for name, note in entries:
-        e = Node(id=uuid.uuid4(), parent=h.id, name=name, value=(TEXT, note))
+        ekey = kg.key(hkey, name)
+        e = Node(id=node_id(ekey, old_ids), parent=h.id, name=name, value=(TEXT, note))
         nodes.append(e)
-        nodes.append(Node(id=uuid.uuid4(), parent=e.id, name="@created", value=(TEXT, now)))
+        keys.append(ekey)
+        ckey = kg.key(ekey, "@created")
+        # 记录时间也沿用旧值：否则每次重新生成都会整篇变一遍
+        nodes.append(
+            Node(
+                id=node_id(ckey, old_ids),
+                parent=e.id,
+                name="@created",
+                value=(TEXT, old_created.get(ckey, now)),
+            )
+        )
+        keys.append(ckey)
 
 
 def write_file(path, root_name, root_note, root_source, protocol, history, tree):
     nodes = []
+    keys = []
     refs = []
     labels = {}
     now = datetime.now(timezone.utc).isoformat()
-    root = Node(id=uuid.uuid4(), parent=None, name=root_name, value=(EMPTY, None))
+    old = load_previous(path)
+    old_ids = old[0]
+    kg = KeyGen()
+    root_key = kg.key("", root_name)
+    root = Node(id=node_id(root_key, old_ids), parent=None, name=root_name, value=(EMPTY, None))
     nodes.append(root)
-    add_aux(nodes, root, "@note", root_note)
-    add_aux(nodes, root, "@source", root_source)
-    add_aux(nodes, root, "@protocol", protocol)
-    add_history(nodes, root, history, now)
+    keys.append(root_key)
+    for name, text in (("@note", root_note), ("@source", root_source), ("@protocol", protocol)):
+        add_aux(nodes, keys, old_ids, root, name, text, kg.key(root_key, name))
+    add_history(nodes, keys, kg, old, root, root_key, history, now)
     for child in tree:
-        build(nodes, refs, labels, root, child)
+        build(nodes, keys, kg, old, refs, labels, root, child, kg.key(root_key, child["name"]))
+
+    # 编号与记录时间在建节点时就已经沿用（见 node_id / add_history）：
+    # 重新生成只该体现「内容改了什么」
+    reused = sum(1 for key in keys if key in old_ids)
     resolve_refs(refs, labels)
 
     header = extract_header().encode("utf-8")
     node_bytes = b"".join(codec.encode_node(n) for n in nodes)
     payload = b"XRNG" + bytes([1]) + len(header).to_bytes(4, "big") + header + node_bytes
     path.write_bytes(payload)
-    print(f"{path.name}: {len(nodes)} 节点, {len(payload)} 字节")
+    print(f"{path.name}: {len(nodes)} 节点（沿用 {reused} 个原编号）, {len(payload)} 字节")
 
 
 # ============================================================================
@@ -630,17 +716,18 @@ VERSION_TREE = [
         {"name": "协议 shard-v1", "value": "v1.0（依赖内核 v1.0）"},
         {"name": "协议 append-v1", "value": "v1.0（依赖内核 v1.0）"},
         {"name": "协议 catalog-v1", "value": "v1.0（依赖内核 v1.0）"},
+        {"name": "协议 wsidx-v1", "value": "v1.1（依赖内核 v1.0）"},
         {"name": "实现 tools（Python 参考）", "value": "v0.1（依赖内核 v1.0）"},
         {"name": "实现 xirang-core（Rust 交付）", "value": "0.2.0（依赖内核 v1.0）"},
         {"name": "实现 xirang-cli（xr / xr-mcp，含库接口）", "value": "0.4.0（依赖内核 v1.0）"},
         {"name": "桌面 xirang-app（Rust + egui）", "value": "0.1.0（依赖内核 v1.0）"},
-        {"name": "盘上格式", "value": "文件格式 1 · XRIDX 3 · XRCAT 2"},
+        {"name": "盘上格式", "value": "文件格式 1 · XRIDX 3 · XRCAT 2 · wsidx 清单 2"},
     ]},
 ]
 
 VERSION_HISTORY = [
     ("v1.0", "版本规范定稿：解耦 + 依赖声明。"),
-    ("v1.1", "协议升到 v1.1（新增 append-v1）；桌面端改为 Rust + egui；盘上索引 XRIDX 3。"),
+    ("v1.1", "协议升到 v1.1（新增 append-v1、wsidx-v1 补登记）；桌面端改为 Rust + egui；盘上索引 XRIDX 3、wsidx 清单 2。"),
 ]
 
 
@@ -675,6 +762,9 @@ ERROR_CODES = [
     _err("F009", "节点名超长", "节点名超过 255 字节上限。"),
     _err("F010", "类型标记非法", "解码时节点值的类型标记不在 0-6。"),
     _err("F011", "文本非法 UTF-8", "解码时节点名 / 文本值不是合法 UTF-8。"),
+    _err("F012", "索引块缺失", "读工作区索引时，index.manifest 里记的某个块文件不存在或读不出来。"),
+    _err("F013", "索引损坏 / 格式版本不支持", "索引文件（日志 / 清单 / 块）的魔数、版本、类型或长度字段不对——也包括「盘上格式版本对不上」。"),
+    _err("F014", "索引锁被占用", "另一个进程正在写同一个工作区的索引；等它结束，锁会在下次写入时自动回收。"),
     _err("F015", "尾部残片已忽略", "追加写到一半留下的半条记录：读取时忽略并提示，写入前截断到最后一个完整记录。"),
     _err("C001", "类型名非法", "格式转换时 type 不是 7 种之一。"),
     _err("C002", "UUID 非法", "编号 / 父节点 / 引用值不是合法 UUID。"),
@@ -710,7 +800,7 @@ ERROR_TREE = [
 
 ERROR_HISTORY = [
     ("v1.0", "错误列表定稿：节点层 E/R、实现层 F/C，模板层 V/O 预留。"),
-    ("v1.1", "E002 收窄为「未被声明为修订的重复编号」；新增 F015 尾部残片已忽略（F012–F014 已被索引改动占用）。"),
+    ("v1.1", "E002 收窄为「未被声明为修订的重复编号」；补齐索引层 F012–F014，新增 F015 尾部残片已忽略。"),
 ]
 
 
@@ -765,6 +855,20 @@ PROTOCOL_TREE = [
             {"name": "怎么增量", "value": "末尾还有修订块（append-v1 追加的历史记录，按写入顺序）。索引头记着「已经扫到源文件第几字节」；文件只变长时只扫新增的那一段并往修订块追加条目，不重建整张索引（整份重建要 15.6 秒，增量补扫是毫秒级）。读取时修订块先于基础块命中，实现「后写覆盖」。"},
             {"name": "什么时候失效", "value": "源文件尺寸回退、或被从中间改写（前缀校验对不上）就整份重建；解码后发现编号对不上也会重建。它只是缓存，删掉会自动重建。"},
         ]},
+        {"name": "wsidx-v1 工作区统一索引", "children": [
+            {"name": "一句话", "value": "每个工作区一套索引，放在 <工作区>/.xirang-index/，三本台账（定位 / 关系 / 反向）各自回答一类问题，写入只追加日志、压实才合并。"},
+            {"name": "放在哪", "value": "工作区根目录下的隐藏目录（默认 = 数据文件所在目录，可用 XIRANG_WORKSPACE 指定更大范围）。用户不必看见；可整体删除、可重建。"},
+            {"name": "三本台账", "value": "定位本（编号 → 文件 + 偏移 + 长度 + 树根，按编号排序）；关系本（树根 + 父 → 孩子 + 位置，按「树根 + 父」排序，同一棵树连续存放）；反向本（被引用编号 → 来源编号 + 文件）。"},
+            {"name": "怎么分块", "value": "每本按条目数分块（默认每块 100 万条），块内定长、按各自的首键升序；块边界与文件表记在 index.manifest，常驻内存。"},
+            {"name": "怎么写", "value": "数据文件落盘后只追加日志记录（不原地改块）。每个文件带一个「代号」，判定规则只有一条：条目属于「写它时那条文件记录」的代号。整份登记 → 代号 +1，该文件旧代号的条目一律作废；只追加登记 → 代号一个字都不动（旧记录的字节位置没挪动，旧条目继续有效），只把变化的那几条作为「后写覆盖」追加进日志；改掉引用还要给旧的那条反向边补一条墓碑，否则「谁引用我」会一直列出已经不指向我的节点。"},
+            {"name": "怎么压实", "value": "xr index compact：扫描与建块不持锁（写者照常写）→ 只在「换 manifest + 清日志」的瞬间持锁。块文件带代数前缀，新块写新名字 → 原子换 manifest → 再删旧代数，中断在任何时刻都不会出现半新半旧的索引。"},
+            {"name": "什么时候自动整理", "value": "读命令与写命令结束后，若「日志 > 主干 30% 且主干 ≥ 1MB」，CLI 分离一个后台进程执行 xr index compact（先给结果、再整理；XIRANG_INDEX_MAINTENANCE=off 关闭）；常驻的 MCP / 桌面版用后台线程做同一件事。"},
+            {"name": "怎么判过期", "value": "每个文件在台账里带指纹（尺寸 + 修改时间），对不上时该文件的条目一律作废，读路径回退到「整份载入」并提示。只追加登记还记着「上次登记到的文件长度 + 那段之前 64 字节的哈希」：长度一点不变也可能被从中间改写，只比长度会静默错位——哈希对不上就退回整份登记。"},
+            {"name": "向前兼容", "value": "未知段与未知记录类型必须按长度跳过；以后加字段倒排等新段不必升主版本。"},
+            {"name": "格式版本", "value": "每个索引文件头带一个格式版本字节（当前 2；2026-09 起：文件记录多了「上次登记到的长度 + 前缀守护哈希」、反向本多了墓碑记录）。版本对不上直接报 F013，读路径回退整份载入并提示，xr index rebuild 重建即可——台账只是缓存，绝不把新格式当旧格式读。"},
+            {"name": "与 catalog 的分工", "value": "catalog 是账号级的「编号 → 文件」入口（跨工作区）；wsidx 是工作区内的细定位。两者都是缓存，都可删可重建。"},
+            {"name": "代价", "value": "体积约等于数据的 1.2–2 倍（三本台账之和）；改一个词只追加几十到几百字节（毫秒级），代价是同一编号会攒下多份记录，偶尔要用 xr compact <文件> 折叠；整份写入（压实、物理删除）才需要重扫该文件的全部条目。"},
+        ]},
     ]},
     {"name": "内核边界", "value": "内核只增不改：节点四属性、7 大类标记永不复用；协议只改变「树怎么组织、怎么存」，不改节点本身。"},
 ]
@@ -772,6 +876,7 @@ PROTOCOL_TREE = [
 PROTOCOL_HISTORY = [
     ("v1.0", "协议登记定稿：shard-v1（分片词库）、catalog-v1（本机目录）、XRIDX 侧车索引。"),
     ("v1.1", "新增 append-v1（单文件修订）：同编号多记录 = 修订、后写覆盖；XRIDX 改为增量补扫。"),
+    ("v1.2", "补登记 wsidx-v1（工作区统一索引）：只追加登记不动代号、反向本墓碑、盘上格式版本 2（老格式报 F013 重建）。"),
 ]
 
 

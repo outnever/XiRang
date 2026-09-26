@@ -18,6 +18,7 @@
 ## 关键事实（别踩坑）
 
 - **代码与测试**：`rust/`（`cargo`，交付实现 `xr`/`xr-mcp`）+ `tools/`（Python 参考实现，语义与 `rust/` 对齐）+ `app/`（Rust + egui 桌面）。跑测试：`python3 -m pytest tests/`、`cargo test --manifest-path rust/Cargo.toml`、`cargo test --manifest-path app/Cargo.toml`；正式行为以 `rust/` + `spec/` 为准。
+- **改规范文档后要重新生成自举文件**：`spec/*.md` 与 `errors/错误列表.md` 有对应的原生 `.xirang`（内容**手写**在 `scripts/gen_native_spec.py` 里）。改完 Markdown 要同步改生成器的结构并跑 `python3 scripts/gen_native_spec.py`。生成器会**沿用既有编号与记录时间**，所以重新生成是逐字节稳定的（只有真改动的节点会变）；`python3 -m pytest tests/test_native_spec_sync.py` 守着「两边都不缺关键内容」与「重生成一字不变」两条。
 - 全部文档为中文，Markdown 文件名无空格、无英文（如 `errors/错误列表.md`）。
 - 版本采用「解耦 + 依赖声明」：内核（README 的「节点 / 节点值」部分）是唯一核心版本，外围各自独立版本并标注「依赖内核 vX.Y」，见 `spec/版本规范.md`。
 - 仓库远程为 GitHub：`https://github.com/outnever/XiRang`（唯一公开地址）。

@@ -28,17 +28,47 @@ def _native_text(rel: str) -> str:
 PAIRS = [
     ("README.md", "spec/息壤文档.xirang", ["协议", "CLI", "MCP", "Skill", "rust/core", "rust/cli", "app", "255"]),
     ("spec/模板.md", "spec/模板.xirang", ["注释式", "@实例", "@模板", "格式转换"]),
-    ("spec/版本规范.md", "spec/版本规范.xirang", ["shard-v1", "catalog-v1", "xirang-core", "xirang-app", "XRCAT", "XRIDX"]),
-    ("spec/协议.md", "spec/协议.xirang", ["shard-v1", "append-v1", "catalog-v1", "XRIDX", "分片清单", "磁盘二分"]),
-    ("errors/错误列表.md", "errors/错误列表.xirang", ["F009", "F010", "F011", "F015", "W001", "W008", "预留"]),
+    ("spec/版本规范.md", "spec/版本规范.xirang",
+     ["shard-v1", "catalog-v1", "wsidx-v1", "xirang-core", "xirang-app", "XRCAT", "XRIDX", "wsidx 清单 2"]),
+    ("spec/协议.md", "spec/协议.xirang",
+     ["shard-v1", "append-v1", "catalog-v1", "XRIDX", "wsidx-v1", "分片清单", "磁盘二分",
+      "只追加登记", "墓碑", "格式版本"]),
+    ("errors/错误列表.md", "errors/错误列表.xirang",
+     ["F009", "F010", "F011", "F012", "F013", "F014", "F015", "W001", "W008", "预留"]),
 ]
 
 
 def test_native_specs_not_drifted():
     missing = []
     for md, xr, marks in PAIRS:
-        text = _native_text(xr)
+        native = _native_text(xr)               # 自举文件里的节点名与文本值
+        source = (ROOT / md).read_text(encoding="utf-8")  # Markdown 原文
         for m in marks:
-            if m not in text:
+            if m not in native:
                 missing.append(f"{xr} 里缺 {m!r}（应见 {md}）")
+            if m not in source:
+                missing.append(f"{md} 里缺 {m!r}（自举文件里有）")
     assert not missing, "自举文件与 Markdown 漂移了：\n  " + "\n  ".join(missing)
+
+
+def test_native_specs_regenerate_byte_identically():
+    """重新生成自举文件必须一字不变（编号与记录时间沿用旧值）。
+
+    否则每次改一句 Markdown 都会让这几个文件整篇变一遍，diff 里看不出真正改了什么。
+    在临时目录里跑生成器，不动仓库里的文件。
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    targets = [xr for _, xr, _ in PAIRS]
+    with tempfile.TemporaryDirectory(prefix="xr-nativespec-") as tmp:
+        sandbox = Path(tmp)
+        for item in ("scripts", "tools", "spec", "errors"):
+            shutil.copytree(ROOT / item, sandbox / item)
+        for item in ("README.md", "LICENSE"):
+            shutil.copy(ROOT / item, sandbox / item)
+        subprocess.run(["python3", "scripts/gen_native_spec.py"], cwd=sandbox, check=True,
+                       stdout=subprocess.DEVNULL)
+        changed = [t for t in targets if (sandbox / t).read_bytes() != (ROOT / t).read_bytes()]
+    assert not changed, f"重新生成后这些文件变了（应逐字节一致）：{changed}"

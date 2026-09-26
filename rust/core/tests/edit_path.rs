@@ -172,3 +172,116 @@ fn direct_edit_recognises_template_definitions() {
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
 }
+
+// ============================================================================
+// 批量提交（`edit::apply_batch`）
+// ============================================================================
+
+/// 建一个有一批普通节点的文件：根 → 子 0..n-1（每个子节点都真存在）。
+fn make_wide_file(dir: &Path, name: &str, n: usize) -> (PathBuf, Vec<Uuid>) {
+    let path = dir.join(name);
+    let mut s = Store::new();
+    let root = s.create(None, "根", Value::Empty, false).id;
+    let mut ids = Vec::new();
+    for i in 0..n {
+        ids.push(s.create(Some(root), &format!("词{i}"), Value::Text("旧".into()), false).id);
+    }
+    s.save(&path).unwrap();
+    (path, ids)
+}
+
+/// 批量：同一编号改多次只写一条最终记录、只留一次痕；台账一次跟上。
+#[test]
+fn batch_folds_repeats_and_registers_once() {
+    let dir = tmp_dir("batch");
+    let (path, ids) = make_wide_file(&dir, "批量.xirang", 50);
+    wsidx::rebuild(&dir, &[]).unwrap();
+
+    let mut ops = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        ops.push(edit::BatchOp::Set { id: *id, value: Value::Text(format!("新{i}")) });
+        if i % 5 == 0 {
+            // 同一个编号再来一次：应当以最后一次为准，而且只多一条记录
+            ops.push(edit::BatchOp::Rename { id: *id, name: format!("改{i}") });
+        }
+    }
+    let out = edit::apply_batch(&path, &ops, false, false, false).unwrap();
+    assert_eq!(out.ops, ops.len());
+    assert_eq!(out.changed, ids.len(), "同一编号改多次只算一个");
+    // 不留痕：每个改动只追加一条记录，外加一条协议声明
+    assert_eq!(out.appended, ids.len() + 1, "不留痕时每条改动只写一条记录");
+
+    let view = tree::Store::load_view(&path).unwrap();
+    for (i, id) in ids.iter().enumerate() {
+        let n = view.get(*id).unwrap();
+        assert_eq!(n.value, Value::Text(format!("新{i}")));
+        if i % 5 == 0 {
+            assert_eq!(n.name, format!("改{i}"), "改名要叠在改值之后");
+        }
+    }
+    assert_eq!(
+        view.nodes().iter().filter(|n| n.name == "@protocol").count(),
+        1,
+        "协议声明只补一条"
+    );
+    let st = wsidx::files_status(&dir).unwrap();
+    assert!(st.iter().all(|f| f.fresh), "批量之后台账要新鲜：{st:?}");
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
+/// 批量是「整批不动」：任一条不合法，一个字节都不该变。
+#[test]
+fn batch_is_all_or_nothing() {
+    let dir = tmp_dir("batchbad");
+    let (path, ids) = make_wide_file(&dir, "整批.xirang", 20);
+    wsidx::rebuild(&dir, &[]).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let ops = vec![
+        edit::BatchOp::Set { id: ids[0], value: Value::Text("好".into()) },
+        edit::BatchOp::Set { id: ids[1], value: Value::Text("也好".into()) },
+        // 这一条故意指一个不存在的编号
+        edit::BatchOp::Set {
+            id: Uuid::random_v4(),
+            value: Value::Text("坏".into()),
+        },
+    ];
+    assert!(edit::apply_batch(&path, &ops, false, false, false).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before, "失败时文件必须一个字节不变");
+    assert_eq!(
+        tree::Store::load_view(&path).unwrap().get(ids[0]).unwrap().value,
+        Value::Text("旧".into()),
+        "前面那几条也不许落地"
+    );
+
+    // 预演同样不写
+    assert!(edit::apply_batch(&path, &ops[..2], false, false, true).is_ok());
+    assert_eq!(std::fs::read(&path).unwrap(), before, "预演不写文件");
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
+/// 批量也守模板定义的护栏（`force` 才放行）。
+#[test]
+fn batch_respects_template_guard() {
+    let dir = tmp_dir("batchtpl");
+    let path = dir.join("模板.xirang");
+    let mut s = Store::new();
+    let tpl = s.create(None, "词条", Value::Empty, false).id;
+    s.create(Some(tpl), "@模板", Value::Empty, false);
+    let field = s.create(Some(tpl), "词形", Value::Empty, false).id;
+    s.save(&path).unwrap();
+    wsidx::rebuild(&dir, &[]).unwrap();
+
+    let ops = vec![edit::BatchOp::Set { id: field, value: Value::Text("抢改".into()) }];
+    let err = edit::apply_batch(&path, &ops, false, false, false).unwrap_err();
+    assert!(err.contains("模板定义"), "应当被模板护栏拦下：{err}");
+    // 显式强制才放行
+    assert!(edit::apply_batch(&path, &ops, false, true, false).is_ok());
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}

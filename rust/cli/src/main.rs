@@ -649,6 +649,82 @@ fn cmd_set(file: &str, node: &str, value: &str, no_history: bool, yes: bool) -> 
     }
 }
 
+/// `xr batch <文件> <清单>`：一批改动一次落盘。
+///
+/// 清单是 JSONL（一行一条改动；`-` 表示从 stdin 读，空行与 `#` 注释跳过）：
+/// ```text
+/// {"op":"set","id":"<编号>","value":"新值"}
+/// {"op":"link","id":"<编号>","to":"<目标编号>"}
+/// {"op":"rename","id":"<编号>","name":"新名字"}
+/// {"op":"rm","id":"<编号>"}
+/// ```
+fn cmd_batch(
+    file: &str,
+    list: &str,
+    no_history: bool,
+    dry_run: bool,
+    json_out: bool,
+    yes: bool,
+) -> i32 {
+    let text = if list == "-" {
+        let mut s = String::new();
+        use std::io::Read as _;
+        if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+            eprintln!("错误：读不到 stdin 上的清单：{e}");
+            return 2;
+        }
+        s
+    } else {
+        match std::fs::read_to_string(list) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("错误：读不到清单 {list}：{e}");
+                return 2;
+            }
+        }
+    };
+    let parsed = match ops::parse_batch(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("错误：{e}");
+            return 2;
+        }
+    };
+    match ops::batch_edit(&Policy::cli(yes), &CliHooks, file, &parsed, no_history, dry_run) {
+        Ok(o) => {
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "file": file,
+                        "ops": o.ops,
+                        "changed": o.changed,
+                        "appended": o.appended,
+                        "dryRun": o.dry_run,
+                    })
+                );
+                return 0;
+            }
+            if o.dry_run {
+                println!(
+                    "（预演）校验通过：清单 {} 条，会改到 {} 个节点；没有写文件",
+                    o.ops, o.changed
+                );
+            } else {
+                println!(
+                    "已批量提交：清单 {} 条 → 改到 {} 个节点，追加 {} 条记录（{}）",
+                    o.ops,
+                    o.changed,
+                    o.appended,
+                    if no_history { "不留痕" } else { "带留痕" }
+                );
+            }
+            0
+        }
+        Err(e) => report(&e),
+    }
+}
+
 fn cmd_rename(file: &str, node: &str, new_name: &str, no_history: bool, yes: bool) -> i32 {
     match ops::rename_node(&Policy::cli(yes), &CliHooks, file, node, new_name, no_history) {
         Ok(o) => {
@@ -2187,6 +2263,13 @@ fn usage() {
     println!("  xr link <file> <from-id> <to-id> [--no-history]   建引用边");
     println!("  xr copy <file> <node-id> <parent|nil> [--blank] [--no-history]  复制子树");
     println!("  xr fill <file> <root-id> <名/路径=值>... [--no-history]  按名字/路径映射赋值");
+    println!("  xr batch <file> <清单文件|-> [--no-history] [--dry-run] [--json] [--yes]");
+    println!("      一批改动一次落盘（几十万条迁移用）。清单 = JSONL，一行一条改动：");
+    println!("        {{\"op\":\"set\",\"id\":\"<编号>\",\"value\":\"新值\"}}");
+    println!("        {{\"op\":\"link\",\"id\":\"<编号>\",\"to\":\"<目标编号>\"}}");
+    println!("        {{\"op\":\"rename\",\"id\":\"<编号>\",\"name\":\"新名字\"}}");
+    println!("        {{\"op\":\"rm\",\"id\":\"<编号>\"}}（`-` = 从 stdin 读；空行与 # 注释跳过）");
+    println!("      先在内存里全部校验，任一条不合法整批不动；--dry-run 只校验不写");
     println!("  xr match <file> --root <名>|--shape-of <node-id>|--template <名> [--where 路径=值] [--json] [--tree]");
     println!("      结构/名字/值匹配（按根名/形状码/模板实例；--json 结构化、--tree 整树）");
     println!("  （--no-history：不写 @history / @created，适合批量创建 & 初始数据）");
@@ -2324,6 +2407,22 @@ fn main() {
                 2
             } else {
                 cmd_set(file, &args[3], &args[4], has_flag(&args, "--no-history"), yes)
+            }
+        }
+        "batch" => {
+            if args.len() < 4 {
+                eprintln!("用法：xr batch <文件> <清单文件|-> [--no-history] [--dry-run] [--json] [--yes]");
+                eprintln!("      清单 = JSONL（一行一条改动），见 xr --help");
+                2
+            } else {
+                cmd_batch(
+                    file,
+                    &args[3],
+                    has_flag(&args, "--no-history"),
+                    has_flag(&args, "--dry-run"),
+                    has_flag(&args, "--json"),
+                    yes,
+                )
             }
         }
         "rename" => {

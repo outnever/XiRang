@@ -295,6 +295,37 @@ fn tool_node(cfg: &Config, args: &Value) -> Result<Value, OpError> {
             let o = ops::set_value(&pol, &ops::NoHooks, &file, &node, value, no_history)?;
             Ok(json!({"updated": o.id.to_string()}))
         }
+        // 批量提交：一次请求改一批（几十万条迁移用；`ops` 数组或 `batch` 文本都收）
+        "batch" => {
+            let parsed = match (args.get("ops"), args.get("batch")) {
+                (Some(Value::Array(items)), _) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for (i, v) in items.iter().enumerate() {
+                        out.push(
+                            ops::parse_batch_item(v, &format!("第 {} 项", i + 1))
+                                .map_err(OpError::invalid)?,
+                        );
+                    }
+                    out
+                }
+                (_, Some(Value::String(text))) => {
+                    ops::parse_batch(text).map_err(OpError::invalid)?
+                }
+                _ => {
+                    return Err(OpError::invalid(
+                        "batch 需要 ops（JSON 数组）或 batch（JSONL 文本）",
+                    ))
+                }
+            };
+            let dry_run = bool_arg(args, "dry_run", false);
+            let o = ops::batch_edit(&pol, &ops::NoHooks, &file, &parsed, no_history, dry_run)?;
+            Ok(json!({
+                "ops": o.ops,
+                "changed": o.changed,
+                "appended": o.appended,
+                "dryRun": o.dry_run,
+            }))
+        }
         "rename" => {
             let node = str_arg(args, "node")?;
             let name = str_arg(args, "name")?;

@@ -193,6 +193,27 @@ Three things you will notice:
 
 Exceptions: whole-file `import`, `history prune` and `tmpl rm` still rewrite the whole file — they are supposed to make it actually smaller, or need to express "the record is really gone" (which appending cannot express). `--no-history` only affects history recording, not this rule.
 
+### `xr batch <file> <list-file|-> [--no-history] [--dry-run] [--json] [--yes]`
+
+Submit **a batch** of changes at once (for migrations of hundreds of thousands of records). The list is **JSONL**: one change per line; blank lines and `#` comments are skipped; a whole-file JSON array works too; `-` reads from stdin.
+
+```text
+{"op":"set","id":"<id>","value":"new value"}   set the value (string / number / boolean / null)
+{"op":"set","id":"<id>","ref":"<target id>"}   set the value to a reference
+{"op":"link","id":"<id>","to":"<target id>"}   change a reference (same thing)
+{"op":"rename","id":"<id>","name":"new name"}  rename
+{"op":"rm","id":"<id>"}                        delete (empty the name and value)
+```
+
+- **Validate everything first, then write**: if any line is invalid (id not in this file, protected template definition, name too long, …) **nothing is applied**, and the error names the line.
+- **One process, one write, one ledger registration** — no per-change process start. Changing the same id several times in one batch writes one final record and one history entry.
+- `--dry-run` validates only: it reports how many nodes would change and writes nothing.
+- `--no-history` skips `@history` (recommended for migrations: otherwise each change adds two extra history nodes).
+- Only **existing** nodes; to bulk **create**, use `xr import --append`.
+- One list targets one file; for shard collections, submit per shard.
+
+Measured (187 MB / 3.47 million nodes, release): **400,000 reference changes in 105 seconds** (one command per change used to take hours), growing the file by about 27 MB; afterwards `xr validate` reports 0 errors and `xr index compact` takes 4.4 s. Cost scales with "number of changes + number of distinct ancestors involved"; for batches this size, `--dry-run` first and compact afterwards.
+
 ### `xr new <file> <parent|nil> <name> [value] [--no-history]`
 Add a node. `parent` = `nil` to create a root. Creates a new file if it does not exist.
 

@@ -589,3 +589,72 @@ fn mcp_does_not_touch_the_local_catalog() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// 批量提交也走 MCP：一次请求改一批（与 CLI 同一条实现：`ops::batch_edit`）。
+#[test]
+fn node_batch_over_mcp() {
+    let root = tmp_root("batch");
+    let mut mcp = Mcp::start(&root);
+
+    let root_id = mcp.call(
+        "node",
+        json!({"file": "b.xirang", "action": "create", "name": "根", "no_history": true}),
+    )["created"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let id = mcp.call(
+            "node",
+            json!({"file": "b.xirang", "action": "create", "parent": root_id,
+                   "name": format!("词{i}"), "value": "旧", "no_history": true}),
+        )["created"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        ids.push(id);
+    }
+    let ops: Vec<Value> = ids
+        .iter()
+        .map(|id| json!({"op": "set", "id": id, "value": "新"}))
+        .collect();
+
+    // 预演
+    let out = mcp.call(
+        "node",
+        json!({"file": "b.xirang", "action": "batch", "ops": ops,
+               "no_history": true, "dry_run": true}),
+    );
+    assert_eq!(out["changed"], 4);
+    assert_eq!(out["dryRun"], true);
+
+    // 真跑：四条改动（协议声明在之前的 create 时已经补过了，这里不该再来一条）
+    let out = mcp.call(
+        "node",
+        json!({"file": "b.xirang", "action": "batch", "ops": ops, "no_history": true}),
+    );
+    assert_eq!(out["changed"], 4);
+    assert_eq!(out["appended"], 4, "不留痕时每条改动只写一条记录：{out}");
+    let (_, tree_out, _) = run({
+        let mut c = xr(&root);
+        c.args(["tree", "b.xirang", "--no-pager"]);
+        c
+    });
+    assert_eq!(
+        tree_out.matches("@protocol = append-v1").count(),
+        1,
+        "协议声明必须只有一条：{tree_out}"
+    );
+
+    // 读得回来（与 CLI 结果一致）
+    let (_, out, err) = run({
+        let mut c = xr(&root);
+        c.args(["find", "b.xirang", "新"]);
+        c
+    });
+    assert!(err.is_empty(), "{err}");
+    assert!(out.contains("共 4 个匹配"), "四条都该读到：{out}");
+
+    std::fs::remove_dir_all(&root).ok();
+}

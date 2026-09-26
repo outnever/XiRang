@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value as JsonValue};
 use xirang_core::codec::{parse_value, Node, Uuid, Value as XValue};
-use xirang_core::{convert, query, shard, tree, validator};
+use xirang_core::{convert, query, shard, tree};
 
 // ============================================================================
 // 错误与策略
@@ -666,7 +666,8 @@ pub fn view(
     let (store, _path) = load(pol, hooks, file)?;
     let total = store.len();
     if let Some(g) = unbounded_guard {
-        if opts.limit.is_none() && total > g {
+        // `--force` / `force: true` 明确表示「我知道会刷屏，照样打」
+        if opts.limit.is_none() && total > g && !pol.force {
             return Err(OpError::guarded(
                 format!("这个文件有 {total} 个节点，全量打印会刷屏（可能上百 MB）"),
                 format!(
@@ -1332,10 +1333,167 @@ pub fn create_node(
     Ok(CreateOutcome { id: n.id, name: name.to_string(), new_shard: false, warnings })
 }
 
+// ============================================================================
+// 批量提交：一批改动一次落盘（几十万条迁移用）
+// ============================================================================
+
+pub struct BatchOutcome {
+    /// 清单里一共多少条改动。
+    pub ops: usize,
+    /// 真正改到的节点数（同一编号在一批里改多次只算一个）。
+    pub changed: usize,
+    /// 往文件里追加的记录条数（含留痕与协议声明）。
+    pub appended: usize,
+    /// 预演：只校验不落盘。
+    pub dry_run: bool,
+}
+
+/// 批量清单的一行（JSON）→ 一条改动。
+///
+/// 支持的形状（`op` 缺省 = `set`）：
+/// ```text
+/// {"op":"set","id":"<编号>","value":<JSON 标量>}
+/// {"op":"set","id":"<编号>","ref":"<目标编号>"}     // 值 = 引用
+/// {"op":"link","id":"<编号>","to":"<目标编号>"}      // 改引用
+/// {"op":"rename","id":"<编号>","name":"新名字"}
+/// {"op":"rm","id":"<编号>"}
+/// ```
+pub fn parse_batch_item(v: &JsonValue, at: &str) -> Result<xirang_core::edit::BatchOp, String> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| format!("{at}：每一项都要是一个 JSON 对象"))?;
+    let op = obj.get("op").and_then(|x| x.as_str()).unwrap_or("set");
+    let raw_id = obj
+        .get("id")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| format!("{at}：缺少 id"))?;
+    let id = Uuid::parse(raw_id).ok_or_else(|| format!("{at}：id 不是合法编号：{raw_id}"))?;
+    let ref_of = |key: &str| -> Result<Uuid, String> {
+        let raw = obj
+            .get(key)
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("{at}：缺少 {key}"))?;
+        Uuid::parse(raw).ok_or_else(|| format!("{at}：{key} 不是合法编号：{raw}"))
+    };
+    match op {
+        "set" => {
+            if obj.contains_key("ref") {
+                return Ok(xirang_core::edit::BatchOp::Set {
+                    id,
+                    value: XValue::Reference(ref_of("ref")?),
+                });
+            }
+            let raw = obj
+                .get("value")
+                .ok_or_else(|| format!("{at}：set 需要 value 或 ref"))?;
+            if let Some(r) = raw.get("ref").and_then(|x| x.as_str()) {
+                return Ok(xirang_core::edit::BatchOp::Set {
+                    id,
+                    value: XValue::Reference(
+                        Uuid::parse(r).ok_or_else(|| format!("{at}：ref 不是合法编号：{r}"))?,
+                    ),
+                });
+            }
+            let value = match raw {
+                JsonValue::Null => XValue::Empty,
+                JsonValue::Bool(b) => XValue::Bool(*b),
+                JsonValue::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        XValue::Int(i)
+                    } else if let Some(f) = n.as_f64() {
+                        XValue::Float(f)
+                    } else {
+                        return Err(format!("{at}：数字超出范围"));
+                    }
+                }
+                JsonValue::String(s) => XValue::Text(s.clone()),
+                other => {
+                    return Err(format!(
+                        "{at}：值只能是字符串 / 数字 / 布尔 / null / {{\"ref\": 编号}}，实得 {other}"
+                    ))
+                }
+            };
+            Ok(xirang_core::edit::BatchOp::Set { id, value })
+        }
+        "link" | "ref" => Ok(xirang_core::edit::BatchOp::Link {
+            id,
+            to: ref_of(if obj.contains_key("to") { "to" } else { "ref" })?,
+        }),
+        "rename" => {
+            let name = obj
+                .get("name")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| format!("{at}：rename 需要 name"))?;
+            Ok(xirang_core::edit::BatchOp::Rename { id, name: name.to_string() })
+        }
+        "rm" | "remove" => Ok(xirang_core::edit::BatchOp::Remove { id }),
+        other => Err(format!(
+            "{at}：不认识的 op「{other}」（可用 set / link / rename / rm）"
+        )),
+    }
+}
+
+/// 解析批量清单：一行一个 JSON 对象（空行与 `#` 注释跳过）；
+/// 整份是一个 JSON 数组也认。报错带行号。
+pub fn parse_batch(text: &str) -> Result<Vec<xirang_core::edit::BatchOp>, String> {
+    let head = text.trim_start();
+    let mut out = Vec::new();
+    if head.starts_with('[') {
+        let arr: Vec<JsonValue> =
+            serde_json::from_str(head).map_err(|e| format!("清单不是合法的 JSON 数组：{e}"))?;
+        for (i, v) in arr.iter().enumerate() {
+            out.push(parse_batch_item(v, &format!("第 {} 项", i + 1))?);
+        }
+        return Ok(out);
+    }
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let v: JsonValue = serde_json::from_str(line)
+            .map_err(|e| format!("第 {} 行不是合法 JSON：{e}", i + 1))?;
+        out.push(parse_batch_item(&v, &format!("第 {} 行", i + 1))?);
+    }
+    Ok(out)
+}
+
 pub struct SetOutcome {
     pub id: Uuid,
     /// 走的是「按编号直读单节点」快路吗（true = 没有整份载入文件）。
     pub via_index: bool,
+}
+
+/// 批量提交：一个进程、一次落盘、一次台账登记。
+///
+/// 先在内存里把整批算完并全部校验（编号在不在这个文件里、模板定义护栏、
+/// 名字长度…），任一条不合法就**整批不动**；`dry_run` 只校验不写。
+pub fn batch_edit(
+    pol: &Policy,
+    hooks: &dyn Hooks,
+    file: &str,
+    ops: &[xirang_core::edit::BatchOp],
+    no_history: bool,
+    dry_run: bool,
+) -> OpResult<BatchOutcome> {
+    let path = pol.resolve(file)?;
+    if path.is_dir() {
+        return Err(OpError::invalid(
+            "批量提交一次只对一个 .xirang 文件；词库目录请按分片分别提交",
+        ));
+    }
+    let out = xirang_core::edit::apply_batch(&path, ops, !no_history, pol.force, dry_run)
+        .map_err(OpError::invalid)?;
+    if !dry_run {
+        hooks.on_save(&path, None); // 没有编号表：目录登记转后台
+        update_index(&path);
+    }
+    Ok(BatchOutcome {
+        ops: ops.len(),
+        changed: out.changed,
+        appended: out.appended,
+        dry_run,
+    })
 }
 
 pub fn set_value(
@@ -2225,7 +2383,7 @@ pub const MCP_TOOLS: &[&str] = &[
 
 pub const QUERY_ACTIONS: &[&str] = &["find", "match", "instances", "refs", "history"];
 pub const NODE_ACTIONS: &[&str] =
-    &["create", "set", "rename", "remove", "link", "copy", "fill", "revert", "prune_history"];
+    &["create", "set", "rename", "remove", "link", "copy", "fill", "revert", "prune_history", "batch"];
 pub const TEMPLATE_ACTIONS: &[&str] = &["define", "list", "instantiate", "remove"];
 pub const CONVERT_ACTIONS: &[&str] = &["export", "import", "append"];
 pub const BLOB_ACTIONS: &[&str] = &["import", "export", "info"];

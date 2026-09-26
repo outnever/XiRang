@@ -44,7 +44,7 @@ Most MCP clients start servers from a JSON config shaped like this (use your own
 | `file_diff` | — | compare two files (added/removed/changed, by node id) |
 | `tree` | `layout=tree\|flat` | tree view; `node`/`depth`/`limit`/`skip_aux`; `limit` defaults to 200 |
 | `query` | `find` / `match` / `instances` / `refs` / `history` | search; match by structure/name/template; instances; reference edges; `@history` snapshots |
-| `node` | `create` / `set` / `rename` / `remove` / `link` / `copy` / `fill` / `revert` | edit nodes |
+| `node` | `create` / `set` / `rename` / `remove` / `link` / `copy` / `fill` / `revert` / `prune_history` / `batch` | edit nodes; `batch` commits a whole batch (an `ops` array or a `batch` JSONL string, optional `dry_run`) |
 | `template` | `define` / `list` / `instantiate` / `remove` | define templates, list them, batch-instantiate (optionally `under` a parent), remove |
 | `convert` | `export` / `import` / `append` | export to `json`/`yaml`/`xml`/`md`, whole-file import, append nested JSON as a subtree |
 | `blob` | `import` / `export` / `info` | blob values: read in, write out, inspect |

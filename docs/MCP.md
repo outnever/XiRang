@@ -44,7 +44,7 @@ rust/target/debug/xr-mcp --root /你的数据目录
 | `file_diff` | — | 两文件对比（增/删/改，按节点编号） |
 | `tree` | `layout=tree\|flat` | 树视图；可给 `node`/`depth`/`limit`/`skip_aux`；`limit` 默认 200 |
 | `query` | `find` / `match` / `instances` / `refs` / `history` | 搜索、按结构/名字/模板匹配、实例、引用边、`@history` 快照 |
-| `node` | `create` / `set` / `rename` / `remove` / `link` / `copy` / `fill` / `revert` | 改节点 |
+| `node` | `create` / `set` / `rename` / `remove` / `link` / `copy` / `fill` / `revert` / `prune_history` / `batch` | 改节点；`batch` 一次提交一批改动（`ops` 数组，或 `batch` 的 JSONL 文本；可带 `dry_run`） |
 | `template` | `define` / `list` / `instantiate` / `remove` | 建模板、列模板、按模板批量建实例（可 `under` 挂到某父下）、删模板 |
 | `convert` | `export` / `import` / `append` | `json`/`yaml`/`xml`/`md` 导出、整文件导入、把嵌套 JSON 追加成子树 |
 | `blob` | `import` / `export` / `info` | 二进制块：读入、写出、查看 |

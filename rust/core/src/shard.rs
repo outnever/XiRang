@@ -234,6 +234,40 @@ pub fn append_changes(path: &Path, before: &Store, after: &Store) -> Result<(), 
     Ok(())
 }
 
+/// 把 `store` 这次改动碰过的节点**只追加**到文件末尾（真正的 append-only）。
+///
+/// 与 [`append_changes`] 的区别：不用「改前 / 改后两个完整 Store 做对比」——
+/// 347 万节点克隆一次要 1–2 秒、约 1 GB 内存，会把省下的时间吃回去。
+/// 改由写操作自己报告碰了谁（[`crate::tree::Journal`]）。返回追加的记录条数。
+///
+/// **有物理删除时返回 Err**：追加写表达不了「记录真的没了」——旧的关系条目
+/// 还指向已经不存在的记录，读出来就是错的。这种情况调用方要退回整份重写。
+pub fn append_journal(path: &Path, store: &Store) -> Result<usize, String> {
+    let j = store.journal();
+    if !j.removed().is_empty() {
+        return Err(format!(
+            "有 {} 个节点被物理删除：只追加写表达不了，需要整份重写",
+            j.removed().len()
+        ));
+    }
+    if j.is_empty() {
+        return Ok(0);
+    }
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    let mut n = 0usize;
+    for id in j.order() {
+        if let Some(node) = store.get(*id) {
+            let bytes = codec::encode_node(node).map_err(|e| format!("{e:?}"))?;
+            f.write_all(&bytes).map_err(|e| e.to_string())?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 #[derive(Clone, Debug)]
 pub struct ShardEntry {
     /// 分片根节点名（便于人读，非唯一）。

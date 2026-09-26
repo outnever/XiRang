@@ -233,7 +233,7 @@ fn load_target(
 
 fn save(
     hooks: &dyn Hooks,
-    store: &tree::Store,
+    store: &mut tree::Store,
     path: &Path,
     in_collection: bool,
     before: Option<&tree::Store>,
@@ -241,11 +241,52 @@ fn save(
     if in_collection {
         let before = before.ok_or_else(|| OpError::internal("词库写入缺少改动前快照"))?;
         shard::append_changes(path, before, store).map_err(OpError::internal)?;
-    } else {
+    } else if path.exists() && !store.journal().is_empty() {
+        if store.journal().removed().is_empty() {
+            // 普通文件：只追加写（比整份重写快三个数量级，也让 append-v1 的历史留得住）
+            mark_append_protocol(store)?;
+            shard::append_journal(path, store).map_err(OpError::internal)?;
+        } else {
+            // 物理删除（裁剪留痕 / 删模板）：旧的关系条目会指向已经不存在的记录，
+            // 只追加写表达不了 → 退回整份重写（这类操作本来就要让文件真的变小）
+            store.save(path).map_err(|e| OpError::internal(e.to_string()))?;
+        }
+    } else if !store.journal().is_empty() {
+        // 新文件：本来就得整份写（文件头 + 头文本）
         store.save(path).map_err(|e| OpError::internal(e.to_string()))?;
+    } else {
+        // 没有任何改动（例如把值设成同一个）：一个字节都不用写
     }
+    store.clear_journal();
     hooks.on_save(path, store);
     update_index(path);
+    Ok(())
+}
+
+/// 首次在某棵树上追加之前，幂等补一条 `@protocol = append-v1`。
+///
+/// 追加写之后，同一个编号在文件里会有多份记录，读的时候按「后写覆盖」取最后一条。
+/// 声明了协议，`xr validate` 才不会把这种正常的重复编号报成 E002；
+/// 已经有了就一条都不加（否则每次编辑都多一个节点，又是一个膨胀源）。
+fn mark_append_protocol(store: &mut tree::Store) -> OpResult<()> {
+    let mut roots: Vec<Uuid> = Vec::new();
+    for id in store.journal().order().to_vec() {
+        if let Some(root) = store.root_of(id) {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+    for root in roots {
+        if !store.declares_protocol(root, tree::PROTOCOL_APPEND) {
+            store.create(
+                Some(root),
+                "@protocol",
+                XValue::Text(tree::PROTOCOL_APPEND.into()),
+                false,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -262,6 +303,24 @@ pub fn update_index(path: &Path) {
         return;
     }
     let ws_root = xirang_core::wsidx::workspace_root(path);
+    // 快路：只登记「文件新增的那一段」（追加写之后就走这一条，毫秒级）
+    match xirang_core::wsidx::append_tail(&ws_root, path) {
+        Ok(t) => {
+            if t.truncated_bytes > 0 {
+                eprintln!(
+                    "（提示：尾部有 {} 字节残片没登记——按 F015「忽略尾部残片」处理；\
+                     xr compact <文件> 可以把它折掉）",
+                    t.truncated_bytes
+                );
+            }
+            if let Some(f) = ON_INDEX_TOUCH.get() {
+                f(ws_root);
+            }
+            return;
+        }
+        // 对不上（没登记过 / 文件变小 / 前缀被改写）：退回整份登记，绝不猜
+        Err(_) => {}
+    }
     // 大文件：登记 = 重扫全文（179 MB / 347 万节点约 49 秒）。这一步不该挡住用户的命令，
     // 索引只是缓存，晚几十秒跟上没有任何数据风险（指纹不符时读路径会回退并打印原因）。
     let big = std::fs::metadata(path)
@@ -1187,7 +1246,7 @@ pub fn create_node(
                 let (mut store, shard_path) = load_shard(&path, pid)?;
                 let before = store.clone();
                 let n = store.create(Some(pid), name, value, !no_history);
-                save(hooks, &store, &shard_path, true, Some(&before))?;
+                save(hooks, &mut store, &shard_path, true, Some(&before))?;
                 Ok(CreateOutcome {
                     id: n.id,
                     name: name.to_string(),
@@ -1229,9 +1288,7 @@ pub fn create_node(
         }
     }
     let n = store.create(p, name, value, !no_history);
-    store.save(&path).map_err(|e| OpError::internal(e.to_string()))?;
-    hooks.on_save(&path, &store);
-    update_index(&path);
+    save(hooks, &mut store, &path, false, None)?;
     Ok(CreateOutcome { id: n.id, name: name.to_string(), new_shard: false, warnings })
 }
 
@@ -1253,7 +1310,7 @@ pub fn set_value(
     let before = store.clone();
     let r = if no_history { store.set_quiet(id, value) } else { store.update(id, value) };
     r.map_err(OpError::internal)?;
-    save(hooks, &store, &path, in_collection, Some(&before))?;
+    save(hooks, &mut store, &path, in_collection, Some(&before))?;
     Ok(SetOutcome { id })
 }
 
@@ -1286,7 +1343,7 @@ pub fn rename_node(
         store.rename(id, new_name.to_string())
     };
     r.map_err(OpError::internal)?;
-    save(hooks, &store, &path, in_collection, Some(&before))?;
+    save(hooks, &mut store, &path, in_collection, Some(&before))?;
     Ok(RenameOutcome { id, name: new_name.to_string() })
 }
 
@@ -1305,7 +1362,7 @@ pub fn remove_node(
     guard_editable(pol, &store, id)?;
     let before = store.clone();
     store.remove(id).map_err(OpError::internal)?;
-    save(hooks, &store, &path, in_collection, Some(&before))?;
+    save(hooks, &mut store, &path, in_collection, Some(&before))?;
     Ok(RemoveOutcome { id })
 }
 
@@ -1347,7 +1404,7 @@ pub fn link_nodes(
             store.update(f, XValue::Reference(t))
         };
         r.map_err(OpError::internal)?;
-        save(hooks, &store, &shard_path, true, Some(&before))?;
+        save(hooks, &mut store, &shard_path, true, Some(&before))?;
         return Ok(LinkOutcome { from: f, to: t });
     }
 
@@ -1365,7 +1422,7 @@ pub fn link_nodes(
         store.update(f, XValue::Reference(t))
     };
     r.map_err(OpError::internal)?;
-    save(hooks, &store, &path, false, None)?;
+    save(hooks, &mut store, &path, false, None)?;
     Ok(LinkOutcome { from: f, to: t })
 }
 
@@ -1409,7 +1466,7 @@ pub fn copy_node(
     }
     let opts = tree::CopyOptions { blank_values: blank, history: !no_history };
     let new_id = store.copy_subtree(id, p, &opts).map_err(OpError::internal)?;
-    save(hooks, &store, &path, false, None)?;
+    save(hooks, &mut store, &path, false, None)?;
     Ok(CopyOutcome { src_id: id, src_name: src.name, new_id, warnings })
 }
 
@@ -1482,7 +1539,7 @@ pub fn fill_values(
         };
         r.map_err(|e| OpError::internal(format!("{e}（{path_expr}）")))?;
     }
-    save(hooks, &store, &path, in_collection, Some(&before))?;
+    save(hooks, &mut store, &path, in_collection, Some(&before))?;
     Ok(FillOutcome { count: assigns.len() })
 }
 
@@ -1529,7 +1586,7 @@ pub fn prune_history(
     let bytes_after = if dry_run || report.removed == 0 {
         bytes_before
     } else {
-        save(hooks, &store, &path, in_collection, None)?;
+        save(hooks, &mut store, &path, in_collection, None)?;
         std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
     };
     Ok(PruneHistoryOutcome {
@@ -1565,7 +1622,7 @@ pub fn revert_node(
         let name = store.get(id).map(|n| n.name.clone()).unwrap_or_default();
         return Ok(RevertOutcome { id, name, no_snapshot: Some(e) });
     }
-    save(hooks, &store, &path, false, None)?;
+    save(hooks, &mut store, &path, false, None)?;
     let name = store.get(id).map(|n| n.name.clone()).unwrap_or_default();
     Ok(RevertOutcome { id, name, no_snapshot: None })
 }
@@ -1592,7 +1649,7 @@ pub fn blob_import(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "blob".to_string());
     let n = store.create(p, &name, XValue::Blob(bytes), true);
-    save(hooks, &store, &path, false, None)?;
+    save(hooks, &mut store, &path, false, None)?;
     Ok(BlobImportOutcome { id: n.id, name })
 }
 
@@ -1838,9 +1895,7 @@ pub fn template_define(
         return Err(OpError::invalid(format!("模板已存在：{name}（先删再建）")));
     }
     let id = build_template(&mut store, None, name, sample).map_err(OpError::invalid)?;
-    store.save(&path).map_err(|e| OpError::internal(e.to_string()))?;
-    hooks.on_save(&path, &store);
-    update_index(&path);
+    save(hooks, &mut store, &path, false, None)?;
     Ok(TemplateDefineOutcome { id, name: name.to_string() })
 }
 
@@ -1890,7 +1945,7 @@ pub fn template_remove(
         store.remove_subtree(*id).map_err(OpError::internal)?;
     }
     store.remove_subtree(tpl_id).map_err(OpError::internal)?;
-    save(hooks, &store, &path, false, None)?;
+    save(hooks, &mut store, &path, false, None)?;
     Ok(TemplateRemoveOutcome { name: tpl_name, id: tpl_id, removed_instances: inst_ids.len() })
 }
 
@@ -1908,7 +1963,7 @@ pub fn import_append(
     let (mut store, path) = load(pol, hooks, file)?;
     let p = parse_parent(parent)?;
     build_json_tree(&mut store, p, value).map_err(OpError::invalid)?;
-    save(hooks, &store, &path, false, None)?;
+    save(hooks, &mut store, &path, false, None)?;
     Ok(ImportAppendOutcome { nodes_after: store.len() })
 }
 
@@ -1933,7 +1988,7 @@ pub fn import_instances(
     for rec in records {
         instantiate(&mut store, tpl_id, inst_parent, rec).map_err(OpError::invalid)?;
     }
-    save(hooks, &store, &path, false, None)?;
+    save(hooks, &mut store, &path, false, None)?;
     Ok(ImportInstancesOutcome { template_id: tpl_id, template_name: tpl_name, count: records.len() })
 }
 

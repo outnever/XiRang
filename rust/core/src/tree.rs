@@ -26,11 +26,68 @@ pub struct Store {
     index: HashMap<Uuid, usize>, // UUID -> nodes 下标
     /// 父 UUID -> 子节点下标（按追加序）。避免每次 children 都扫全表（P34：O(N²)）。
     children_of: HashMap<Uuid, Vec<usize>>,
+    /// 写入日志：本次改动碰过谁（只追加写靠它算「往文件末尾补哪几条」）。
+    journal: Journal,
+}
+
+/// 写入日志：本次改动碰过的编号 → 改动**前**的样子（`None` = 改动前不存在）。
+///
+/// 「只追加写」靠它算出要往文件末尾补哪几条，**不必克隆整棵树**
+/// （347 万节点克隆一次要 1–2 秒、约 1 GB 内存，会把省下的时间吃回去）。
+/// 读路径不写它；`Store::load` / `fold` 建出来的 Store 日志是空的。
+#[derive(Default, Clone, Debug)]
+pub struct Journal {
+    /// 碰过的编号，按第一次碰到的顺序（追加写就按这个顺序写，稳定可测）。
+    order: Vec<Uuid>,
+    before: HashMap<Uuid, Option<Node>>,
+    /// 被**物理删掉**的编号（`rm` 是置空、不算；裁剪留痕 / 删子树才算）。
+    removed: HashSet<Uuid>,
+}
+
+impl Journal {
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty() && self.removed.is_empty()
+    }
+    /// 碰过的编号，按第一次碰到的顺序。
+    pub fn order(&self) -> &[Uuid] {
+        &self.order
+    }
+    /// 改动前的样子；`None` = 改动前不存在（本次新建的）。
+    pub fn before(&self, id: Uuid) -> Option<&Node> {
+        self.before.get(&id).and_then(|x| x.as_ref())
+    }
+    /// 物理删掉的编号。
+    pub fn removed(&self) -> &HashSet<Uuid> {
+        &self.removed
+    }
+    /// 记下「碰过谁」。同一个编号只记第一次（那才是改动前的样子）。
+    fn touch(&mut self, id: Uuid, prev: Option<Node>) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.before.entry(id) {
+            self.order.push(id);
+            e.insert(prev);
+        }
+    }
 }
 
 impl Store {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 本次改动碰过谁（写路径的「要落盘的变化」）。
+    pub fn journal(&self) -> &Journal {
+        &self.journal
+    }
+
+    /// 落盘之后清空写入日志（避免下次误当成「还有变化没写」）。
+    pub fn clear_journal(&mut self) {
+        self.journal = Journal::default();
+    }
+
+    /// 改动前记一笔（原位改值 / 改名 / 置空之前调）。
+    fn touch(&mut self, id: Uuid) {
+        let prev = self.get(id).cloned();
+        self.journal.touch(id, prev);
     }
 
     pub fn add(&mut self, node: Node) {
@@ -39,6 +96,7 @@ impl Store {
             self.children_of.entry(p).or_default().push(i);
         }
         self.index.insert(node.id, i);
+        self.journal.touch(node.id, None);
         self.nodes.push(node);
     }
 
@@ -183,6 +241,7 @@ impl Store {
         if self.nodes[idx].value == new_value {
             return Ok(()); // 值相同 = 无变化，不记录
         }
+        self.touch(node_id);
         let history = self.ensure_history(node_id);
         let snap = Node {
             id: Uuid::random_v4(),
@@ -203,6 +262,7 @@ impl Store {
         if self.nodes[idx].value == new_value {
             return Ok(());
         }
+        self.touch(node_id);
         self.nodes[idx].value = new_value;
         Ok(())
     }
@@ -217,6 +277,7 @@ impl Store {
         if self.nodes[idx].name == new_name {
             return Ok(());
         }
+        self.touch(node_id);
         self.nodes[idx].name = new_name;
         Ok(())
     }
@@ -224,6 +285,7 @@ impl Store {
     /// 回滚：直接把节点的名字 + 值恢复为指定内容（不回写 @history）。
     pub fn restore(&mut self, node_id: Uuid, name: String, value: Value) -> Result<(), String> {
         let idx = *self.index.get(&node_id).ok_or("节点不存在")?;
+        self.touch(node_id);
         self.nodes[idx].name = name;
         self.nodes[idx].value = value;
         Ok(())
@@ -253,6 +315,7 @@ impl Store {
         // 回滚本身也留痕：把当前状态快照进 @history（+@replaced），这样「每次修改都留痕」对回滚也成立。
         let cur_name = self.nodes[idx].name.clone();
         let cur_value = self.nodes[idx].value.clone();
+        self.touch(node_id);
         let snap = Node {
             id: Uuid::random_v4(),
             parent: Some(hist_id),
@@ -275,6 +338,7 @@ impl Store {
         if self.nodes[idx].name == new_name {
             return Ok(()); // 同名 = 无变化，不记录
         }
+        self.touch(node_id);
         let history = self.ensure_history(node_id);
         let snap = Node {
             id: Uuid::random_v4(),
@@ -295,6 +359,7 @@ impl Store {
         if self.nodes[idx].name.is_empty() && self.nodes[idx].value == Value::Empty {
             return Ok(()); // 已是空节点，没得删，不记录
         }
+        self.touch(node_id);
         let history = self.ensure_history(node_id);
         let snap = Node {
             id: Uuid::random_v4(),
@@ -431,6 +496,8 @@ impl Store {
         let to_remove: HashSet<Uuid> = self.subtree(&root).into_iter().map(|n| n.id).collect();
         self.nodes.retain(|n| !to_remove.contains(&n.id));
         self.rebuild_index();
+        // 物理删除：追加写表达不了「记录真的没了」，调用方要退回整份重写
+        self.journal.removed.extend(to_remove);
         Ok(())
     }
 
@@ -537,6 +604,7 @@ impl Store {
             let node = codec::decode_node(data, &mut off)?;
             store.add(node);
         }
+        store.clear_journal(); // 读进来的不算「本次改动」
         Ok(store)
     }
 
@@ -634,6 +702,7 @@ pub fn fold(store: &Store) -> Store {
     for (_, n) in items {
         out.add(n);
     }
+    out.clear_journal(); // 折叠出来的 Store 只是「当前视图」，不是改动
     out
 }
 

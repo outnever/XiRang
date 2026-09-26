@@ -1447,11 +1447,24 @@ pub fn files_status(ws_root: &Path) -> Result<Vec<FileStatus>, String> {
 /// 增量修复：只重扫指纹变了的文件（自愈），再顺带清理已消失的文件。
 /// 返回（更新的文件数，追加的条目数，清理的文件数）。
 pub fn update(ws_root: &Path) -> Result<(usize, u64, usize), String> {
-    let stale: Vec<PathBuf> = files_status(ws_root)?
+    let mut stale: Vec<PathBuf> = files_status(ws_root)?
         .into_iter()
         .filter(|f| f.exists && !f.fresh)
         .map(|f| PathBuf::from(f.path))
         .collect();
+    // 还没登记过的文件也要补上：否则「大文件的登记挪到后台」会永远不登记它
+    // （`append_file` 是唯一的入口，`update` 只管「已登记但指纹变了」的）。
+    let known: HashSet<String> = read_manifest(&index_dir(ws_root))?
+        .files
+        .iter()
+        .map(|f| f.path.clone())
+        .collect();
+    for p in collect_data_files(ws_root) {
+        let abs = p.canonicalize().unwrap_or_else(|_| p.clone());
+        if !known.contains(&abs.to_string_lossy().into_owned()) && !stale.contains(&p) {
+            stale.push(p);
+        }
+    }
     let mut entries = 0u64;
     for p in &stale {
         entries += append_file(ws_root, p)?.loc;

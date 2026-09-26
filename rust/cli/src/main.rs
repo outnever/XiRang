@@ -68,6 +68,35 @@ fn index_enabled() -> bool {
     INDEX_ENABLED.load(Ordering::Relaxed)
 }
 
+/// 超过这个体积的文件，本机目录登记也挪到后台：登记 = 把整份文件的编号写进小册子
+/// （347 万节点约 4–6 秒）。目录也只是缓存，晚几十秒跟上没有数据风险。
+const BACKGROUND_CATALOG_MIN_BYTES: u64 = 20 * 1024 * 1024;
+
+/// 起一个后台的 `xr catalog scan <文件>`。只有确实找到同目录的 `xr` 才做——
+/// 桌面端进程里没有这个子命令，绝不能让 App 自己再起一个自己。
+fn spawn_background_catalog_scan(path: &Path) -> bool {
+    if std::env::var("XIRANG_INDEX_MAINTENANCE").map(|v| v == "off").unwrap_or(false) {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let xr = exe.with_file_name("xr");
+    if !xr.is_file() {
+        return false;
+    }
+    std::process::Command::new(xr)
+        .arg("catalog")
+        .arg("scan")
+        .arg(path)
+        .env("XIRANG_INDEX_MAINTENANCE", "off") // 防递归
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
 /// 把一个已加载的 Store 增量登记进本机目录（尽力而为，失败静默）。
 fn index_store(file: &str, store: &tree::Store) {
     if !index_enabled() {
@@ -88,6 +117,12 @@ fn index_store(file: &str, store: &tree::Store) {
         .unwrap_or_else(|| file.to_string());
     let cpath = catalog::default_path();
     if catalog::Catalog::is_fresh(&cpath, &abs, fp) {
+        return;
+    }
+    if fp.size >= BACKGROUND_CATALOG_MIN_BYTES && spawn_background_catalog_scan(p) {
+        eprintln!(
+            "（本机目录登记已在后台进行，命令先返回；XIRANG_INDEX=off 可关闭本机目录）"
+        );
         return;
     }
     let mut cat = catalog::Catalog::load(&cpath).unwrap_or_default();
@@ -1689,6 +1724,8 @@ fn cmd_compact(dir: &str, all: bool) -> i32 {
                     "  记录: {raw} → {folded}（折叠掉 {} 条历史记录）",
                     raw.saturating_sub(folded)
                 );
+                // 压实是「整份重写」：文件指纹变了，台账要重新跟上（大文件会转后台）
+                ops::update_index(plain);
                 0
             }
             Err(e) => {
@@ -1728,6 +1765,7 @@ fn cmd_compact(dir: &str, all: bool) -> i32 {
                 eprintln!("错误：{err}");
                 return 2;
             }
+            ops::update_index(&path); // 整份重写后让台账重新跟上
             compacted += 1;
         }
     }
@@ -1960,6 +1998,7 @@ fn cmd_catalog_check_sync(uuid_str: &str, base: &str) -> i32 {
             eprintln!("写回失败 {f}：{e}");
             return 2;
         }
+        ops::update_index(Path::new(f)); // 写回了就重新跟上台账
         println!("已同步 {f}（自身 → {}）", label_brief(&base_node));
         changed += 1;
     }

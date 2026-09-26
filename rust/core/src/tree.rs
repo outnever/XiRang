@@ -706,6 +706,61 @@ pub fn fold(store: &Store) -> Store {
     out
 }
 
+/// 折叠一个数据文件的摘要（预演和实际落盘都用它）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FoldPlan {
+    /// 折叠前的记录条数（同一个编号可能有好几条）。
+    pub records_before: usize,
+    /// 折叠后的记录条数（一个编号一条）。
+    pub records_after: usize,
+    pub bytes_before: u64,
+    /// 折叠后文件的字节数（预演时是算出来的；实际落盘后按真实文件长度回报）。
+    pub bytes_after: u64,
+}
+
+impl FoldPlan {
+    /// 折掉了多少条历史记录。
+    pub fn folded_records(&self) -> usize {
+        self.records_before.saturating_sub(self.records_after)
+    }
+    /// 有没有真的折掉东西（没有 = 本来就没有重复记录）。
+    pub fn changed(&self) -> bool {
+        self.records_before != self.records_after
+    }
+}
+
+/// **只算不写**：折叠这个数据文件会变成什么样（`xr compact <文件> --dry-run` 用）。
+pub fn fold_prepare(path: &Path) -> Result<(Store, FoldPlan), String> {
+    let bytes_before = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let raw = Store::load(path)?;
+    let folded = fold(&raw);
+    let encoded = make_file(&folded.encode()?);
+    let plan = FoldPlan {
+        records_before: raw.len(),
+        records_after: folded.len(),
+        bytes_before,
+        bytes_after: encoded.len() as u64,
+    };
+    Ok((folded, plan))
+}
+
+/// 折叠一个数据文件：同一个编号只留最后一条记录（后写覆盖），整份重写回去。
+///
+/// 折叠**不改变任何读得到的结果**（读的人本来就是取最后一条），所以它不是破坏性操作。
+/// 落盘走 [`Store::save`]（临时文件 + 改名，原子）。
+pub fn fold_file(path: &Path) -> Result<FoldPlan, String> {
+    let (folded, mut plan) = fold_prepare(path)?;
+    if plan.changed() {
+        folded.save(path).map_err(|e| e.to_string())?;
+        // 落盘后的真实长度（写文件头等细节以实际为准）
+        plan.bytes_after = std::fs::metadata(path).map(|m| m.len()).unwrap_or(plan.bytes_after);
+    } else {
+        // 没有重复记录：一个字节都不写（写了会白白改掉 mtime，让台账变成「指纹不符」）
+        plan.bytes_after = plan.bytes_before;
+    }
+    Ok(plan)
+}
+
 /// 节点数据段在文件里的绝对起始偏移（魔数 4 + 版本 1 + 头长 4 + 头文本）。
 pub fn node_data_start(data: &[u8]) -> Result<u64, String> {
     if data.len() < 9 {

@@ -81,11 +81,19 @@ fn set_appends_instead_of_rewriting() {
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("一致"), "{out}");
 
-    // 压实：折叠回一条记录、文件变小，读出来的还是最后那个值
+    // 折叠（压实）：先预演（不动文件），再真折（变小），读出来的还是最后那个值
     let folded_before = size(&root);
+    let (code, out, err) = run(&root, &["compact", "a.xirang", "--dry-run"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("预演"), "预演要说明自己在预演：{out}");
+    assert!(out.contains("不跨文件"), "输出要写明折叠口径：{out}");
+    assert!(out.contains("字节:"), "输出要报「字节多少 → 多少」：{out}");
+    assert_eq!(size(&root), folded_before, "预演不能动文件");
+
     let (code, out, err) = run(&root, &["compact", "a.xirang"]);
     assert_eq!(code, 0, "{err}");
-    assert!(out.contains("已合并"), "{out}");
+    assert!(out.contains("已折叠"), "{out}");
+    assert!(out.contains("记录:") && out.contains("字节:"), "{out}");
     assert!(size(&root) < folded_before, "压实后应该变小");
     let (_, out, _) = run(&root, &["find", "a.xirang", "第2次"]);
     assert!(out.contains(&id), "压实后值还得在：{out}");

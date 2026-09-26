@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use eframe::egui;
 use xirang_core::codec::{parse_value, Node, Uuid, Value};
-use xirang_core::index::compact_file;
+use xirang_core::tree::fold_file;
 use xirang_core::tree::Store;
 
 use xirang_app::edit;
@@ -640,16 +640,20 @@ impl App {
     fn compact_active(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let path = tab.path.clone();
-        match compact_file(&path) {
-            Ok((raw, folded)) => {
+        match fold_file(&path) {
+            Ok(plan) => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let _ = tab.doc.reload();
                 }
                 self.rows_dirty = true;
                 self.graph_dirty = true;
                 self.status = format!(
-                    "已合并：记录 {raw} → {folded}（折叠掉 {} 条历史记录）",
-                    raw.saturating_sub(folded)
+                    "已折叠：记录 {} → {}（折叠掉 {} 条）· 字节 {} → {}",
+                    plan.records_before,
+                    plan.records_after,
+                    plan.folded_records(),
+                    plan.bytes_before,
+                    plan.bytes_after
                 );
             }
             Err(e) => self.error = Some(e),

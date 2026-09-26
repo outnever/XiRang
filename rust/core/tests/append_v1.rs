@@ -3,10 +3,8 @@
 use std::path::PathBuf;
 
 use xirang_core::codec::{Node, Uuid, Value};
-use xirang_core::index::{
-    build, compact_file, read_node_at, sidecar_path, AppendWriter, Sidecar,
-};
-use xirang_core::tree::{self, Store};
+use xirang_core::index::{build, read_node_at, sidecar_path, AppendWriter, Sidecar};
+use xirang_core::tree::{self, fold_file, Store};
 
 
 /// 本文件的测试验的是 **侧车后端** 上的 append-v1 增量（修订块 / 尾部残片）。
@@ -174,9 +172,9 @@ fn compact_file_folds_revisions_and_keeps_view() {
     let before = std::fs::metadata(&p).unwrap().len();
     assert!(Sidecar::open_for(&p).unwrap().rev_count >= 5);
 
-    let (raw, folded) = compact_file(&p).unwrap();
-    assert_eq!(raw, 7, "原始记录 = 2 基版 + 5 修订");
-    assert_eq!(folded, 2, "折叠后只剩两个编号");
+    let plan = fold_file(&p).unwrap();
+    assert_eq!(plan.records_before, 7, "原始记录 = 2 基版 + 5 修订");
+    assert_eq!(plan.records_after, 2, "折叠后只剩两个编号");
     assert!(std::fs::metadata(&p).unwrap().len() < before, "文件变小");
 
     let sc = Sidecar::open_for(&p).unwrap();

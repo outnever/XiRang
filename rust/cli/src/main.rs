@@ -1713,19 +1713,30 @@ fn cmd_collection_list(dir: &str) -> i32 {
     0
 }
 
-fn cmd_compact(dir: &str, all: bool) -> i32 {
-    // 单文件：折叠掉 append-v1 累积的历史记录（整份重写 = 顺手合并）
+/// 折叠（压实的单文件形态）：只折叠**这一个文件内部**同一编号的多份记录
+/// （后写覆盖），不跨文件、不合并编号——「同一个编号出现在多个文件里」是跨文件身份，
+/// 与这个命令无关。折叠不改变任何读得到的结果，所以它不是破坏性操作：没有 `--yes`。
+fn cmd_compact(dir: &str, all: bool, dry_run: bool) -> i32 {
     let plain = Path::new(dir);
     if plain.is_file() {
-        return match index::compact_file(plain) {
-            Ok((raw, folded)) => {
-                println!("已合并：{dir}");
+        return match if dry_run { tree::fold_prepare(plain).map(|(_, p)| p) } else { tree::fold_file(plain) } {
+            Ok(p) => {
+                println!("{}已折叠：{dir}", if dry_run { "（预演）" } else { "" });
+                println!("  只折叠这一个文件内部同一编号的多份记录；不跨文件、不合并编号");
                 println!(
-                    "  记录: {raw} → {folded}（折叠掉 {} 条历史记录）",
-                    raw.saturating_sub(folded)
+                    "  记录: {} → {}（折叠掉 {} 条）",
+                    p.records_before,
+                    p.records_after,
+                    p.folded_records()
                 );
-                // 压实是「整份重写」：文件指纹变了，台账要重新跟上（大文件会转后台）
-                ops::update_index(plain);
+                println!("  字节: {} → {}", p.bytes_before, p.bytes_after);
+                if !p.changed() {
+                    println!("  （没有重复记录，本来就折叠好了：一个字节都没改）");
+                }
+                if !dry_run && p.changed() {
+                    // 折叠是「整份重写」：文件指纹变了，台账要重新跟上（大文件会转后台）
+                    ops::update_index(plain);
+                }
                 0
             }
             Err(e) => {
@@ -1750,26 +1761,43 @@ fn cmd_compact(dir: &str, all: bool) -> i32 {
         }
     };
     let mut compacted = 0;
+    let mut records_before = 0usize;
+    let mut records_after = 0usize;
+    let mut bytes_before = 0u64;
+    let mut bytes_after = 0u64;
     for e in &manifest.shards {
         let path = Path::new(dir).join(&e.filename);
-        let raw = match tree::Store::load_view(&path) {
-            Ok(s) => s,
+        let (folded, plan) = match tree::fold_prepare(&path) {
+            Ok(v) => v,
             Err(err) => {
                 eprintln!("错误：{err}");
                 return 2;
             }
         };
-        let folded = shard::fold(&raw);
-        if all || folded.len() != raw.len() {
-            if let Err(err) = save_store(&folded, &path) {
-                eprintln!("错误：{err}");
-                return 2;
+        if all || plan.changed() {
+            records_before += plan.records_before;
+            records_after += plan.records_after;
+            bytes_before += plan.bytes_before;
+            bytes_after += plan.bytes_after;
+            if !dry_run {
+                if let Err(err) = save_store(&folded, &path) {
+                    eprintln!("错误：{err}");
+                    return 2;
+                }
+                ops::update_index(&path); // 整份重写后让台账重新跟上
             }
-            ops::update_index(&path); // 整份重写后让台账重新跟上
             compacted += 1;
         }
     }
-    println!("已合并 {compacted} 个分片");
+    println!("{}已折叠 {compacted} 个分片", if dry_run { "（预演）" } else { "" });
+    if compacted > 0 {
+        println!(
+            "  只折叠各分片内部同一编号的多份记录；不跨文件、不合并编号\n  \
+             记录: {records_before} → {records_after}（折叠掉 {} 条）\n  \
+             字节: {bytes_before} → {bytes_after}",
+            records_before.saturating_sub(records_after)
+        );
+    }
     0
 }
 
@@ -2152,7 +2180,11 @@ fn usage() {
     println!("      （XIRANG_INDEX_MODE=sidecar 时退化为每文件 .idx 的维护；默认是工作区台账）");
     println!("  xr collection split <file> --rule <规则> [--out <dir>]   无损拆成 shard 词库");
     println!("  xr collection list <dir>            列出 shard 词库分片");
-    println!("  xr compact <dir> [--all]            合并分片的覆盖日志");
+    println!("  xr compact <文件|目录> [--all] [--dry-run]");
+    println!("                                      折叠覆盖记录：<文件> 只折叠这一个文件内部");
+    println!("                                      同一编号的多份记录，不跨文件、不合并编号；");
+    println!("                                      <目录> 折叠各分片。--all 连没重复的也重写，");
+    println!("                                      --dry-run 只预演（折叠不改变读得到的结果，无 --yes）");
     println!("  xr catalog scan [路径...]           扫描文件/目录进本机目录");
     println!("  xr catalog list                     列出本机目录的文件");
     println!("  xr catalog check                    列出同编号但自身名字/值不一致的编号（附两边孩子）");
@@ -2570,7 +2602,7 @@ fn main() {
                 usage();
                 2
             } else {
-                cmd_compact(&args[2], has_flag(&args, "--all"))
+                cmd_compact(&args[2], has_flag(&args, "--all"), has_flag(&args, "--dry-run"))
             }
         }
         "catalog" => {

@@ -1104,14 +1104,6 @@ impl AppendWriter {
     }
 }
 
-/// 合并（compact）：折叠掉同一编号的历史记录，重写文件 + 重建索引。
-pub fn compact_file(path: &Path) -> Result<(usize, usize), String> {
-    let raw = Store::load(path)?;
-    let folded = tree::fold(&raw);
-    folded.save(path).map_err(|e| e.to_string())?;
-    Ok((raw.len(), folded.len()))
-}
-
 /// 从源文件按「相对偏移 + 字节长」读出单个节点（只读这一段，不整读文件）。
 pub fn read_node_at(
     path: &Path,

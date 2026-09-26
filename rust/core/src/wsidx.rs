@@ -698,6 +698,13 @@ fn append_rec(f: &mut File, kind: u8, payload: &[u8]) -> std::io::Result<u64> {
     Ok(o.len() as u64)
 }
 
+/// 同样的记录格式，但攒进缓冲区（供「一次 write」的批量追加用）。
+fn push_rec(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.push(kind);
+    out.extend_from_slice(payload);
+}
+
 /// 删掉某一本里「不属于当前 manifest」的块（换完 manifest 之后调用）。
 fn remove_other_blocks(dir: &Path, kind: u8, keep: &LedgerInfo) {
     let prefix = format!("{}-", ledger_name(kind));
@@ -903,14 +910,19 @@ fn append_file_locked(dir: &Path, data_path: &Path) -> Result<Stats, String> {
     let mut written = 0u64;
     for kind in [KIND_LOC, KIND_REL, KIND_REV] {
         ensure_log(dir, kind)?;
+        // 攒成一个缓冲区、一次 write：逐条 append_rec 在 347 万节点上是约 700 万次系统调用
+        // （实测 18 秒里有 15 秒花在这里），批量写之后降到几秒以内。
+        let mut buf: Vec<u8> = Vec::new();
+        push_rec(&mut buf, REC_FILE, &rec_bytes);
+        for b in entries.bytes(kind) {
+            push_rec(&mut buf, REC_ENTRY, &b);
+        }
         let mut f = OpenOptions::new()
             .append(true)
             .open(log_path(dir, kind))
             .map_err(|e| e.to_string())?;
-        written += append_rec(&mut f, REC_FILE, &rec_bytes).map_err(|e| e.to_string())?;
-        for b in entries.bytes(kind) {
-            written += append_rec(&mut f, REC_ENTRY, &b).map_err(|e| e.to_string())?;
-        }
+        f.write_all(&buf).map_err(|e| e.to_string())?;
+        written += buf.len() as u64;
     }
     // 日志先落，再更新 manifest：中途崩了也能靠日志里的文件记录恢复（更安全的方向）
     m.generation = new_gen;

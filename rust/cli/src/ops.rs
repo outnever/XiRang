@@ -254,15 +254,58 @@ fn save(
 /// 两个 bin 共用一个入口；「碰过哪个工作区」由调用方通过 [`ON_INDEX_TOUCH`] 挂钩接收。
 pub static ON_INDEX_TOUCH: std::sync::OnceLock<fn(std::path::PathBuf)> = std::sync::OnceLock::new();
 
+/// 大于这个体积的文件，索引登记放到后台进程做（登记要重扫全文，很贵）。
+const BACKGROUND_INDEX_MIN_BYTES: u64 = 20 * 1024 * 1024;
+
 pub fn update_index(path: &Path) {
     if xirang_core::index::sidecar_enabled() {
         return;
     }
     let ws_root = xirang_core::wsidx::workspace_root(path);
+    // 大文件：登记 = 重扫全文（179 MB / 347 万节点约 49 秒）。这一步不该挡住用户的命令，
+    // 索引只是缓存，晚几十秒跟上没有任何数据风险（指纹不符时读路径会回退并打印原因）。
+    let big = std::fs::metadata(path)
+        .map(|m| m.len() >= BACKGROUND_INDEX_MIN_BYTES)
+        .unwrap_or(false);
+    if big && spawn_background_index_update(&ws_root) {
+        eprintln!("（索引登记已在后台进行，命令先返回；XIRANG_INDEX_MAINTENANCE=off 可关闭）");
+        if let Some(f) = ON_INDEX_TOUCH.get() {
+            f(ws_root);
+        }
+        return;
+    }
     let _ = xirang_core::wsidx::append_file(&ws_root, path);
     if let Some(f) = ON_INDEX_TOUCH.get() {
         f(ws_root);
     }
+}
+
+/// 起一个后台的 `xr index update <工作区>`（和自动压实同一套路）。
+/// 只有确实找到 `xr` 可执行文件时才做——桌面端进程里没有这个子命令，绝不能让 App 自己再起一个自己。
+fn spawn_background_index_update(ws_root: &Path) -> bool {
+    if std::env::var("XIRANG_INDEX_MAINTENANCE")
+        .map(|v| v == "off")
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let xr = exe.with_file_name("xr");
+    if !xr.is_file() {
+        return false;
+    }
+    std::process::Command::new(xr)
+        .arg("index")
+        .arg("update")
+        .arg(ws_root)
+        .env("XIRANG_INDEX_MAINTENANCE", "off") // 防递归
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
 }
 
 /// 在词库目录里按 UUID 定位分片，读出折叠后的可编辑 Store + 该分片文件路径。

@@ -1337,6 +1337,15 @@ pub fn create_node(
 // 批量提交：一批改动一次落盘（几十万条迁移用）
 // ============================================================================
 
+/// 批量提交里「一个文件」的结果（跨分片提交时每个文件一行）。
+#[derive(Clone, Debug)]
+pub struct BatchFileOutcome {
+    pub file: String,
+    pub ops: usize,
+    pub changed: usize,
+    pub appended: usize,
+}
+
 pub struct BatchOutcome {
     /// 清单里一共多少条改动。
     pub ops: usize,
@@ -1346,6 +1355,17 @@ pub struct BatchOutcome {
     pub appended: usize,
     /// 预演：只校验不落盘。
     pub dry_run: bool,
+    /// 这次改动落到哪些文件（单文件提交时只有一项）。
+    pub files: Vec<BatchFileOutcome>,
+}
+
+/// 批量提交的开关（用结构体，免得一长串 bool 传错位置）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BatchOptions {
+    pub no_history: bool,
+    pub dry_run: bool,
+    /// 允许写「悬空引用」（目标在本工作区与本机目录里都找不到）。
+    pub allow_missing_target: bool,
 }
 
 /// 批量清单的一行（JSON）→ 一条改动。
@@ -1357,6 +1377,7 @@ pub struct BatchOutcome {
 /// {"op":"link","id":"<编号>","to":"<目标编号>"}      // 改引用
 /// {"op":"rename","id":"<编号>","name":"新名字"}
 /// {"op":"rm","id":"<编号>"}
+/// {"op":"rm_subtree","id":"<编号>"}   // 连子树一起清空（每个节点都留空；有留痕时可逐个 revert）
 /// ```
 pub fn parse_batch_item(v: &JsonValue, at: &str) -> Result<xirang_core::edit::BatchOp, String> {
     let obj = v
@@ -1427,8 +1448,9 @@ pub fn parse_batch_item(v: &JsonValue, at: &str) -> Result<xirang_core::edit::Ba
             Ok(xirang_core::edit::BatchOp::Rename { id, name: name.to_string() })
         }
         "rm" | "remove" => Ok(xirang_core::edit::BatchOp::Remove { id }),
+        "rm_subtree" | "retire" => Ok(xirang_core::edit::BatchOp::RmSubtree { id }),
         other => Err(format!(
-            "{at}：不认识的 op「{other}」（可用 set / link / rename / rm）"
+            "{at}：不认识的 op「{other}」（可用 set / link / rename / rm / rm_subtree）"
         )),
     }
 }
@@ -1471,28 +1493,140 @@ pub struct SetOutcome {
 pub fn batch_edit(
     pol: &Policy,
     hooks: &dyn Hooks,
-    file: &str,
+    target: &str,
     ops: &[xirang_core::edit::BatchOp],
-    no_history: bool,
-    dry_run: bool,
+    opts: BatchOptions,
 ) -> OpResult<BatchOutcome> {
-    let path = pol.resolve(file)?;
-    if path.is_dir() {
-        return Err(OpError::invalid(
-            "批量提交一次只对一个 .xirang 文件；词库目录请按分片分别提交",
-        ));
-    }
-    let out = xirang_core::edit::apply_batch(&path, ops, !no_history, pol.force, dry_run)
+    let path = pol.resolve(target)?;
+    // 单文件：整批都落在这一个文件里
+    if !path.is_dir() {
+        let out = xirang_core::edit::apply_batch(
+            &path,
+            ops,
+            !opts.no_history,
+            pol.force,
+            opts.dry_run,
+            opts.allow_missing_target,
+        )
         .map_err(OpError::invalid)?;
-    if !dry_run {
-        hooks.on_save(&path, None); // 没有编号表：目录登记转后台
-        update_index(&path);
+        if !opts.dry_run {
+            hooks.on_save(&path, None); // 没有编号表：目录登记转后台
+            update_index(&path);
+        }
+        return Ok(BatchOutcome {
+            ops: ops.len(),
+            changed: out.changed,
+            appended: out.appended,
+            dry_run: opts.dry_run,
+            files: vec![BatchFileOutcome {
+                file: path.display().to_string(),
+                ops: ops.len(),
+                changed: out.changed,
+                appended: out.appended,
+            }],
+        });
+    }
+
+    // 目录（词库分片）：按编号把每条改动分派到它所在的分片，再一个分片一个分片地跑
+    let ws_root = xirang_core::wsidx::workspace_root(&path);
+    // 先把目录里的数据文件登记一遍：复制过来的干净分片目录天然没登记
+    // （已登记且新鲜的文件会被跳过，所以这一步很廉价）。
+    // 注意不能只看「台账文件在不在」——台账可能是空的，那也算「在」。
+    let _ = xirang_core::wsidx::update(&ws_root);
+    let dir = path.canonicalize().unwrap_or_else(|_| path.clone());
+    let mut groups: Vec<(PathBuf, Vec<xirang_core::edit::BatchOp>)> = Vec::new();
+    {
+        let mut r = xirang_core::wsidx::Reader::open(&ws_root).map_err(OpError::internal)?;
+        for (i, op) in ops.iter().enumerate() {
+            let id = op.id();
+            let hits: Vec<PathBuf> = r
+                .locate(id)
+                .map_err(OpError::internal)?
+                .into_iter()
+                .map(|h| PathBuf::from(h.file))
+                .filter(|p| p.parent().map(|d| d == dir).unwrap_or(false))
+                .collect();
+            let at = i + 1;
+            match hits.len() {
+                0 => {
+                    return Err(OpError::invalid(format!(
+                        "第 {at} 条：编号 {id} 不在 {} 里的任何已登记文件里（先跑 xr index update 试试）",
+                        path.display()
+                    )))
+                }
+                1 => {
+                    let f = hits.into_iter().next().unwrap();
+                    match groups.iter_mut().find(|(p, _)| *p == f) {
+                        Some((_, v)) => v.push(op.clone()),
+                        None => groups.push((f, vec![op.clone()])),
+                    }
+                }
+                _ => {
+                    let names: Vec<String> =
+                        hits.iter().map(|p| p.display().to_string()).collect();
+                    return Err(OpError::invalid(format!(
+                        "第 {at} 条：编号 {id} 同时出现在多个文件里（{}）——同一个编号在多个文件里是正常的跨文件身份，\
+                         请分别对这两个文件提交",
+                        names.join("、")
+                    )));
+                }
+            }
+        }
+    }
+
+    // 先整批校验（每个文件都预演一遍）：任何一个文件过不去，就一个字节都不写
+    for (file, group) in &groups {
+        xirang_core::edit::apply_batch(
+            file,
+            group,
+            !opts.no_history,
+            pol.force,
+            true,
+            opts.allow_missing_target,
+        )
+        .map_err(|e| OpError::invalid(format!("{}：{e}", file.display())))?;
+    }
+
+    let mut files: Vec<BatchFileOutcome> = Vec::new();
+    let mut done: Vec<String> = Vec::new();
+    for (file, group) in &groups {
+        let out = match xirang_core::edit::apply_batch(
+            file,
+            group,
+            !opts.no_history,
+            pol.force,
+            opts.dry_run,
+            opts.allow_missing_target,
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                // 分片之间做不到整体事务：说清哪个成了、哪个没成，方便重跑
+                return Err(OpError::internal(format!(
+                    "{} 失败：{e}\n（本次已完成的文件：{}；失败的文件可以修好清单后重新提交，\
+                     批量是按「编号 + 文件」去重的，重跑同一份清单不会重复改）",
+                    file.display(),
+                    if done.is_empty() { "无".to_string() } else { done.join("、") }
+                )));
+            }
+        };
+        if !opts.dry_run {
+            hooks.on_save(file, None);
+            update_index(file);
+            done.push(file.display().to_string());
+        }
+        files.push(BatchFileOutcome {
+            file: file.display().to_string(),
+            ops: group.len(),
+            changed: out.changed,
+            appended: out.appended,
+        });
     }
     Ok(BatchOutcome {
         ops: ops.len(),
-        changed: out.changed,
-        appended: out.appended,
-        dry_run,
+        changed: files.iter().map(|f| f.changed).sum(),
+        appended: files.iter().map(|f| f.appended).sum(),
+        dry_run: opts.dry_run,
+        files,
     })
 }
 

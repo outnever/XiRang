@@ -138,10 +138,25 @@ pub fn append_records(path: &Path, records: &[Node]) -> Result<usize, String> {
 /// 写之前先收拾干净：让台账跟上文件，并把尾部残片（F015，上次写崩留下的半条记录）
 /// 截到最后一条完整记录——否则新的追加会落在残片后面，把残片夹在中间。
 ///
-/// 台账不可用时返回 `Err`（调用方可以忽略：那就下次再说）。
+/// **文件还没登记过（或台账对不上）时会就地整份登记一次**：迁移的第一步
+/// 往往就是「复制一份词库到干净目录再改」，复制出来的文件天然没登记，
+/// 不该把用户卡在第一步。
 pub fn prepare(path: &Path) -> Result<(), String> {
     let ws_root = wsidx::workspace_root(path);
-    let t = wsidx::append_tail(&ws_root, path)?;
+    let t = match wsidx::append_tail(&ws_root, path) {
+        Ok(t) => t,
+        Err(_) => {
+            // 整份登记一次再对齐；还是不行就把两条修复命令都告诉用户
+            wsidx::append_file(&ws_root, path).map_err(|e| {
+                format!(
+                    "{e}（台账对不上，且自动整份登记失败；可手动跑 `xr index update` 或 `xr index rebuild`）"
+                )
+            })?;
+            wsidx::append_tail(&ws_root, path).map_err(|e| {
+                format!("{e}（自动整份登记之后仍对不上；可手动跑 `xr index update` 或 `xr index rebuild`）")
+            })?
+        }
+    };
     if t.truncated_bytes > 0 {
         let f = fs::OpenOptions::new()
             .write(true)
@@ -278,6 +293,12 @@ pub enum BatchOp {
     Rename { id: Uuid, name: String },
     /// 删：名字与值置空（记录还在，编号不消失）。
     Remove { id: Uuid },
+    /// 连整棵子树一起清空：子树里每个节点都追加一条「空」记录。
+    ///
+    /// 与 `Remove` 一样是「置空」而不是物理删除（追加写的固有语义），
+    /// 但整棵树从正文视图里消失；**留痕打开时每个节点都会记一条快照**，
+    /// 所以事后仍可用 `xr revert` 逐个还原。
+    RmSubtree { id: Uuid },
 }
 
 impl BatchOp {
@@ -286,7 +307,8 @@ impl BatchOp {
             BatchOp::Set { id, .. }
             | BatchOp::Link { id, .. }
             | BatchOp::Rename { id, .. }
-            | BatchOp::Remove { id } => *id,
+            | BatchOp::Remove { id }
+            | BatchOp::RmSubtree { id } => *id,
         }
     }
 }
@@ -300,6 +322,147 @@ pub struct BatchOutcome {
     pub appended: usize,
     /// 一共读了多少条改动（含对同一编号的多次改动）。
     pub ops: usize,
+}
+
+/// 第一遍的「计划器」：把整批算完、全部校验，一个字节都不写。
+///
+/// 为什么要缓存：几十万条改动往往共享同一批祖先、同一个引用目标，
+/// 不缓存的话每条都要顺着父链把孩子表读一遍（宽树里一次就是上万条记录）。
+struct Planner<'a> {
+    r: &'a mut wsidx::Reader,
+    want: &'a Path,
+    history: bool,
+    force: bool,
+    allow_missing_target: bool,
+    changes: Vec<Change>,
+    order: std::collections::HashMap<Uuid, usize>,
+    status: std::collections::HashMap<Uuid, bool>,
+    root_cache: std::collections::HashMap<Uuid, Uuid>,
+    protocol_cache: std::collections::HashMap<Uuid, bool>,
+    roots_done: std::collections::HashSet<Uuid>,
+    target_ok: std::collections::HashMap<Uuid, bool>,
+}
+
+impl Planner<'_> {
+    /// 拿到（必要时新建）某个编号的改动槽位，顺手把护栏、树根、留痕位置算好。
+    fn slot(&mut self, id: Uuid, at: &str) -> Result<usize, String> {
+        if let Some(k) = self.order.get(&id) {
+            return Ok(*k);
+        }
+        let hit = locate_here(self.r, self.want, id).map_err(|e| format!("{at}：{e}"))?;
+        let before = wsidx::read_node_at_hit(&hit)?;
+        // 这条记录刚读出来，直接用它判模板状态（省掉一次按编号查台账）
+        let protected = protected_in(self.r, self.want, id, Some(&before), &mut self.status, 0)?;
+        if protected && !self.force {
+            return Err(format!(
+                "{at}：编号 {id} 属于模板定义，不能直接编辑（确要改请用 --yes）"
+            ));
+        }
+        // 树根、声明要不要补、`@history` 在哪：都在第一遍查好。
+        // （第一遍文件还没被追加过，台账的「指纹新鲜」判断成立；
+        // 第二遍一旦开始追加，文件指纹就变了，再查表会落空。）
+        let root = cached_root(self.r, self.want, id, &mut self.root_cache, 0)?;
+        let needs_marker = if self.roots_done.contains(&root) {
+            false
+        } else {
+            let has = match self.protocol_cache.get(&root) {
+                Some(v) => *v,
+                None => {
+                    let v = declares_protocol_in(self.r, self.want, root, tree::PROTOCOL_APPEND)?;
+                    self.protocol_cache.insert(root, v);
+                    v
+                }
+            };
+            self.roots_done.insert(root);
+            !has
+        };
+        let hist_id = if self.history {
+            children_in_file(self.r, self.want, id)?
+                .into_iter()
+                .find(|k| k.name == "@history")
+                .map(|k| k.id)
+        } else {
+            None
+        };
+        self.changes.push(Change {
+            after: before.clone(),
+            before,
+            noop: true,
+            hist_id,
+            marker_root: if needs_marker { Some(root) } else { None },
+        });
+        let idx = self.changes.len() - 1;
+        self.order.insert(id, idx);
+        Ok(idx)
+    }
+
+    /// 把某个槽位改成「算完之后的样子」。
+    fn set_after(&mut self, idx: usize, f: impl FnOnce(&Node) -> Node) {
+        let cur = self.changes[idx].after.clone();
+        self.changes[idx].after = f(&cur);
+        self.changes[idx].noop = false;
+    }
+
+    /// 引用目标必须存在：本工作区（含别的分片）或本机目录里能命中就算通过。
+    fn require_target(&mut self, t: Uuid, at: &str) -> Result<(), String> {
+        if self.allow_missing_target {
+            return Ok(());
+        }
+        let ok = match self.target_ok.get(&t) {
+            Some(v) => *v,
+            None => {
+                let v = target_exists(self.r, t)?;
+                self.target_ok.insert(t, v);
+                v
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "{at}：引用目标 {t} 在本工作区（含其它分片）与本机目录里都找不到；\
+                 确要写悬空引用请加 --allow-missing-target"
+            ))
+        }
+    }
+
+    /// 连子树一起清空：这一棵里的每个节点都追加一条「空」记录。
+    fn retire_subtree(&mut self, root: Uuid, at: &str) -> Result<(), String> {
+        let mut stack = vec![root];
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if seen.len() > 1_000_000 {
+                return Err(format!("{at}：子树超过 100 万节点，请分几次提交"));
+            }
+            let idx = self.slot(id, at)?;
+            self.set_after(idx, |cur| Node {
+                name: String::new(),
+                value: Value::Empty,
+                ..cur.clone()
+            });
+            for k in children_in_file(self.r, self.want, id)? {
+                stack.push(k.id);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 引用目标是否存在于**本工作区**（台账里任意文件都算）或本机目录里。
+fn target_exists(r: &mut wsidx::Reader, t: Uuid) -> Result<bool, String> {
+    if !r.locate(t)?.is_empty() {
+        return Ok(true);
+    }
+    // 跨工作区：本机目录只是缓存，读不到就当没有（要写这种引用就加逃生口）
+    if let Ok(mut cat) = crate::catalog::CatalogReader::open(&crate::catalog::default_path()) {
+        if let Ok(paths) = cat.lookup_all(t) {
+            return Ok(!paths.is_empty());
+        }
+    }
+    Ok(false)
 }
 
 /// 一条已经算好、等着落盘的改动。
@@ -327,6 +490,7 @@ pub fn apply_batch(
     history: bool,
     force: bool,
     dry_run: bool,
+    allow_missing_target: bool,
 ) -> Result<BatchOutcome, String> {
     let mut out = BatchOutcome { changed: 0, appended: 0, ops: ops.len() };
     if ops.is_empty() {
@@ -338,75 +502,39 @@ pub fn apply_batch(
     let mut r = wsidx::Reader::open(&ws_root)?;
 
     // —— 第一遍：全部算完 + 校验，一个字节都不写 ——
-    let mut changes: Vec<Change> = Vec::new();
-    let mut order: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
-    // 祖先状态按节点缓存：四十万条改动往往共享同一批祖先，不缓存的话
-    // 每条都要顺着父链把「孩子表」读一遍（宽树里一次就是上万条记录）。
-    let mut status: std::collections::HashMap<Uuid, bool> = std::collections::HashMap::new();
-    let mut root_cache: std::collections::HashMap<Uuid, Uuid> = std::collections::HashMap::new();
-    let mut protocol_cache: std::collections::HashMap<Uuid, bool> = std::collections::HashMap::new();
-    let mut roots_done: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut planner = Planner {
+        r: &mut r,
+        want: &want,
+        history,
+        force,
+        allow_missing_target,
+        changes: Vec::new(),
+        order: std::collections::HashMap::new(),
+        status: std::collections::HashMap::new(),
+        root_cache: std::collections::HashMap::new(),
+        protocol_cache: std::collections::HashMap::new(),
+        roots_done: std::collections::HashSet::new(),
+        target_ok: std::collections::HashMap::new(),
+    };
     for (i, op) in ops.iter().enumerate() {
         let id = op.id();
         let at = format!("第 {} 条", i + 1);
-        // 已经在本次改动里的：接着上一个状态算（保证「改两次」的结果是对的）
-        let idx = match order.get(&id) {
-            Some(k) => *k,
-            None => {
-                let hit = locate_here(&mut r, &want, id)
-                    .map_err(|e| format!("{at}：{e}"))?;
-                let before = wsidx::read_node_at_hit(&hit)?;
-                // 这条记录刚读出来，直接用它判模板状态（省掉一次按编号查台账）
-                let protected = protected_in(&mut r, &want, id, Some(&before), &mut status, 0)?;
-                if protected && !force {
-                    return Err(format!(
-                        "{at}：编号 {id} 属于模板定义，不能直接编辑（确要改请用 --yes）"
-                    ));
+        match op {
+            BatchOp::Set { value, .. } => {
+                if let Value::Reference(t) = value {
+                    planner.require_target(*t, &at)?;
                 }
-                // 树根、声明要不要补、`@history` 在哪：全在第一遍查好。
-                // （第一遍文件还没被追加过，台账的「指纹新鲜」判断成立；
-                // 第二遍一旦开始追加，文件指纹就变了，再查表会落空。）
-                let root = cached_root(&mut r, &want, id, &mut root_cache, 0)?;
-                let needs_marker = if roots_done.contains(&root) {
-                    false
-                } else {
-                    let has = match protocol_cache.get(&root) {
-                        Some(v) => *v,
-                        None => {
-                            let v =
-                                declares_protocol_in(&mut r, &want, root, tree::PROTOCOL_APPEND)?;
-                            protocol_cache.insert(root, v);
-                            v
-                        }
-                    };
-                    roots_done.insert(root);
-                    !has
-                };
-                let hist_id = if history {
-                    children_in_file(&mut r, &want, id)?
-                        .into_iter()
-                        .find(|k| k.name == "@history")
-                        .map(|k| k.id)
-                } else {
-                    None
-                };
-                changes.push(Change {
-                    after: before.clone(),
-                    before,
-                    noop: true,
-                    hist_id,
-                    marker_root: if needs_marker { Some(root) } else { None },
-                });
-                order.insert(id, changes.len() - 1);
-                changes.len() - 1
+                let idx = planner.slot(id, &at)?;
+                planner.set_after(idx, |cur| Node { value: value.clone(), ..cur.clone() });
             }
-        };
-        let after = match op {
-            BatchOp::Set { value, .. } => Node { value: value.clone(), ..changes[idx].after.clone() },
-            BatchOp::Link { to, .. } => Node {
-                value: Value::Reference(*to),
-                ..changes[idx].after.clone()
-            },
+            BatchOp::Link { to, .. } => {
+                planner.require_target(*to, &at)?;
+                let idx = planner.slot(id, &at)?;
+                planner.set_after(idx, |cur| Node {
+                    value: Value::Reference(*to),
+                    ..cur.clone()
+                });
+            }
             BatchOp::Rename { name, .. } => {
                 if name.is_empty() {
                     return Err(format!("{at}：新名字不能为空（要清空名字请用 rm）"));
@@ -414,17 +542,21 @@ pub fn apply_batch(
                 if name.as_bytes().len() > 255 {
                     return Err(format!("{at}：名字超 255 字节"));
                 }
-                Node { name: name.clone(), ..changes[idx].after.clone() }
+                let idx = planner.slot(id, &at)?;
+                planner.set_after(idx, |cur| Node { name: name.clone(), ..cur.clone() });
             }
-            BatchOp::Remove { .. } => Node {
-                name: String::new(),
-                value: Value::Empty,
-                ..changes[idx].after.clone()
-            },
-        };
-        changes[idx].noop = false;
-        changes[idx].after = after;
+            BatchOp::Remove { .. } => {
+                let idx = planner.slot(id, &at)?;
+                planner.set_after(idx, |cur| Node {
+                    name: String::new(),
+                    value: Value::Empty,
+                    ..cur.clone()
+                });
+            }
+            BatchOp::RmSubtree { .. } => planner.retire_subtree(id, &at)?,
+        }
     }
+    let mut changes = planner.changes;
     changes.retain(|c| !c.noop);
     out.changed = changes.len();
     if changes.is_empty() {

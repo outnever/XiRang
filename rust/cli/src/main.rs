@@ -665,6 +665,7 @@ fn cmd_batch(
     dry_run: bool,
     json_out: bool,
     yes: bool,
+    allow_missing_target: bool,
 ) -> i32 {
     let text = if list == "-" {
         let mut s = String::new();
@@ -690,9 +691,33 @@ fn cmd_batch(
             return 2;
         }
     };
-    match ops::batch_edit(&Policy::cli(yes), &CliHooks, file, &parsed, no_history, dry_run) {
+    // 大批量之前先看看台账日志是不是偏大：日志一大，逐条定位会慢很多
+    if let Ok(path) = ops::Policy::cli(yes).resolve(file) {
+        if let Ok(st) = xirang_core::wsidx::info(&xirang_core::wsidx::workspace_root(&path)) {
+            if st.log_bytes > 64 * 1024 * 1024 {
+                eprintln!(
+                    "（提示：台账日志有 {:.0} MB，偏大——大批量之前先跑一次 `xr index compact` 会快很多）",
+                    st.log_bytes as f64 / 1e6
+                );
+            }
+        }
+    }
+    let opts = ops::BatchOptions { no_history, dry_run, allow_missing_target };
+    match ops::batch_edit(&Policy::cli(yes), &CliHooks, file, &parsed, opts) {
         Ok(o) => {
             if json_out {
+                let files: Vec<serde_json::Value> = o
+                    .files
+                    .iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "file": f.file,
+                            "ops": f.ops,
+                            "changed": f.changed,
+                            "appended": f.appended,
+                        })
+                    })
+                    .collect();
                 println!(
                     "{}",
                     serde_json::json!({
@@ -701,9 +726,19 @@ fn cmd_batch(
                         "changed": o.changed,
                         "appended": o.appended,
                         "dryRun": o.dry_run,
+                        "files": files,
                     })
                 );
                 return 0;
+            }
+            // 跨分片（目录）时逐文件报一行：哪个文件改了多少，一目了然
+            if o.files.len() > 1 {
+                for f in &o.files {
+                    println!(
+                        "  {} → {} 条改动，追加 {} 条记录",
+                        f.file, f.changed, f.appended
+                    );
+                }
             }
             if o.dry_run {
                 println!(
@@ -2225,6 +2260,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--no-history", "--no-index", "--yes", "--blank", "--all", "--root", "--shape-of",
     "--template", "--where", "--subtree", "--append", "--under", "--from-json", "--rule",
     "--out", "--only", "--sync", "--base", "--depth", "--no-pager", "--force",
+    "--dry-run", "--allow-missing-target",
 ];
 
 fn is_known_flag(s: &str) -> bool {
@@ -2268,8 +2304,10 @@ fn usage() {
     println!("        {{\"op\":\"set\",\"id\":\"<编号>\",\"value\":\"新值\"}}");
     println!("        {{\"op\":\"link\",\"id\":\"<编号>\",\"to\":\"<目标编号>\"}}");
     println!("        {{\"op\":\"rename\",\"id\":\"<编号>\",\"name\":\"新名字\"}}");
-    println!("        {{\"op\":\"rm\",\"id\":\"<编号>\"}}（`-` = 从 stdin 读；空行与 # 注释跳过）");
-    println!("      先在内存里全部校验，任一条不合法整批不动；--dry-run 只校验不写");
+    println!("        {{\"op\":\"rm\",\"id\":\"<编号>\"}} / {{\"op\":\"rm_subtree\",\"id\":\"<编号>\"}}（连子树一起清空）");
+    println!("      清单可以给文件、也可以给词库目录（按编号自动分派到分片）；`-` = 从 stdin 读");
+    println!("      空行与 # 注释跳过；先在内存里全部校验，任一条不合法整批不动");
+    println!("      --dry-run 只校验不写；引用目标不存在会被拦下（要写悬空引用加 --allow-missing-target）");
     println!("  xr match <file> --root <名>|--shape-of <node-id>|--template <名> [--where 路径=值] [--json] [--tree]");
     println!("      结构/名字/值匹配（按根名/形状码/模板实例；--json 结构化、--tree 整树）");
     println!("  （--no-history：不写 @history / @created，适合批量创建 & 初始数据）");
@@ -2422,6 +2460,7 @@ fn main() {
                     has_flag(&args, "--dry-run"),
                     has_flag(&args, "--json"),
                     yes,
+                    has_flag(&args, "--allow-missing-target"),
                 )
             }
         }

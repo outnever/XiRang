@@ -318,12 +318,26 @@ fn tool_node(cfg: &Config, args: &Value) -> Result<Value, OpError> {
                 }
             };
             let dry_run = bool_arg(args, "dry_run", false);
-            let o = ops::batch_edit(&pol, &ops::NoHooks, &file, &parsed, no_history, dry_run)?;
+            let allow_missing = bool_arg(args, "allow_missing_target", false);
+            let o = ops::batch_edit(
+                &pol,
+                &ops::NoHooks,
+                &file,
+                &parsed,
+                ops::BatchOptions {
+                    no_history,
+                    dry_run,
+                    allow_missing_target: allow_missing,
+                },
+            )?;
             Ok(json!({
                 "ops": o.ops,
                 "changed": o.changed,
                 "appended": o.appended,
                 "dryRun": o.dry_run,
+                "files": o.files.iter().map(|f| json!({
+                    "file": f.file, "ops": f.ops, "changed": f.changed, "appended": f.appended,
+                })).collect::<Vec<_>>(),
             }))
         }
         "rename" => {

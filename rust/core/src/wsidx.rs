@@ -1642,6 +1642,12 @@ pub struct Reader {
     manifest: Manifest,
     final_gen: HashMap<u32, u64>,
     loc_over: HashMap<(Uuid, u32), LocEntry>,
+    /// `loc_over` 的按编号索引：编号 → 日志里出现在哪些文件。
+    ///
+    /// 没有它，每次按编号定位都要**线性扫一遍整份日志索引**：日志涨到几十万条
+    /// 之后，批量命令会从几十秒变成几十分钟（实测 28 MB 日志 / 2 万条改动 = 32 秒，
+    /// 加上这个索引之后回到 5 秒）。
+    loc_ids: HashMap<Uuid, Vec<u32>>,
     rel_over: HashMap<(Uuid, Uuid), Vec<RelEntry>>,
     rev_over: HashMap<Uuid, Vec<RevEntry>>,
     /// 反向本的「已作废边」：最新事件是墓碑的 (目标, 来源)。
@@ -1681,6 +1687,7 @@ impl Reader {
             final_gen: manifest.files.iter().map(|f| (f.id, f.cur_gen)).collect(),
             manifest,
             loc_over: HashMap::new(),
+            loc_ids: HashMap::new(),
             rel_over: HashMap::new(),
             rev_over: HashMap::new(),
             rev_tomb: HashSet::new(),
@@ -1725,6 +1732,7 @@ impl Reader {
             });
             r.removed.insert(id);
         }
+        r.reindex_loc_ids();
         Ok(r)
     }
 
@@ -1789,6 +1797,10 @@ impl Reader {
                     (KIND_LOC, REC_ENTRY) if payload.len() == LOC_ENTRY => {
                         let e = dec_loc(&payload);
                         self.loc_over.insert((e.uuid, e.file_id), e);
+                        let fids = self.loc_ids.entry(e.uuid).or_default();
+                        if !fids.contains(&e.file_id) {
+                            fids.push(e.file_id);
+                        }
                     }
                     (KIND_REL, REC_ENTRY) if payload.len() == REL_ENTRY => {
                         let e = dec_rel(&payload);
@@ -1827,7 +1839,18 @@ impl Reader {
                 !v.is_empty()
             });
         }
+        // 按编号索引跟着重建（上面按文件修剪过 loc_over）
+        self.reindex_loc_ids();
         Ok(())
+    }
+
+    /// 重建 `loc_ids`（`loc_over` 被按文件修剪之后调）。
+    fn reindex_loc_ids(&mut self) {
+        self.loc_ids.clear();
+        for (u, fid) in self.loc_over.keys() {
+            let v = self.loc_ids.entry(*u).or_default();
+            v.push(*fid);
+        }
     }
 
     pub fn file_count(&self) -> usize {
@@ -2003,9 +2026,14 @@ impl Reader {
                 out.insert(e.root);
             }
         }
-        for ((u, fid), e) in self.loc_over.clone() {
-            if u == id && self.file_fresh(fid) {
-                out.insert(e.root);
+        // 只挑出这个编号的那几条再干活：**不能整份扫（更不能 clone）日志索引**——
+        // 日志涨到几十万条之后，每次定位扫一遍 = 批量命令从几十秒变成几十分钟。
+        let fids: Vec<u32> = self.loc_ids.get(&id).cloned().unwrap_or_default();
+        for fid in fids {
+            if let Some(e) = self.loc_over.get(&(id, fid)) {
+                if self.file_fresh(fid) {
+                    out.insert(e.root);
+                }
             }
         }
         Ok(out.into_iter().collect())
@@ -2031,10 +2059,14 @@ impl Reader {
             let h = self.hit(e.file_id, e.off, e.len)?;
             by_file.insert(h.file.clone(), h);
         }
-        for ((u, fid), e) in self.loc_over.clone() {
-            if u == id && self.file_fresh(fid) {
-                let h = self.hit(fid, e.off, e.len)?;
-                by_file.insert(h.file.clone(), h); // 日志优先
+        // 同上：只取这个编号的几条（按编号索引直接定位）
+        let fids: Vec<u32> = self.loc_ids.get(&id).cloned().unwrap_or_default();
+        for fid in fids {
+            if let Some(e) = self.loc_over.get(&(id, fid)) {
+                if self.file_fresh(fid) {
+                    let h = self.hit(fid, e.off, e.len)?;
+                    by_file.insert(h.file.clone(), h); // 日志优先
+                }
             }
         }
         Ok(by_file.into_values().collect())

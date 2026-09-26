@@ -193,7 +193,7 @@ Three things you will notice:
 
 Exceptions: whole-file `import`, `history prune` and `tmpl rm` still rewrite the whole file — they are supposed to make it actually smaller, or need to express "the record is really gone" (which appending cannot express). `--no-history` only affects history recording, not this rule.
 
-### `xr batch <file> <list-file|-> [--no-history] [--dry-run] [--json] [--yes]`
+### `xr batch <file|collection-dir> <list-file|-> [--no-history] [--dry-run] [--json] [--yes] [--allow-missing-target]`
 
 Submit **a batch** of changes at once (for migrations of hundreds of thousands of records). The list is **JSONL**: one change per line; blank lines and `#` comments are skipped; a whole-file JSON array works too; `-` reads from stdin.
 
@@ -203,6 +203,7 @@ Submit **a batch** of changes at once (for migrations of hundreds of thousands o
 {"op":"link","id":"<id>","to":"<target id>"}   change a reference (same thing)
 {"op":"rename","id":"<id>","name":"new name"}  rename
 {"op":"rm","id":"<id>"}                        delete (empty the name and value)
+{"op":"rm_subtree","id":"<id>"}                empty the whole subtree (every descendant)
 ```
 
 - **Validate everything first, then write**: if any line is invalid (id not in this file, protected template definition, name too long, …) **nothing is applied**, and the error names the line.
@@ -210,9 +211,15 @@ Submit **a batch** of changes at once (for migrations of hundreds of thousands o
 - `--dry-run` validates only: it reports how many nodes would change and writes nothing.
 - `--no-history` skips `@history` (recommended for migrations: otherwise each change adds two extra history nodes).
 - Only **existing** nodes; to bulk **create**, use `xr import --append`.
-- One list targets one file; for shard collections, submit per shard.
+- **Reference targets are checked**: a `link` / `ref` target must be findable in **this workspace (including other shards) or the local catalog**, otherwise the whole batch is refused with the line number; pass `--allow-missing-target` to write a dangling reference on purpose.
+- **Unregistered files work**: a collection copied to a clean directory has no ledger yet — the command registers it in full on the spot (single-node writes do the same), so a migration never stalls at step one.
+- **One list can span several files**: when the target is a **collection directory**, ops are dispatched to the shard holding each id, and each shard is validated-then-written; the output reports per file. Shards have no cross-file transaction, but the failure message says which files succeeded, so re-running is easy.
+
+`rm` vs `rm_subtree` (both "empty", never a physical delete — that is what append-only means): `rm` empties just that one node and leaves its children in place; `rm_subtree` empties every node in the subtree (each gets a `@history` snapshot when history is on, so `xr revert` can restore them one by one). To keep a subtree intact but out of the main view, `rename` its top node to an `@`-prefixed name (e.g. `@已合并`) — nothing is changed.
 
 Measured (187 MB / 3.47 million nodes, release): **400,000 reference changes in 105 seconds** (one command per change used to take hours), growing the file by about 27 MB; afterwards `xr validate` reports 0 errors and `xr index compact` takes 4.4 s. Cost scales with "number of changes + number of distinct ancestors involved"; for batches this size, `--dry-run` first and compact afterwards.
+
+> **Before a large batch, check the ledger log**: when it is large (say over 64 MB) the command prints a hint — run `xr index compact` first and the batch will be much faster (a large log never changes results, it only costs extra reads when locating nodes).
 
 ### `xr new <file> <parent|nil> <name> [value] [--no-history]`
 Add a node. `parent` = `nil` to create a root. Creates a new file if it does not exist.

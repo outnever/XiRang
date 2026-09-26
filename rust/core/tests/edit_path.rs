@@ -205,7 +205,7 @@ fn batch_folds_repeats_and_registers_once() {
             ops.push(edit::BatchOp::Rename { id: *id, name: format!("改{i}") });
         }
     }
-    let out = edit::apply_batch(&path, &ops, false, false, false).unwrap();
+    let out = edit::apply_batch(&path, &ops, false, false, false, false).unwrap();
     assert_eq!(out.ops, ops.len());
     assert_eq!(out.changed, ids.len(), "同一编号改多次只算一个");
     // 不留痕：每个改动只追加一条记录，外加一条协议声明
@@ -248,7 +248,7 @@ fn batch_is_all_or_nothing() {
             value: Value::Text("坏".into()),
         },
     ];
-    assert!(edit::apply_batch(&path, &ops, false, false, false).is_err());
+    assert!(edit::apply_batch(&path, &ops, false, false, false, false).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), before, "失败时文件必须一个字节不变");
     assert_eq!(
         tree::Store::load_view(&path).unwrap().get(ids[0]).unwrap().value,
@@ -257,7 +257,7 @@ fn batch_is_all_or_nothing() {
     );
 
     // 预演同样不写
-    assert!(edit::apply_batch(&path, &ops[..2], false, false, true).is_ok());
+    assert!(edit::apply_batch(&path, &ops[..2], false, false, true, false).is_ok());
     assert_eq!(std::fs::read(&path).unwrap(), before, "预演不写文件");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -277,10 +277,101 @@ fn batch_respects_template_guard() {
     wsidx::rebuild(&dir, &[]).unwrap();
 
     let ops = vec![edit::BatchOp::Set { id: field, value: Value::Text("抢改".into()) }];
-    let err = edit::apply_batch(&path, &ops, false, false, false).unwrap_err();
+    let err = edit::apply_batch(&path, &ops, false, false, false, false).unwrap_err();
     assert!(err.contains("模板定义"), "应当被模板护栏拦下：{err}");
     // 显式强制才放行
-    assert!(edit::apply_batch(&path, &ops, false, true, false).is_ok());
+    assert!(edit::apply_batch(&path, &ops, false, true, false, false).is_ok());
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
+/// 文件还没登记过（典型场景：把词库复制到干净目录）→ 就地整份登记，别卡住流程。
+#[test]
+fn batch_auto_registers_an_unregistered_file() {
+    let dir = tmp_dir("batchreg");
+    let src = tmp_dir("batchregsrc");
+    let (from, ids) = make_wide_file(&src, "原件.xirang", 10);
+    let path = dir.join("副本.xirang");
+    std::fs::copy(&from, &path).unwrap(); // 复制出来的文件天然没登记
+
+    let ops = vec![edit::BatchOp::Set { id: ids[0], value: Value::Text("改过".into()) }];
+    let out = edit::apply_batch(&path, &ops, false, false, false, false)
+        .expect("没登记过也要能跑（就地整份登记）");
+    assert_eq!(out.changed, 1);
+    assert_eq!(
+        tree::Store::load_view(&path).unwrap().get(ids[0]).unwrap().value,
+        Value::Text("改过".into())
+    );
+    let st = wsidx::files_status(&dir).unwrap();
+    assert!(st.iter().any(|f| f.fresh), "改完台账里应当有这个文件：{st:?}");
+
+    for d in [&dir, &src] {
+        std::fs::remove_dir_all(d).ok();
+        std::fs::remove_dir_all(wsidx::index_dir(d)).ok();
+    }
+}
+
+/// 引用目标不存在 → 整批不动；`--allow-missing-target`（`allow_missing_target`）才放行。
+#[test]
+fn batch_refuses_missing_reference_target() {
+    let dir = tmp_dir("batchtarget");
+    let (path, ids) = make_wide_file(&dir, "目标.xirang", 5);
+    wsidx::rebuild(&dir, &[]).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let ghost = Uuid::random_v4();
+    let ops = vec![edit::BatchOp::Link { id: ids[0], to: ghost }];
+    let err = edit::apply_batch(&path, &ops, false, false, false, false).unwrap_err();
+    assert!(err.contains("引用目标"), "应当拦下悬空引用：{err}");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "拒绝时不许写文件");
+
+    // 目标在同一个文件里就通过
+    let ok = vec![edit::BatchOp::Link { id: ids[0], to: ids[1] }];
+    edit::apply_batch(&path, &ok, false, false, false, false).unwrap();
+    // 明确要写悬空引用时放行
+    edit::apply_batch(&path, &ops, false, false, false, true).unwrap();
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
+/// `rm_subtree`：连子树一起清空（每个节点都置空，留痕打开时每个都能回滚）。
+#[test]
+fn batch_rm_subtree_empties_every_node_in_the_subtree() {
+    let dir = tmp_dir("batchrm");
+    let path = dir.join("子树.xirang");
+    let mut s = Store::new();
+    let root = s.create(None, "根", Value::Empty, false).id;
+    let parent = s.create(Some(root), "义项", Value::Empty, false).id;
+    let a = s.create(Some(parent), "释义", Value::Text("指人".into()), false).id;
+    let b = s.create(Some(parent), "读音", Value::Text("rén".into()), false).id;
+    let keep = s.create(Some(root), "别动", Value::Text("留着".into()), false).id;
+    s.save(&path).unwrap();
+    wsidx::rebuild(&dir, &[]).unwrap();
+
+    let ops = vec![edit::BatchOp::RmSubtree { id: parent }];
+    let out = edit::apply_batch(&path, &ops, true, false, false, false).unwrap();
+    assert_eq!(out.changed, 3, "义项自己 + 两个孩子");
+
+    let view = tree::Store::load_view(&path).unwrap();
+    for id in [parent, a, b] {
+        let n = view.get(id).expect("节点还在（追加写的语义：置空不物理删）");
+        assert!(n.name.is_empty() && n.value == Value::Empty, "节点 {id} 应当被置空");
+    }
+    assert_eq!(
+        view.get(keep).unwrap().value,
+        Value::Text("留着".into()),
+        "子树之外的不许动"
+    );
+    // 留痕打开时每个被清空的节点都有 @history（可以用 xr revert 逐个还原）
+    for id in [parent, a, b] {
+        let kids = view.children(view.get(id).unwrap());
+        assert!(
+            kids.iter().any(|k| k.name == "@history"),
+            "节点 {id} 应当留下 @history"
+        );
+    }
 
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();

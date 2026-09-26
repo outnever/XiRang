@@ -141,3 +141,91 @@ fn batch_dry_run_then_apply_then_refuse_a_bad_line() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// 复制到干净目录（文件还没登记）→ 批量照样能跑，不该把迁移卡在第一步。
+#[test]
+fn batch_on_an_unregistered_copy_works() {
+    let root = tmp_root("unreg");
+    let ids = build(&root, 3);
+    // 复制到子目录：新副本天然没登记
+    std::fs::create_dir_all(root.join("干净")).unwrap();
+    std::fs::copy(root.join("a.xirang"), root.join("干净/副本.xirang")).unwrap();
+    let list = format!("{{\"op\":\"set\",\"id\":\"{}\",\"value\":\"改过\"}}\n", ids[0]);
+    std::fs::write(root.join("干净/l.jsonl"), &list).unwrap();
+
+    let (code, out, err) = run(
+        &root,
+        &["batch", "干净/副本.xirang", "干净/l.jsonl", "--no-history"],
+        None,
+    );
+    assert_eq!(code, 0, "没登记过也应当能跑：{err}");
+    assert!(out.contains("已批量提交"), "{out}");
+    let (_, out, _) = run(&root, &["find", "干净/副本.xirang", "改过"], None);
+    assert!(out.contains(&ids[0]), "{out}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 词库分片：一次提交跨多个分片，内部按文件分组，输出逐文件报账。
+#[test]
+fn batch_over_a_shard_directory() {
+    let root = tmp_root("shards");
+    // 两棵根 → 拆成两个分片
+    let (_, out, _) = run(&root, &["new", "词库.xirang", "nil", "甲根"], None);
+    let a_root = grab(&out);
+    let (_, out, _) = run(&root, &["new", "词库.xirang", "nil", "乙根"], None);
+    let b_root = grab(&out);
+    let (_, out, _) = run(&root, &["new", "词库.xirang", &a_root, "词1"], None);
+    let a = grab(&out);
+    let (_, out, _) = run(&root, &["new", "词库.xirang", &b_root, "词2"], None);
+    let b = grab(&out);
+    let (code, _, err) = run(
+        &root,
+        &["collection", "split", "词库.xirang", "--rule", "root", "--out", "分片"],
+        None,
+    );
+    assert_eq!(code, 0, "{err}");
+
+    let list = format!(
+        "{{\"op\":\"rename\",\"id\":\"{a}\",\"name\":\"词1改\"}}\n{{\"op\":\"rename\",\"id\":\"{b}\",\"name\":\"词2改\"}}\n"
+    );
+    std::fs::write(root.join("跨.jsonl"), &list).unwrap();
+
+    // 预演：两个分片都要校验过，且不写文件
+    let (code, out, err) = run(&root, &["batch", "分片", "跨.jsonl", "--dry-run"], None);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("会改到 2 个节点"), "{out}");
+    assert_eq!(out.matches(".xirang →").count(), 2, "逐分片报账：{out}");
+
+    // 真跑
+    let (code, out, err) = run(&root, &["batch", "分片", "跨.jsonl", "--no-history"], None);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("已批量提交") && out.contains("改到 2 个节点"), "{out}");
+    assert_eq!(out.matches(".xirang →").count(), 2, "逐分片报账：{out}");
+
+    // 两个分片各自都改到了
+    let mut seen = 0;
+    for entry in std::fs::read_dir(root.join("分片")).unwrap().flatten() {
+        let p = entry.path();
+        if p.extension().map(|e| e == "xirang").unwrap_or(false) {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            let (_, out, _) = run(&root, &["find", &format!("分片/{name}"), "词1改"], None);
+            if out.contains(&a) {
+                seen += 1;
+            }
+            let (_, out, _) = run(&root, &["find", &format!("分片/{name}"), "词2改"], None);
+            if out.contains(&b) {
+                seen += 1;
+            }
+        }
+    }
+    assert_eq!(seen, 2, "两个分片各改到一条");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+fn grab(out: &str) -> String {
+    out.split('<')
+        .nth(1)
+        .and_then(|s| s.split('>').next())
+        .expect("取节点编号")
+        .to_string()
+}

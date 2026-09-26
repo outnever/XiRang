@@ -28,8 +28,16 @@ cargo build --manifest-path rust/Cargo.toml -p xirang-cli
 - **I/O convention**: data goes to stdout, errors/notes go to stderr; exit codes are `0`=success, `1`=validation failed, `2`=usage/runtime error. Commands are safe to pipeline and to parse programmatically.
 - `--json`: structured output (instead of human text), for programs/LLMs.
 - `--no-history`: write operations do not record `@history`/`@created` (for batch creation / initial data).
-- `--yes`: confirm an action that a guard stopped (template-definition edits, `tmpl rm`, `import` over a non-empty file, `blob-export` over an existing file).
+- `--yes`: confirm an action that a guard stopped (template-definition edits, `tmpl rm`, `import` over a non-empty file, `blob-export` over an existing file, `history prune`, `index drop/forget`).
 - **For AI agents**: `xr-mcp` exposes the same operations as structured tools (identical capabilities and guards, plus confinement to allowed roots) — see [MCP](MCP.en.md).
+- **Writes are append-only**: changing one word appends a few records to the end of the file (milliseconds), instead of rewriting the whole file. So the file grows slowly and one node id may have several records (readers take the last one); the first edit under a root adds an `@protocol = append-v1` marker there. Details and costs: see "Append-only writes" under Writing.
+- **For files ≥ 20 MB the two caches move to the background**: index registration and local-catalog registration no longer block the command — it returns first and prints a note (`XIRANG_INDEX_MAINTENANCE=off` disables background maintenance; `XIRANG_INDEX=off` disables the local catalog entirely). A cache catching up a few seconds later costs nothing.
+- `XIRANG_INDEX_MODE`: `workspace` (default, one ledger per workspace) / `sidecar` (the older per-file `.idx`); switching requires rebuilding the corresponding index.
+- `XIRANG_INDEX_MAINTENANCE`: default `auto` — after a command finishes, if the index log exceeds 30% of the base blocks, it spawns a background process to compact; `off` disables it.
+- `XIRANG_INDEX_COMPACT_RATIO` / `XIRANG_INDEX_COMPACT_MIN_BYTES`: compaction trigger ratio and minimum base size (defaults 0.30 / 1000000), for tuning and tests.
+- `XIRANG_WORKSPACE`: the workspace root (decides where `.xirang-index/` lives); defaults to the directory of the data file.
+- `XIRANG_CATALOG`: location of the local catalog file (default `~/.config/xirang/catalog.idx`).
+- `xr ws` does **not** register the files you name into the local catalog (that would read every file in full); use `xr catalog scan` for that.
 - `--no-index`: read commands index the files they touch into the **local catalog** by default (see "Local catalog"); this flag disables it for one run, and `XIRANG_INDEX=off` disables it globally.
 - Path addressing: `name/child/grandchild` (`/`-separated), relative to a given subtree root.
 
@@ -103,11 +111,37 @@ xr ws <nodeID> a.xirang b.xirang   # list both copies, union their children, tag
 xr ws <nodeID> a.xirang --only a.xirang   # only the copy in a.xirang (and only its children)
 ```
 
-### `xr index <file1> [file2…]`
-Rebuild/refresh the sidecar index and print a summary (an implementation-layer `.xirang.idx` cache; never modifies the `.xirang` itself).
+### `xr index <subcommand> [paths…] [--json] [--verbose] [--stale] [--dry-run] [--yes] [--sample N] [--deep]`
+Workspace index maintenance (by default the **workspace ledger** — three ledgers under `<workspace>/.xirang-index/`: locate / relations / reverse).
+The index is an **implementation-layer cache**: safe to delete, rebuildable, never touches the `.xirang` files themselves and holds no unique data.
+
+| Subcommand | What it does |
+|---|---|
+| `status [--verbose]` | Overview: block/entry counts and base-vs-log size per ledger, generation, file and node totals, files whose fingerprint doesn't match, whether compaction is advised, total index size; `--verbose` also lists the first rows of the file table |
+| `files [--stale]` | Per file: entry count, generations (block baseline / latest), fingerprint match, still on disk |
+| `update` | **Incremental repair**: rescans only files whose fingerprint changed (self-healing), then drops entries for deleted files |
+| `rebuild` | Full rebuild (defaults to every `.xirang` in the workspace) |
+| `compact` | Merge the log back into blocks (new block names → atomic manifest swap → old blocks deleted) |
+| `check [--sample N] [--deep]` | Consistency check: locate and read N sampled ids (default 5); `--deep` also rescans each file and compares entry counts |
+| `gc` | Drop entries for files that no longer exist (space is reclaimed by the next compaction) |
+| `drop --yes` | **Delete the whole index directory** (data files are untouched) |
+| `forget <files…> --yes` | Remove the given files from the ledger (data files are kept) |
+| `unlock` | Clear the writer lock (prints the pid inside and whether it is still running) |
+| `path` | Print the absolute path of the index directory |
+
+After a data file is written, the write path appends log records itself (blocks are never edited in place); when the log exceeds 30% of the base blocks, `status` advises a compaction.
+With `XIRANG_INDEX_MODE=sidecar` this degrades to the older per-file `.idx` (`status` / `rebuild` / `gc` are available there).
+**Destructive subcommands (`drop` / `forget`) require `--yes`**; every subcommand accepts `--dry-run` to show what it would do without doing it.
+All subcommands support `--json` (camelCase fields) for scripts and GUIs.
 
 ```bash
-xr index lexicon.xirang graph.xirang   # per file: root count / node count / edge count / new or reused
+xr index status                     # current state of this workspace's index
+xr index files --stale              # which files were changed outside xr
+xr index update                     # repair them incrementally (self-healing)
+xr index rebuild lexicon.shards     # or rescan everything
+xr index compact                     # merge the log into blocks
+xr index check                       # sampled consistency check
+xr index drop --yes                  # delete the index (data untouched)
 ```
 
 ### `xr history <file> <node-id>`
@@ -116,6 +150,25 @@ Show a node's `@history` snapshots.
 ```bash
 xr history data.xirang <nodeID>
 ```
+
+### `xr history prune <file> <node-id> [--keep N] [--before <ISO-prefix>] [--dry-run] [--yes]`
+Trim history: keep only the most recent N snapshots (default 20), optionally only dropping those older than a given time.
+
+**Why**: history is the one thing that makes a single file grow without bound — measured on one node edited 50 times: 8850 bytes / 103 nodes with history, versus 2498 bytes / 1 node with `--no-history` (each edit adds 2 nodes: the snapshot plus `@replaced`). Those snapshots also go into the index.
+
+**Careful**: the trimmed snapshots are a **real structural deletion**, so you lose that much rollback ability:
+
+- without `--yes` it only prints "would drop N, keep M" and exits with code 2;
+- `--dry-run` rehearses without touching the file;
+- the snapshots that are kept remain usable with `xr revert`.
+
+```bash
+xr history prune data.xirang <nodeID> --keep 5            # see how much would go first
+xr history prune data.xirang <nodeID> --keep 5 --yes      # actually trim
+xr history prune data.xirang <nodeID> --before 2026-01-01 --yes   # only trim before 2026
+```
+
+The same node id in other files is **not affected**: pruning only touches this node's history in this one file.
 
 ### `xr diff <a.xirang> <b.xirang> [--json]`
 Compare two files by node ID (added/removed/changed, with before/after values).
@@ -126,6 +179,18 @@ xr diff old.xirang new.xirang --json
 ```
 
 ## Writing
+
+### Append-only writes (append-v1)
+
+A write command does not edit "that line in the file" — it **appends a new record with the same node id** to the end of the file, and readers take the last record per id. That is where "changing one word writes a few dozen bytes" comes from (on a 3.47-million-node file, one word went from over ten seconds to milliseconds).
+
+Three things you will notice:
+
+1. **The file grows**: several records accumulate for the same id. Fold them once in a while with `xr compact <file>` (see "Fold / compact").
+2. **The first edit adds one auxiliary node**: the root you edited gets an `@protocol = append-v1` marker (added once). Without it, `xr validate` would report those normal duplicate ids as an E002 error — see `spec/协议.md`.
+3. **Old content cannot be corrupted**: appending never rewrites existing bytes; a crash mid-write leaves only a trailing fragment (F015), which reads ignore with a note.
+
+Exceptions: whole-file `import`, `history prune` and `tmpl rm` still rewrite the whole file — they are supposed to make it actually smaller, or need to express "the record is really gone" (which appending cannot express). `--no-history` only affects history recording, not this rule.
 
 ### `xr new <file> <parent|nil> <name> [value] [--no-history]`
 Add a node. `parent` = `nil` to create a root. Creates a new file if it does not exist.
@@ -205,12 +270,22 @@ List a collection's predicate and its shards.
 xr collection list lexicon.shards
 ```
 
-### `xr compact <dir> [--all]`
-Fold a shard's overlay log (same-UUID last-write-wins). `--all` folds every shard; otherwise only shards that have revisions are folded.
+### Fold / compact `xr compact <file|dir> [--all] [--dry-run]`
+
+Fold overlay records back into a base version (one record per node id). Two forms:
+
+- **`<file>`**: folds duplicate records for the same id **inside this one file only**; it never merges across files and never merges ids — "the same id in several files" is cross-file identity and has nothing to do with this command. This is the slimming exit for append-only writes.
+- **`<dir>`**: folds the shards of a collection (`--all` also rewrites shards with no revisions).
+
+Output reports "records N → M, bytes X → Y"; when there are no duplicates it says plainly that **not a single byte was written**. `--dry-run` rehearses only. Folding never changes any readable result (readers already take the last record), so it is **not destructive and needs no `--yes`**.
 
 ```bash
-xr compact lexicon.shards --all
+xr compact big.xirang            # fold this one file (records / bytes before and after)
+xr compact big.xirang --dry-run  # see how much would be folded, without touching the file
+xr compact lexicon.shards --all  # fold every shard in a collection
 ```
+
+> Don't confuse this with `xr index compact`, which compacts the **ledger's own** log (`.xirang-index/`) and has nothing to do with data files.
 
 ### Writing into a collection
 `xr new/set/rename/rm/link/fill` may also take a collection directory as `<file>`, targeting only the shard that needs changing:

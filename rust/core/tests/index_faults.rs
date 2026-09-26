@@ -92,6 +92,39 @@ fn missing_block_is_loud_not_silent() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// 老格式的台账清单必须被拒掉，而不是把新格式的「文件记录」当旧格式读
+/// （2026-09 格式改过：文件记录多了 `indexed_upto` + `prefix_guard`、
+/// 反向本多了墓碑记录）。错了要大声说，然后回退整份载入。
+#[test]
+fn old_index_format_is_loud_not_silent() {
+    let dir = tmp_dir("format");
+    let info = build(&dir);
+    let manifest = wsidx::index_dir(&dir).join("index.manifest");
+
+    // 把头部格式版本字节改回旧版（1），模拟「老实现写的台账」
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    assert_eq!(&bytes[..5], b"XWSIX", "清单头应有魔数");
+    bytes[5] = 1;
+    std::fs::write(&manifest, &bytes).unwrap();
+
+    // 1) 打开索引必须报 F013，而不是硬读出一个错的答案
+    let err = wsidx::Reader::open(&dir).err().expect("老格式应报错");
+    assert!(err.contains("F013"), "错误应带 F013：{err}");
+
+    // 2) 走索引的入口应回退到整份载入，并给出原因
+    let ps = paths(&info);
+    let mut ws = index::LazyWorkspace::from_paths(&ps).unwrap();
+    assert_eq!(ws.backend_kind(), "memory", "老格式应回退整份载入");
+    assert!(ws.fallback_reason().unwrap().contains("F013"));
+    assert!(!ws.node_views(info.entry_ids[0]).is_empty(), "回退后仍要能查到");
+
+    // 3) 按提示重建之后恢复
+    wsidx::rebuild(&dir, &[]).unwrap();
+    assert!(wsidx::Reader::open(&dir).is_ok(), "重建后应能打开");
+    assert!(consistent(&dir, &info));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn compact_leaves_a_consistent_index() {
     let dir = tmp_dir("compact");

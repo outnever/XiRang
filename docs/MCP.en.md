@@ -64,9 +64,13 @@ Refusals return `isError: true` with a body of `{"error":{"kind":"guarded","mess
 
 ## What MCP deliberately does not cover
 
-Machine-local state stays in the `xr` CLI: `catalog` (the local catalog), `index` (sidecar index), `collection` / `compact` (shard libraries), `ws` (cross-file view).
+Machine-local state stays in the `xr` CLI: `catalog` (the local catalog), `index` (the workspace ledger, with the legacy per-file sidecar as a fallback mode), `collection` / `compact` (shard libraries, and folding overlay records), `ws` (cross-file view).
 
 MCP **never writes the local catalog**. The consequence matters: an MCP-only session does not register files into the catalog, so `xr ws` will not find them afterwards — run `xr catalog scan` first if you need cross-file resolution. Shard library directories (`.xirang` directories) always return `unsupported` over MCP.
+
+The workspace index (the three ledgers under `.xirang-index/`) is **maintained automatically by the write path**: CLI and MCP share one operation layer, so both append log records after writing data; rebuilding and compaction are done with the CLI's `xr index ...`.
+
+Writes are **append-only** as well (`append-v1`): changing one word appends a few records to the end of the file, and the first edit under a root adds an `@protocol = append-v1` marker. So the file grows slowly and one node id may have several records (readers take the last one); fold them once in a while with `xr compact <file>` from the CLI — that action is not in MCP (it is host-state maintenance). The only whole-file rewrites are `convert`'s `import` and `template`'s `remove`.
 
 ## Old tool names → new tool names
 

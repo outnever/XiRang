@@ -26,7 +26,13 @@ use crate::codec::Uuid;
 use crate::index;
 
 pub const MAGIC: &[u8; 5] = b"XWSIX";
+/// 对外报的协议版本（`xr index status` 里显示 `wsidx-vN`）。
 pub const VERSION: u8 = 1;
+/// **盘上格式**版本（写在每个索引文件的头里）。与对外的协议名分开：
+/// 2026-09 格式改过一次——文件记录多了 `indexed_upto` + `prefix_guard` 两栏、
+/// 反向本多了墓碑记录（`REC_TOMBSTONE`）。老格式一律拒掉让上层重建，
+/// 而不是把新格式当旧格式读（台账只是缓存，重建即可）。
+const FORMAT_VERSION: u8 = 2;
 pub const INDEX_DIR: &str = ".xirang-index";
 /// 每块的条目上限（36–68 MB，视台账而定）。
 pub const BLOCK_ENTRIES: usize = 1_000_000;
@@ -316,7 +322,7 @@ fn lock_path(dir: &Path) -> PathBuf {
 fn write_prefix(o: &mut Vec<u8>, kind: u8, part: u8) {
     let header = HEADER.as_bytes();
     o.extend_from_slice(MAGIC);
-    o.push(VERSION);
+    o.push(FORMAT_VERSION);
     o.push(kind);
     o.push(part);
     o.extend_from_slice(&(header.len() as u32).to_be_bytes());
@@ -335,8 +341,8 @@ fn read_prefix(f: &mut File, want_kind: u8, want_part: u8) -> Result<(), String>
     if &head[..5] != MAGIC {
         return Err("F013：索引文件损坏（魔数不符）".into());
     }
-    if head[5] != VERSION {
-        return Err("F013：索引版本不支持".into());
+    if head[5] != FORMAT_VERSION {
+        return Err("F013：索引格式版本不支持（`xr index rebuild` 重建即可）".into());
     }
     if head[6] != want_kind || head[7] != want_part {
         return Err("F013：索引文件类型不符".into());
@@ -457,6 +463,14 @@ fn enc_manifest(m: &Manifest) -> Vec<u8> {
 }
 
 fn dec_manifest(b: &[u8]) -> Result<Manifest, String> {
+    // 清单也要先验魔数与格式版本：老格式的「文件记录」短 16 字节，
+    // 直接按新格式读会把后面的字节当条目读出来（静默给出错答案）。
+    if b.len() < PREFIX_LEN || &b[..5] != MAGIC {
+        return Err("F013：索引文件损坏（清单魔数不符）".into());
+    }
+    if b[5] != FORMAT_VERSION {
+        return Err("F013：索引格式版本不支持（`xr index rebuild` 重建即可）".into());
+    }
     let mut off = fixed_prefix_len();
     let mut m = Manifest::default();
     m.generation = rd_u64(b, &mut off)?;

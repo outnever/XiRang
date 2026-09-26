@@ -7,11 +7,19 @@
 //! 每本 = `index.manifest` 里的块表 + `loc|rel|rev-NNNN.blk`（有序块，每块 100 万条）
 //! + `loc|rel|rev.log`（追加日志）。写入只追加日志；`compact` 把日志合并回块。
 //! 每个文件在台账里带指纹（尺寸 + 修改时间），对不上就作废并回退到整份载入。
+//!
+//! **有效性规则（唯一一条，别记错）**：条目属于「写它时那个文件记录」的代号。
+//! - **整份登记**（[`append_file`]）：`cur_gen` +1，该文件旧代号的条目一律作废；
+//! - **只追加登记**（[`append_tail`]）：代号**一个字都不动**，旧条目继续有效
+//!   （旧记录的字节位置没挪），只把变化的那几条作为「后写覆盖」追加进日志。
+//!
+//! 所以「追加写的数据文件」配上「只追加登记」是对的；把追加写的数据文件拿去整份登记
+//! 也不会错（只是慢），但反过来（整份重写却只追加登记）会丢条目。
 //! **未知记录类型一律按长度跳过**，以后加段不需要升主版本。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::codec::Uuid;
@@ -35,10 +43,18 @@ const PART_MANIFEST: u8 = 3;
 const REC_ENTRY: u8 = 1;
 const REC_FILE: u8 = 3;
 const REC_FILE_REMOVE: u8 = 4;
+/// 反向本墓碑：作废一条「来源 → 目标」的引用边（载荷 = 目标 16 字节 + 来源 16 字节）。
+/// 节点被改掉引用之后，旧的那条「旧目标 → 这个节点」必须显式作废，
+/// 否则「谁引用我」会一直列出已经不指向我的节点。
+const REC_TOMBSTONE: u8 = 5;
 
 pub const LOC_ENTRY: usize = 52; // uuid16 + file_id4 + off8 + len8 + root16
 pub const REL_ENTRY: usize = 68; // root16 + parent16 + child16 + file_id4 + off8 + len8
 pub const REV_ENTRY: usize = 36; // target16 + source16 + file_id4
+
+/// 「只追加登记」的守护窗口：记住登记起点之前这么多字节的哈希。
+/// 只比长度不够——从中间改写、长度一点不变也能骗过长度比对。
+pub const GUARD_BYTES: u64 = 64;
 
 const HEADER: &str = "\
 XiRang workspace index (XWSIX) v1
@@ -151,7 +167,7 @@ fn key_uuid(id: Uuid) -> [u8; 32] {
 
 // ---------------------------------------------------------------- manifest
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileEntry {
     pub id: u32,
     pub path: String,
@@ -161,8 +177,13 @@ pub struct FileEntry {
     pub uuid_count: u64,
     /// 块里那条目的代号（压实时刻）；与 `cur_gen` 不等说明块已过期。
     pub gen: u64,
-    /// 最新代号（每次追加都会前进）。
+    /// 最新代号。**只有「整份登记」才前进**；「只追加登记」不动它（旧条目继续有效）。
     pub cur_gen: u64,
+    /// 上次登记时文件覆盖到的绝对字节长度（= 下一次「只追加登记」的起点）。
+    pub indexed_upto: u64,
+    /// `indexed_upto` 之前一小段字节的哈希：对不上说明前面那段被改写，
+    /// 必须整份重新登记（[`GUARD_BYTES`]）。
+    pub prefix_guard: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -374,7 +395,7 @@ fn rd_file_rec(b: &[u8], off: &mut usize) -> Result<FileEntry, String> {
     }
     let path = String::from_utf8_lossy(&b[*off..*off + plen]).into_owned();
     *off += plen;
-    Ok(FileEntry {
+    let mut f = FileEntry {
         id,
         path,
         size: rd_u64(b, off)?,
@@ -383,7 +404,16 @@ fn rd_file_rec(b: &[u8], off: &mut usize) -> Result<FileEntry, String> {
         uuid_count: rd_u64(b, off)?,
         gen: rd_u64(b, off)?,
         cur_gen: rd_u64(b, off)?,
-    })
+        indexed_upto: 0,
+        prefix_guard: 0,
+    };
+    // 后加的两栏：老台账没有就读作「上次登记到文件末尾、无守护哈希」
+    // （`indexed_upto = 0` 会让「只追加登记」直接拒绝，退回整份登记，安全）。
+    if *off + 16 <= b.len() {
+        f.indexed_upto = rd_u64(b, off)?;
+        f.prefix_guard = rd_u64(b, off)?;
+    }
+    Ok(f)
 }
 
 fn enc_file_rec(f: &FileEntry, o: &mut Vec<u8>) {
@@ -396,6 +426,8 @@ fn enc_file_rec(f: &FileEntry, o: &mut Vec<u8>) {
     o.extend_from_slice(&f.uuid_count.to_be_bytes());
     o.extend_from_slice(&f.gen.to_be_bytes());
     o.extend_from_slice(&f.cur_gen.to_be_bytes());
+    o.extend_from_slice(&f.indexed_upto.to_be_bytes());
+    o.extend_from_slice(&f.prefix_guard.to_be_bytes());
 }
 
 fn enc_manifest(m: &Manifest) -> Vec<u8> {
@@ -557,6 +589,27 @@ pub fn fingerprint_of(path: &Path) -> Option<(u64, i64, u32)> {
     let meta = fs::metadata(path).ok()?;
     let d = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some((meta.len(), d.as_secs() as i64, d.subsec_nanos()))
+}
+
+/// 登记起点前 [`GUARD_BYTES`] 字节的哈希（只读一小段，不读整份）。
+/// mtime 不能当这个判据——我们自己每次追加都会改 mtime。
+fn guard_at(path: &Path, upto: u64) -> Result<u64, String> {
+    let start = upto.saturating_sub(GUARD_BYTES);
+    let len = (upto - start) as usize;
+    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    Ok(index::fnv1a(&buf))
+}
+
+/// 读文件的 `[from, from+len)` 一段。
+fn read_range(path: &Path, from: u64, len: u64) -> Result<Vec<u8>, String> {
+    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    f.seek(SeekFrom::Start(from)).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    Ok(buf)
 }
 
 /// 扫一个 `.xirang` 文件，产出它在三本台账里的全部条目（偏移是数据段内的相对偏移）。
@@ -800,6 +853,8 @@ fn build_ledgers(
             uuid_count: e.loc.len() as u64,
             gen: m.generation,
             cur_gen: m.generation,
+            indexed_upto: size,
+            prefix_guard: guard_at(&abs, size).unwrap_or(0),
         });
         loc.extend(e.bytes(KIND_LOC));
         rel.extend(e.bytes(KIND_REL));
@@ -888,12 +943,15 @@ fn append_file_locked(dir: &Path, data_path: &Path) -> Result<Stats, String> {
                 uuid_count: 0,
                 gen: 0,
                 cur_gen: 0,
+                indexed_upto: 0,
+                prefix_guard: 0,
             });
             id
         }
     };
     let entries = scan_file(Path::new(&abs), file_id)?;
     let new_gen = m.generation + 1;
+    let guard = guard_at(Path::new(&abs), size).unwrap_or(0);
     let rec = FileEntry {
         id: file_id,
         path: abs,
@@ -903,6 +961,8 @@ fn append_file_locked(dir: &Path, data_path: &Path) -> Result<Stats, String> {
         uuid_count: entries.loc.len() as u64,
         gen: m.files.iter().find(|f| f.id == file_id).map(|f| f.gen).unwrap_or(0),
         cur_gen: new_gen,
+        indexed_upto: size,
+        prefix_guard: guard,
     };
     let mut rec_bytes = Vec::new();
     enc_file_rec(&rec, &mut rec_bytes);
@@ -950,6 +1010,250 @@ fn append_file_locked(dir: &Path, data_path: &Path) -> Result<Stats, String> {
 pub fn compact(ws_root: &Path) -> Result<Stats, String> {
     let dir = index_dir(ws_root);
     let m = read_manifest(&dir)?;
+    compact_with_manifest(&dir, m)
+}
+
+/// 「只登记新增的那一段」的结果。
+#[derive(Clone, Debug, Default)]
+pub struct TailStats {
+    pub stats: Stats,
+    /// 这次实际登记到的文件长度（绝对字节 = 下次的起点）。
+    pub registered_upto: u64,
+    /// 尾部残片字节数（>0 = 只登记到最后一个完整记录；残片按 F015 忽略，不动数据文件）。
+    pub truncated_bytes: u64,
+}
+
+/// 只登记「上次登记之后文件新增的那一段」（追加写产生的记录）。
+///
+/// 前提就是 5.1 的规则：**只追加写不动代号** —— 旧记录的字节位置没挪动，
+/// 所以旧条目继续有效；这里只补「变化的那几条」，外加反向本需要的墓碑。
+///
+/// 任何对不上都返回 `Err`，由调用方退回 [`append_file`] 整份登记：
+/// 文件变小、前缀守护哈希对不上、父节点在台账里查不到、尾部有半条记录。
+/// **不猜**——静默丢条目是最难查的一类 bug。
+pub fn append_tail(ws_root: &Path, data_path: &Path) -> Result<TailStats, String> {
+    let dir = index_dir(ws_root);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let _guard = lock_writer(&dir)?;
+    append_tail_locked(&dir, data_path)
+}
+
+/// 新增区里解析出的一条记录（偏移是文件内的绝对偏移）。
+struct NewRec {
+    id: Uuid,
+    parent: Option<Uuid>,
+    ref_target: Option<Uuid>,
+    off: u64,
+    len: u64,
+}
+
+fn append_tail_locked(dir: &Path, data_path: &Path) -> Result<TailStats, String> {
+    let abs_path = data_path.canonicalize().unwrap_or_else(|_| data_path.to_path_buf());
+    let abs = abs_path.to_string_lossy().into_owned();
+    let (size, sec, nsec) = fingerprint_of(&abs_path).ok_or_else(|| "文件不存在".to_string())?;
+    let mut m = read_manifest(dir)?;
+    let pos = m
+        .files
+        .iter()
+        .position(|f| f.path == abs)
+        .ok_or_else(|| "这个文件还没登记过：需要整份登记".to_string())?;
+    let old = m.files[pos].clone();
+    if size < old.indexed_upto {
+        return Err(format!(
+            "文件变小了（{} → {} 字节）：需要整份登记",
+            old.indexed_upto, size
+        ));
+    }
+    // 前缀守护：长度一样也能从中间改写，所以不只看长度
+    if guard_at(&abs_path, old.indexed_upto)? != old.prefix_guard {
+        return Err("台账记的前缀对不上（前面那段被改写过）：需要整份登记".into());
+    }
+    // 只读「新增的那一段」
+    let tail = read_range(&abs_path, old.indexed_upto, size - old.indexed_upto)?;
+    let mut recs: Vec<NewRec> = Vec::new();
+    let mut good = 0usize;
+    while good < tail.len() {
+        let mut off = good;
+        match index::scan_node(&tail, &mut off) {
+            Ok(r) => {
+                recs.push(NewRec {
+                    id: r.id,
+                    parent: r.parent,
+                    ref_target: r.ref_target,
+                    off: old.indexed_upto + good as u64,
+                    len: (off - good) as u64,
+                });
+                good = off;
+            }
+            Err(_) => break, // 半条记录：只认前面完整的（F015：忽略尾部残片）
+        }
+    }
+    let new_upto = old.indexed_upto + good as u64;
+    let truncated_bytes = (tail.len() - good) as u64;
+
+    // 台账视图：把自己这个文件当作「当前状态」（刚追加完、manifest 还没更新）
+    let mut r = Reader::open_dir(dir, &[(old.id, size, sec, nsec)])?;
+    let data_start = r.data_start_of(old.id)?;
+
+    // 每条新记录属于哪棵树：父可能也在这批里 → 先建这批的父子表
+    let mut parents: HashMap<Uuid, Option<Uuid>> = HashMap::new();
+    for n in &recs {
+        parents.entry(n.id).or_insert(n.parent);
+    }
+    let mut roots: HashMap<Uuid, Uuid> = HashMap::new();
+    for n in &recs {
+        root_of_new(n.id, &parents, &mut roots, &mut r, old.id, 0)?;
+    }
+
+    // 三本台账各自要追加的记录（条目 / 墓碑）
+    let mut loc_p: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut rel_p: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut rev_p: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    let mut new_uuids = 0u64;
+    for n in &recs {
+        let root = roots[&n.id];
+        let off = n
+            .off
+            .checked_sub(data_start)
+            .ok_or("新记录的偏移在文件头之前：需要整份登记")?;
+        let mut b = Vec::new();
+        enc_loc(&LocEntry { uuid: n.id, file_id: old.id, off, len: n.len, root }, &mut b);
+        loc_p.push((REC_ENTRY, b));
+        if let Some(p) = n.parent {
+            let mut b = Vec::new();
+            enc_rel(
+                &RelEntry { root, parent: p, child: n.id, file_id: old.id, off, len: n.len },
+                &mut b,
+            );
+            rel_p.push((REC_ENTRY, b));
+        }
+        if let Some(t) = n.ref_target {
+            let mut b = Vec::new();
+            enc_rev(&RevEntry { target: t, source: n.id, file_id: old.id }, &mut b);
+            rev_p.push((REC_ENTRY, b));
+        }
+        // 旧值是引用、这次不是同一条 → 旧边写墓碑作废（rm 是置空，旧值不是引用，天然不用）
+        if let Some(prev) = r.loc_in_file(n.id, old.id)? {
+            if let Some(old_ref) = read_ref_at(&abs_path, data_start + prev.off, prev.len)? {
+                if Some(old_ref) != n.ref_target {
+                    let mut b = Vec::new();
+                    b.extend_from_slice(&old_ref.0);
+                    b.extend_from_slice(&n.id.0);
+                    rev_p.push((REC_TOMBSTONE, b));
+                }
+            }
+        }
+        if seen.insert(n.id) && r.loc_in_file(n.id, old.id)?.is_none() {
+            new_uuids += 1;
+        }
+    }
+
+    let mut rec = old.clone();
+    rec.size = size;
+    rec.mtime_sec = sec;
+    rec.mtime_nsec = nsec;
+    rec.uuid_count = old.uuid_count + new_uuids;
+    rec.indexed_upto = new_upto;
+    rec.prefix_guard = guard_at(&abs_path, new_upto)?;
+    // `gen` / `cur_gen` 一个字都不动 —— 这就是「只追加登记」的全部秘密
+
+    let mut written = 0u64;
+    if rec != old || !loc_p.is_empty() || !rel_p.is_empty() || !rev_p.is_empty() {
+        let mut rec_bytes = Vec::new();
+        enc_file_rec(&rec, &mut rec_bytes);
+        for (kind, payloads) in
+            [(KIND_LOC, &loc_p), (KIND_REL, &rel_p), (KIND_REV, &rev_p)]
+        {
+            ensure_log(dir, kind)?;
+            // 攒成一个缓冲区、一次 write（与 append_file 同一套路）
+            let mut buf: Vec<u8> = Vec::new();
+            push_rec(&mut buf, REC_FILE, &rec_bytes);
+            for (rk, p) in payloads {
+                push_rec(&mut buf, *rk, p);
+            }
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(log_path(dir, kind))
+                .map_err(|e| e.to_string())?;
+            f.write_all(&buf).map_err(|e| e.to_string())?;
+            written += buf.len() as u64;
+        }
+        // 日志先落，再更新 manifest（中途崩了也能靠日志里的文件记录恢复）
+        m.files[pos] = rec;
+        for kind in [KIND_LOC, KIND_REL, KIND_REV] {
+            let bytes = fs::metadata(log_path(dir, kind)).map(|x| x.len()).unwrap_or(0);
+            ledger_mut(&mut m, kind).log_bytes = bytes;
+        }
+        write_file_atomic(&manifest_path(dir), &enc_manifest(&m)).map_err(|e| e.to_string())?;
+    }
+    Ok(TailStats {
+        stats: Stats {
+            files: m.files.len(),
+            loc: loc_p.len() as u64,
+            rel: rel_p.len() as u64,
+            rev: rev_p.iter().filter(|(rk, _)| *rk == REC_ENTRY).count() as u64,
+            blocks: 0,
+            bytes_written: written,
+            log_bytes: m.loc.log_bytes + m.rel.log_bytes + m.rev.log_bytes,
+        },
+        registered_upto: new_upto,
+        truncated_bytes,
+    })
+}
+
+/// 给「这次新增的记录」定树根：父可能也在这批里（`import --append` 加一整棵子树），
+/// 先在本批的父子表里往上走，走到不在本批的父，再查台账。查不到就报错、退回整份登记。
+fn root_of_new(
+    id: Uuid,
+    parents: &HashMap<Uuid, Option<Uuid>>,
+    roots: &mut HashMap<Uuid, Uuid>,
+    r: &mut Reader,
+    file_id: u32,
+    depth: usize,
+) -> Result<Uuid, String> {
+    if let Some(x) = roots.get(&id) {
+        return Ok(*x);
+    }
+    if depth > 4_096 {
+        return Err("新记录的父链太长（可能成环）：需要整份登记".into());
+    }
+    let root = match parents.get(&id) {
+        Some(None) => id, // 自己是根
+        Some(Some(p)) => {
+            if parents.contains_key(p) {
+                root_of_new(*p, parents, roots, r, file_id, depth + 1)?
+            } else {
+                r.root_in_file(*p, file_id)?.ok_or_else(|| {
+                    format!("新记录 {id} 的父节点 {p} 在台账里查不到：需要整份登记")
+                })?
+            }
+        }
+        None => r
+            .root_in_file(id, file_id)?
+            .ok_or_else(|| format!("新记录 {id} 在台账里查不到：需要整份登记"))?,
+    };
+    roots.insert(id, root);
+    Ok(root)
+}
+
+/// 读「某个位置那条记录」的引用值（不是引用 / 读不出来 → `None`）。
+fn read_ref_at(path: &Path, off: u64, len: u64) -> Result<Option<Uuid>, String> {
+    if len == 0 {
+        return Ok(None);
+    }
+    let bytes = read_range(path, off, len)?;
+    let mut o = 0usize;
+    match crate::codec::decode_node(&bytes, &mut o) {
+        Ok(n) => Ok(match n.value {
+            crate::codec::Value::Reference(t) => Some(t),
+            _ => None,
+        }),
+        Err(e) => Err(format!("读不出旧记录（{e:?}）：需要整份登记")),
+    }
+}
+
+fn compact_with_manifest(dir: &Path, m: Manifest) -> Result<Stats, String> {
     let targets: Vec<PathBuf> = m
         .files
         .iter()
@@ -1313,6 +1617,9 @@ pub struct Reader {
     loc_over: HashMap<(Uuid, u32), LocEntry>,
     rel_over: HashMap<(Uuid, Uuid), Vec<RelEntry>>,
     rev_over: HashMap<Uuid, Vec<RevEntry>>,
+    /// 反向本的「已作废边」：最新事件是墓碑的 (目标, 来源)。
+    /// 块里的老边也要用它过滤掉，否则「谁引用我」会一直列出已经不指向我的节点。
+    rev_tomb: HashSet<(Uuid, Uuid)>,
     removed: HashSet<u32>,
     data_starts: HashMap<u32, u64>,
     /// 路径 → 文件号（`covers` 要按路径查，别线性扫）
@@ -1326,8 +1633,13 @@ pub struct Reader {
 
 impl Reader {
     pub fn open(ws_root: &Path) -> Result<Reader, String> {
-        let dir = index_dir(ws_root);
-        let manifest = read_manifest(&dir)?;
+        Reader::open_dir(&index_dir(ws_root), &[])
+    }
+
+    /// 打开台账；`assume`（编号 + 当前指纹）里的文件跳过指纹核对。
+    /// 写者刚追加完、台账还没更新时用它——否则自己的文件会被当成「被外部改过」而作废。
+    fn open_dir(dir: &Path, assume: &[(u32, u64, i64, u32)]) -> Result<Reader, String> {
+        let manifest = read_manifest(dir)?;
         // 打开时就核对块文件在不在：宁可大声报错，也不要静默返回「查不到」
         for kind in [KIND_LOC, KIND_REL, KIND_REV] {
             for b in &ledger_ref(&manifest, kind).blocks {
@@ -1338,12 +1650,13 @@ impl Reader {
         }
         let path_ids = manifest.files.iter().map(|f| (f.path.clone(), f.id)).collect();
         let mut r = Reader {
-            dir,
+            dir: dir.to_path_buf(),
             final_gen: manifest.files.iter().map(|f| (f.id, f.cur_gen)).collect(),
             manifest,
             loc_over: HashMap::new(),
             rel_over: HashMap::new(),
             rev_over: HashMap::new(),
+            rev_tomb: HashSet::new(),
             removed: HashSet::new(),
             data_starts: HashMap::new(),
             path_ids,
@@ -1353,6 +1666,14 @@ impl Reader {
         };
         r.load_logs()?;
         r.path_ids = r.manifest.files.iter().map(|f| (f.path.clone(), f.id)).collect();
+        // 写者自称「这个文件就是这个指纹」：先记进去，下面的核对就会放过它
+        for (id, size, sec, nsec) in assume {
+            if let Some(f) = r.manifest.files.iter_mut().find(|f| f.id == *id) {
+                f.size = *size;
+                f.mtime_sec = *sec;
+                f.mtime_nsec = *nsec;
+            }
+        }
         // 指纹核对：对不上的文件，其条目一律不可信
         let mut stale: Vec<u32> = Vec::new();
         for f in r.manifest.files.clone() {
@@ -1392,7 +1713,8 @@ impl Reader {
             f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
             let mut off = 0usize;
             let mut cur: Option<(u32, u64)> = None;
-            let mut pending: Vec<(u32, u64, Vec<u8>)> = Vec::new();
+            // (文件号, 写它时的代号, 记录类型, 载荷)
+            let mut pending: Vec<(u32, u64, u8, Vec<u8>)> = Vec::new();
             while off + 5 <= buf.len() {
                 let rlen = u32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
                 let rk = buf[off + 4];
@@ -1424,30 +1746,42 @@ impl Reader {
                         let id = rd_u32(payload, &mut o)?;
                         self.removed.insert(id);
                     }
-                    REC_ENTRY => {
+                    REC_ENTRY | REC_TOMBSTONE => {
                         if let Some((fid, g)) = cur {
-                            pending.push((fid, g, payload.to_vec()));
+                            pending.push((fid, g, rk, payload.to_vec()));
                         }
                     }
                     _ => {} // 未知记录：按长度跳过（向前兼容）
                 }
             }
-            for (fid, g, payload) in pending {
+            for (fid, g, rk, payload) in pending {
                 if self.final_gen.get(&fid).copied().unwrap_or(g) != g {
                     continue; // 旧代号，作废
                 }
-                match kind {
-                    KIND_LOC if payload.len() == LOC_ENTRY => {
+                match (kind, rk) {
+                    (KIND_LOC, REC_ENTRY) if payload.len() == LOC_ENTRY => {
                         let e = dec_loc(&payload);
                         self.loc_over.insert((e.uuid, e.file_id), e);
                     }
-                    KIND_REL if payload.len() == REL_ENTRY => {
+                    (KIND_REL, REC_ENTRY) if payload.len() == REL_ENTRY => {
                         let e = dec_rel(&payload);
                         self.rel_over.entry((e.root, e.parent)).or_default().push(e);
                     }
-                    KIND_REV if payload.len() == REV_ENTRY => {
+                    (KIND_REV, REC_ENTRY) if payload.len() == REV_ENTRY => {
                         let e = dec_rev(&payload);
-                        self.rev_over.entry(e.target).or_default().push(e);
+                        // 同一个来源只留最后一条（追加写之后旧边还在日志里）
+                        self.rev_tomb.remove(&(e.target, e.source));
+                        let v = self.rev_over.entry(e.target).or_default();
+                        v.retain(|x| x.source != e.source);
+                        v.push(e);
+                    }
+                    (KIND_REV, REC_TOMBSTONE) if payload.len() == 32 => {
+                        let target = Uuid(payload[..16].try_into().unwrap());
+                        let source = Uuid(payload[16..].try_into().unwrap());
+                        self.rev_tomb.insert((target, source));
+                        if let Some(v) = self.rev_over.get_mut(&target) {
+                            v.retain(|x| x.source != source);
+                        }
                     }
                     _ => {}
                 }
@@ -1605,6 +1939,33 @@ impl Reader {
         Ok(Hit { file, data_start, off, len })
     }
 
+    /// 某个编号**在指定文件里**的定位条目（日志优先，按「编号 + 文件」）。
+    /// 「只追加登记」用它给新记录定树根、并读出被改节点的旧值。
+    fn loc_in_file(&mut self, id: Uuid, file_id: u32) -> Result<Option<LocEntry>, String> {
+        if !self.file_fresh(file_id) {
+            return Ok(None);
+        }
+        if let Some(e) = self.loc_over.get(&(id, file_id)) {
+            return Ok(Some(*e));
+        }
+        if !self.block_valid(file_id) {
+            return Ok(None);
+        }
+        let key = key_uuid(id);
+        for raw in self.collect_match(KIND_LOC, &key, 16)? {
+            let e = dec_loc(&raw);
+            if e.file_id == file_id {
+                return Ok(Some(e));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 某个编号**在指定文件里**的所属树根。
+    fn root_in_file(&mut self, id: Uuid, file_id: u32) -> Result<Option<Uuid>, String> {
+        Ok(self.loc_in_file(id, file_id)?.map(|e| e.root))
+    }
+
     /// 该编号所属的树根（同编号多文件 → 可能有多个）。
     fn roots_of(&mut self, id: Uuid) -> Result<Vec<Uuid>, String> {
         let mut out: HashSet<Uuid> = HashSet::new();
@@ -1717,7 +2078,12 @@ impl Reader {
             .collect_match(KIND_REV, &key, 16)?
             .into_iter()
             .map(|raw| dec_rev(&raw))
-            .filter(|e| self.block_valid(e.file_id) && self.file_fresh(e.file_id))
+            // 块里的老边也要被墓碑挡掉：节点改掉引用之后，旧目标不该再列出它
+            .filter(|e| {
+                self.block_valid(e.file_id)
+                    && self.file_fresh(e.file_id)
+                    && !self.rev_tomb.contains(&(e.target, e.source))
+            })
             .collect();
         for e in hits {
             if let Some(p) = self.path_of(e.file_id) {
@@ -1769,9 +2135,12 @@ impl Reader {
                 while i < blk.count {
                     if let Ok(raw) = blk.entry(i) {
                         let e = dec_rev(&raw);
-                        out.push((e.source, e.target));
-                        if out.len() >= limit {
-                            break;
+                        // 墓碑挡掉的老边不算（与 `references` 一个口径）
+                        if !self.rev_tomb.contains(&(e.target, e.source)) {
+                            out.push((e.source, e.target));
+                            if out.len() >= limit {
+                                break;
+                            }
                         }
                     }
                     i += 1;

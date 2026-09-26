@@ -105,17 +105,19 @@ fn take<'a>(data: &'a [u8], off: &mut usize, n: usize) -> Result<&'a [u8], Strin
 }
 
 /// 扫描单条节点：只读头 / 名字 / 值标记，跳过 text/blob 载荷（不物化大值）。
-struct Rec {
-    id: Uuid,
-    parent: Option<Uuid>,
-    name: String,
-    tag: u8,
-    ref_target: Option<Uuid>,
-    start: usize,
-    end: usize,
+pub(crate) struct Rec {
+    pub(crate) id: Uuid,
+    pub(crate) parent: Option<Uuid>,
+    pub(crate) name: String,
+    pub(crate) tag: u8,
+    pub(crate) ref_target: Option<Uuid>,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
-fn scan_node(data: &[u8], off: &mut usize) -> Result<Rec, String> {
+/// 解一条节点记录（只读头 / 名字 / 值标记，跳过载荷）。工作区台账的
+/// 「只登记新增的那一段」也用它，两边的解析口径必须一致。
+pub(crate) fn scan_node(data: &[u8], off: &mut usize) -> Result<Rec, String> {
     let start = *off;
     let id = Uuid(take(data, off, 16)?.try_into().unwrap());
     let p = Uuid(take(data, off, 16)?.try_into().unwrap());
@@ -1594,7 +1596,10 @@ impl MemoryBackend {
         let mut files = Vec::new();
         let mut reverse: HashMap<Uuid, Vec<(String, Uuid)>> = HashMap::new();
         for p in paths {
-            let store = Store::load(Path::new(p))?;
+            // 「整份载入」基准取的是**当前视图**：append-v1 文件里同编号有多份记录，
+            // 必须按「后写覆盖」折叠。用原始记录会多出已经被改掉的旧名字 / 旧引用边，
+            // 拿它当对拍基准会把「索引错了」当成「索引对了」。
+            let store = Store::load_view(Path::new(p))?;
             for n in store.nodes() {
                 if let Value::Reference(t) = &n.value {
                     reverse.entry(*t).or_default().push((p.clone(), n.id));

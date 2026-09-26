@@ -308,8 +308,8 @@ pub fn update_index(path: &Path) {
         Ok(t) => {
             if t.truncated_bytes > 0 {
                 eprintln!(
-                    "（提示：尾部有 {} 字节残片没登记——按 F015「忽略尾部残片」处理；\
-                     xr compact <文件> 可以把它折掉）",
+                    "（提示：尾部有 {} 字节残片（F015），只登记到最后一个完整记录；\
+                     这份残片要先截掉，之后的追加才登记得上（桌面端打开该文件会自动截断））",
                     t.truncated_bytes
                 );
             }

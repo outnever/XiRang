@@ -546,12 +546,19 @@ impl Store {
             .encode()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let bytes = make_file(&nodes_bytes);
-        std::fs::write(path, &bytes)?;
+        // 原子写：先在同目录写临时文件，再改名覆盖。
+        // 「整份重写」（保存 / 压实）写到一半崩掉时，原文件不会被写坏。
+        let mut tmp = path.to_path_buf();
+        let name = format!(
+            "{}.tmp{}",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("xirang"),
+            std::process::id()
+        );
+        tmp.set_file_name(name);
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, path)?;
         // 写穿 sidecar 索引（实现层缓存，失败静默，可重建）。
-        // 工作区台账模式（默认）下不再生成每文件侧车，改由 `xirang_core::wsidx` 维护。
-        if crate::index::sidecar_enabled() {
-            crate::index::write_for(path, &bytes);
-        }
+        crate::index::write_for(path, &bytes);
         Ok(())
     }
 

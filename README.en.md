@@ -289,7 +289,7 @@ immediately at the next byte. Read nodes until end of file.
 | [tests/](https://github.com/outnever/XiRang/tree/main/tests) | tests (pytest) |
 | [rust/core](https://github.com/outnever/XiRang/tree/main/rust/core) | Rust core library (codec / validation / tree / convert / query / index / shard / catalog) |
 | [rust/cli](https://github.com/outnever/XiRang/tree/main/rust/cli) | delivered CLI: `xr` and `xr-mcp` (`cargo build -p xirang-cli`) |
-| [app/](https://github.com/outnever/XiRang/tree/main/app) | desktop app (Tauri + Canvas) |
+| [app/](https://github.com/outnever/XiRang/tree/main/app) | desktop app (Rust + egui) |
 | [scripts/](https://github.com/outnever/XiRang/tree/main/scripts) | scripts such as the native-spec generator |
 
 > `tools/` (Python) is the **reference implementation**, semantically aligned with `rust/` (the delivered implementation); the authoritative behavior is `rust/` + `spec/`.

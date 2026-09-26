@@ -16,6 +16,8 @@ archive/
 
 # 实现层缓存（sidecar 索引，随 .xirang 自动重建）
 *.idx
+# 工作区台账（三本索引，随 .xirang 自动重建）
+.xirang-index/
 
 # 本地实验与临时目录
 .exp/

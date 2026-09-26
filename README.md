@@ -294,7 +294,7 @@ immediately at the next byte. Read nodes until end of file.
 | [tests/](https://github.com/outnever/XiRang/tree/main/tests) | 测试（pytest） |
 | [rust/core](https://github.com/outnever/XiRang/tree/main/rust/core) | Rust 核心库（编解码 / 校验 / 树 / 转换 / 查询 / 索引 / 分片 / 目录） |
 | [rust/cli](https://github.com/outnever/XiRang/tree/main/rust/cli) | 交付的 CLI：`xr` 与 `xr-mcp`（`cargo build -p xirang-cli`） |
-| [app/](https://github.com/outnever/XiRang/tree/main/app) | 桌面版（Tauri + Canvas） |
+| [app/](https://github.com/outnever/XiRang/tree/main/app) | 桌面版（Rust + egui） |
 | [scripts/](https://github.com/outnever/XiRang/tree/main/scripts) | 自举生成器等脚本 |
 
 > `tools/`（Python）是**参考实现**，与 `rust/`（交付实现）语义对齐；正式行为以 `rust/` + `spec/` 为准。

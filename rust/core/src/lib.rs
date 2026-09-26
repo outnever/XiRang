@@ -7,6 +7,7 @@
 //! - `convert`：格式转换（后续）
 
 pub mod codec;
+pub mod fixture;
 pub mod catalog;
 pub mod convert;
 pub mod index;

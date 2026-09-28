@@ -120,9 +120,10 @@ fn conflict_refuses_write_and_check_helps_resolve_it() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// 批量提交也按「改一处同步到所有副本」：默认两份都改；`--here` 才只改点名的那个。
 #[test]
-fn batch_refuses_when_a_copy_lives_elsewhere() {
-    let root = tmp_root("batchvalve");
+fn batch_syncs_all_copies_and_here_opts_out() {
+    let root = tmp_root("batchsync");
     let (word, _) = two_files(&root);
     std::fs::write(
         root.join("l.jsonl"),
@@ -130,17 +131,27 @@ fn batch_refuses_when_a_copy_lives_elsewhere() {
     )
     .unwrap();
 
-    // 默认：拒绝（批量的同步语义还没做）
-    let (code, _, err) = run(&root, &["batch", "a.xirang", "l.jsonl", "--no-history"]);
-    assert_eq!(code, 2, "有副本时批量应当拒绝：{err}");
-    assert!(err.contains("--here"), "要给出逃生口：{err}");
-
-    // --here：放行，但只改 a
-    let (code, _, err) = run(&root, &["batch", "a.xirang", "l.jsonl", "--no-history", "--here"]);
+    // 默认：两份都改，并逐文件报账
+    let (code, out, err) = run(&root, &["batch", "a.xirang", "l.jsonl", "--no-history"]);
     assert_eq!(code, 0, "{err}");
-    let (_, out, _) = run(&root, &["find", "a.xirang", "批量"]);
-    assert!(out.contains(&word), "{out}");
-    let (_, out, _) = run(&root, &["find", "b.xirang", "批量"]);
+    assert!(out.contains("已批量提交"), "{out}");
+    assert_eq!(out.matches(".xirang →").count(), 2, "逐文件报账：{out}");
+    for f in ["a.xirang", "b.xirang"] {
+        let (_, out, _) = run(&root, &["find", f, "批量"]);
+        assert!(out.contains(&word), "{f} 应当也改成「批量」：{out}");
+    }
+
+    // --here：只改点名的那个，并提示别处没跟着改
+    std::fs::write(
+        root.join("l2.jsonl"),
+        format!("{{\"op\":\"set\",\"id\":\"{word}\",\"value\":\"只改一份\"}}\n"),
+    )
+    .unwrap();
+    let (code, _out, err) =
+        run(&root, &["batch", "a.xirang", "l2.jsonl", "--no-history", "--here"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("副本没跟着改"), "{err}");
+    let (_, out, _) = run(&root, &["find", "b.xirang", "只改一份"]);
     assert!(out.contains("0 个匹配"), "b 不该被改：{out}");
 
     std::fs::remove_dir_all(&root).ok();

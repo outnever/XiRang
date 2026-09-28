@@ -1557,6 +1557,8 @@ pub struct BatchOutcome {
     pub dry_run: bool,
     /// 这次改动落到哪些文件（单文件提交时只有一项）。
     pub files: Vec<BatchFileOutcome>,
+    /// 用了 `--here` 时：因为「只改点名的文件」而**没有**跟着改的副本（最多列几个）。
+    pub others: Vec<String>,
 }
 
 /// 批量提交的开关（用结构体，免得一长串 bool 传错位置）。
@@ -1700,33 +1702,94 @@ pub fn batch_edit(
     opts: BatchOptions,
 ) -> OpResult<BatchOutcome> {
     let path = pol.resolve(target)?;
-    // 单文件：整批都落在这一个文件里
+    // 普通文件：每条改动落到「点名的文件 ∪ 所有含该编号的副本」（`--here` 只落点名文件）。
+    // 这与单节点写的规则一致：改一处同步到所有副本，冲突先裁决、失败整体回滚。
     if !path.is_dir() {
-        guard_batch_copies(pol, &[path.clone()], &path, ops)?;
-        let out = xirang_core::edit::apply_batch(
-            &path,
-            ops,
+        let here_key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let mut groups: Vec<(PathBuf, Vec<xirang_core::edit::BatchOp>)> = Vec::new();
+        let mut others: Vec<String> = Vec::new();
+        let mut cache: HashMap<Uuid, Vec<PathBuf>> = HashMap::new();
+        for op in ops {
+            let id = op.id();
+            let targets = match cache.get(&id) {
+                Some(v) => v.clone(),
+                None => {
+                    let copies = copy_files(pol, &path, id);
+                    let mut v: Vec<PathBuf> = vec![path.clone()];
+                    for c in copies {
+                        if c.canonicalize().unwrap_or_else(|_| c.clone()) == here_key {
+                            continue;
+                        }
+                        if pol.here {
+                            others.push(c.display().to_string());
+                        } else {
+                            v.push(c);
+                        }
+                    }
+                    // MCP：副本在允许目录之外 → 拒绝整批（同步是硬保证，不静默少写一个文件）
+                    let outside: Vec<String> = v
+                        .iter()
+                        .filter(|p| !pol.allows(p))
+                        .map(|p| p.display().to_string())
+                        .collect();
+                    if !outside.is_empty() {
+                        return Err(OpError::path_denied(format!(
+                            "这些副本在允许目录之外，无法一起同步：{}",
+                            outside.join("、")
+                        ))
+                        .hint("同步是硬保证，所以整批被拒绝；只想改点名的文件就加 here"));
+                    }
+                    cache.insert(id, v.clone());
+                    v
+                }
+            };
+            for f in targets {
+                match groups.iter_mut().find(|(g, _)| *g == f) {
+                    Some((_, list)) => list.push(op.clone()),
+                    None => groups.push((f, vec![op.clone()])),
+                }
+            }
+        }
+        others.sort();
+        others.dedup();
+        let out = xirang_core::edit::apply_batch_shared(
+            &groups,
             !opts.no_history,
             pol.force,
             opts.dry_run,
             opts.allow_missing_target,
         )
-        .map_err(OpError::invalid)?;
+        .map_err(|e| match e {
+            xirang_core::edit::EditError::Guarded(m)
+            | xirang_core::edit::EditError::Conflict(m) => OpError::guarded(
+                m,
+                "先裁决再写；只想改点名的文件就加 `--here`",
+            ),
+            xirang_core::edit::EditError::Unavailable(m)
+            | xirang_core::edit::EditError::Failed(m) => OpError::internal(m),
+        })?;
         if !opts.dry_run {
-            hooks.on_save(&path, None); // 没有编号表：目录登记转后台
-            update_index(&path);
+            for (f, _) in &groups {
+                hooks.on_save(f, None); // 没有编号表：目录登记转后台
+                update_index(f);
+            }
         }
+        let files: Vec<BatchFileOutcome> = out
+            .iter()
+            .map(|(p, o)| BatchFileOutcome {
+                file: p.display().to_string(),
+                ops: o.ops,
+                changed: o.changed,
+                appended: o.appended,
+            })
+            .collect();
         return Ok(BatchOutcome {
             ops: ops.len(),
-            changed: out.changed,
-            appended: out.appended,
+            changed: files.iter().map(|f| f.changed).sum(),
+            appended: files.iter().map(|f| f.appended).sum(),
             dry_run: opts.dry_run,
-            files: vec![BatchFileOutcome {
-                file: path.display().to_string(),
-                ops: ops.len(),
-                changed: out.changed,
-                appended: out.appended,
-            }],
+            files,
+            others,
         });
     }
 
@@ -1836,6 +1899,7 @@ pub fn batch_edit(
         appended: files.iter().map(|f| f.appended).sum(),
         dry_run: opts.dry_run,
         files,
+        others: Vec::new(),
     })
 }
 

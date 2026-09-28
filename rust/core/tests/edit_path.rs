@@ -101,6 +101,87 @@ fn direct_edit_matches_full_load_edit() {
     std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
 }
 
+// ============================================================================
+// 跨文件批量（`edit::apply_batch_shared`）：一批改动同步写进多个文件
+// ============================================================================
+
+/// 同一批改动写进两个文件（同一编号在两份里的三个字段一致）。
+#[test]
+fn batch_shared_writes_every_file() {
+    let dir = tmp_dir("batchshared");
+    let (paths, word, _) = two_files_same_node(&dir, 2);
+    for p in &paths {
+        wsidx::rebuild(&dir, &[]).unwrap();
+        let _ = p;
+    }
+    let ops = vec![edit::BatchOp::Set { id: word, value: Value::Text("火".into()) }];
+    let files: Vec<(PathBuf, Vec<edit::BatchOp>)> =
+        paths.iter().map(|p| (p.clone(), ops.clone())).collect();
+    let out = edit::apply_batch_shared(&files, false, false, false, false).unwrap();
+    assert_eq!(out.len(), 2, "两份都要写到");
+    for p in &paths {
+        let view = tree::Store::load_view(p).unwrap();
+        assert_eq!(view.get(word).unwrap().value, Value::Text("火".into()), "{} 没改到", p.display());
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
+/// 副本之间三字段不一致 → 整批拒绝，一个字节都不写。
+#[test]
+fn batch_shared_refuses_on_conflict() {
+    let dir = tmp_dir("batchsharedconflict");
+    let (paths, word, _) = two_files_same_node(&dir, 2);
+    wsidx::rebuild(&dir, &[]).unwrap();
+    // 只把乙那份的名字改掉
+    edit::edit_node(&paths[1], word, Some("词形改".into()), None, false, false).unwrap();
+    wsidx::rebuild(&dir, &[]).unwrap();
+    let before: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+    let ops = vec![edit::BatchOp::Set { id: word, value: Value::Text("火".into()) }];
+    let files: Vec<(PathBuf, Vec<edit::BatchOp>)> =
+        paths.iter().map(|p| (p.clone(), ops.clone())).collect();
+    let err = edit::apply_batch_shared(&files, false, false, false, false).unwrap_err();
+    match &err {
+        edit::EditError::Conflict(m) => assert!(m.contains("名字"), "要说清哪个字段：{m}"),
+        other => panic!("应当是冲突：{other:?}"),
+    }
+    for (p, b) in paths.iter().zip(before.iter()) {
+        assert_eq!(&std::fs::read(p).unwrap(), b, "{} 不许被写", p.display());
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
+/// 其中一个文件写不进去 → 所有写过的文件都截回原长度（跨文件整体回滚）。
+#[test]
+fn batch_shared_rolls_back_when_one_file_fails() {
+    let dir = tmp_dir("batchsharedrollback");
+    let (paths, word, _) = two_files_same_node(&dir, 2);
+    wsidx::rebuild(&dir, &[]).unwrap();
+    let before: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&paths[1]).unwrap().permissions();
+        perm.set_mode(0o444);
+        std::fs::set_permissions(&paths[1], perm).unwrap();
+        let ops = vec![edit::BatchOp::Set { id: word, value: Value::Text("火".into()) }];
+        let files: Vec<(PathBuf, Vec<edit::BatchOp>)> =
+            paths.iter().map(|p| (p.clone(), ops.clone())).collect();
+        assert!(
+            edit::apply_batch_shared(&files, false, false, false, false).is_err(),
+            "第二份写不进去就该整体失败"
+        );
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), before[0], "第一份必须被截回原长度");
+        let mut perm = std::fs::metadata(&paths[1]).unwrap().permissions();
+        perm.set_mode(0o644);
+        std::fs::set_permissions(&paths[1], perm).unwrap();
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
 /// 文件还没登记过（典型：复制到干净目录）→ **就地整份登记一次**，别把流程卡住。
 #[test]
 fn direct_edit_auto_registers_when_unregistered() {

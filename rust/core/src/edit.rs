@@ -804,6 +804,109 @@ pub fn apply_batch(
     Ok(out)
 }
 
+/// **一批改动、跨多个文件**：一个编号在多个文件里都有副本时，
+/// 把同一条改动同步写进这些文件（与单节点的 [`edit_shared`] 同一套语义）。
+///
+/// 三段走：
+/// 1. **校验**：逐个文件整批预演一遍（编号在不在、模板护栏、引用目标、名字长度…），
+///    再检查「同一个编号在不同文件里的三字段是否一致」——不一致就是冲突，先裁决再写；
+/// 2. **落盘**：逐个文件写（每个文件内部仍然「先算完再连续追加」）；
+///    任何一个文件失败 → 把**所有已经写过的文件**（含失败那个）截回原长度；
+/// 3. **登记**：每个文件写完之后各自登记（回滚时也会把该文件的台账重新对齐）。
+///
+/// `files` 的每一项是「这个文件要写哪些改动」，顺序即落盘顺序（第一个是用户点名的那个）。
+pub fn apply_batch_shared(
+    files: &[(PathBuf, Vec<BatchOp>)],
+    history: bool,
+    force: bool,
+    dry_run: bool,
+    allow_missing_target: bool,
+) -> Result<Vec<(PathBuf, BatchOutcome)>, EditError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    // —— 第一遍：逐个文件预演（一个字节都不写）——
+    for (path, ops) in files {
+        apply_batch(path, ops, history, force, true, allow_missing_target)
+            .map_err(|e| EditError::unavailable(e))?;
+    }
+    // 同一个编号出现在多个文件里 → 三字段必须一致（不一致先裁决）
+    let mut seen: std::collections::HashMap<Uuid, (PathBuf, Node)> = std::collections::HashMap::new();
+    for (path, ops) in files {
+        let mut ids: Vec<Uuid> = ops.iter().map(|o| o.id()).collect();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        ids.dedup();
+        for id in ids {
+            let cur = match read_node(path, id) {
+                Ok(Some(n)) => n,
+                // 这个文件里没有它（预演已经通过了，理论上不会）：跳过这层检查
+                _ => continue,
+            };
+            match seen.get(&id) {
+                Some((first_path, first)) => {
+                    let diff = differing_fields(first, &cur);
+                    if !diff.is_empty() {
+                        return Err(EditError::Conflict(format!(
+                            "编号 {id} 在多个文件里的{}不一样（{} vs {}）——先裁决再写：\
+                             xr catalog check 看详情，xr catalog check --sync {id} --base <文件> 把别处对齐到基准；\
+                             只想改点名的文件就加 --here",
+                            diff.join(" / "),
+                            first_path.display(),
+                            path.display()
+                        )));
+                    }
+                }
+                None => {
+                    seen.insert(id, (path.clone(), cur));
+                }
+            }
+        }
+    }
+    if dry_run {
+        let mut out = Vec::new();
+        for (path, ops) in files {
+            let r = apply_batch(path, ops, history, force, true, allow_missing_target)
+                .map_err(EditError::unavailable)?;
+            out.push((path.clone(), r));
+        }
+        return Ok(out);
+    }
+
+    // —— 第二遍：逐个文件写；失败就把写过的全部截回原长度 ——
+    let mut done: Vec<(PathBuf, u64, BatchOutcome)> = Vec::new();
+    for (path, ops) in files {
+        let before_len = match fs::metadata(path) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                return Err(EditError::Failed(format!("{}：{e}", path.display())));
+            }
+        };
+        match apply_batch(path, ops, history, force, false, allow_missing_target) {
+            Ok(o) => done.push((path.clone(), before_len, o)),
+            Err(e) => {
+                // 回滚：写过的（含这个可能写了一半的）都截回原长度，并让台账重新对齐
+                let mut rolled: Vec<String> = Vec::new();
+                let mut all: Vec<(PathBuf, u64)> =
+                    done.iter().map(|(p, l, _)| (p.clone(), *l)).collect();
+                all.push((path.clone(), before_len));
+                for (p, len) in all {
+                    if let Ok(f) = fs::OpenOptions::new().write(true).open(&p) {
+                        let _ = f.set_len(len);
+                    }
+                    let _ = wsidx::append_tail(&wsidx::workspace_root(&p), &p);
+                    rolled.push(p.display().to_string());
+                }
+                return Err(EditError::Failed(format!(
+                    "{} 写入失败：{e}（已把本次改动整体回滚：{}）",
+                    path.display(),
+                    rolled.join("、")
+                )));
+            }
+        }
+    }
+    Ok(done.into_iter().map(|(p, _, o)| (p, o)).collect())
+}
+
 /// 攒缓冲、按块写（1 MB 一次 write）。
 struct Pusher<'a> {
     f: &'a mut fs::File,

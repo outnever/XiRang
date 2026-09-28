@@ -204,7 +204,7 @@ The same id in several files is **not a duplicate and not a master/copy relation
 - **`--here`**: write only the file you named, and say that other copies were left behind (MCP: `here: true`). Writes into a shard-collection directory still land only in the target shard.
 - The search scope is "files that have been opened (registered)": local catalog ∪ current workspace ledger ∪ the file you named. Re-run `xr catalog scan` after moving to another machine or directory.
 
-> Deliberately **not** done in this round: ① merging happens in the **display layer only** — the children of two files are never physically merged into one file; ② adding a child still targets one file at a time; a batch that touches an id which also exists elsewhere is refused, telling you to use `xr set` (which syncs) or to add `--here`.
+> Deliberately **not** done in this round: merging happens in the **display layer only** — the children of two files are never physically merged into one file, and adding a child still targets one file at a time. **Batches follow the same rule as single-node writes**: every entry is synced into all files containing that id (with a cross-file rollback on failure); `--here` narrows it to the named file.
 
 ### `xr batch <file|collection-dir> <list-file|-> [--no-history] [--dry-run] [--json] [--yes] [--allow-missing-target]`
 
@@ -224,6 +224,7 @@ Submit **a batch** of changes at once (for migrations of hundreds of thousands o
 - `--dry-run` validates only: it reports how many nodes would change and writes nothing.
 - `--no-history` skips `@history` (recommended for migrations: otherwise each change adds two extra history nodes).
 - Only **existing** nodes; to bulk **create**, use `xr import --append`.
+- **Same rule as single-node writes**: when an id also exists in other files, each change is **synced into every file that has it** (each keeps its own history), and any failure rolls the whole batch back; `--here` restricts it to the named file and tells you which copies were left behind.
 - **Reference targets are checked**: a `link` / `ref` target must be findable in **this workspace (including other shards) or the local catalog**, otherwise the whole batch is refused with the line number; pass `--allow-missing-target` to write a dangling reference on purpose.
 - **Unregistered files work**: a collection copied to a clean directory has no ledger yet — the command registers it in full on the spot (single-node writes do the same), so a migration never stalls at step one.
 - **One list can span several files**: when the target is a **collection directory**, ops are dispatched to the shard holding each id, and each shard is validated-then-written; the output reports per file. Shards have no cross-file transaction, but the failure message says which files succeeded, so re-running is easy.

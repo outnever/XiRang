@@ -771,6 +771,13 @@ fn cmd_batch(
                     );
                 }
             }
+            if !o.others.is_empty() {
+                eprintln!(
+                    "（提示：{} 个副本没跟着改（因为 --here）：{}）",
+                    o.others.len(),
+                    o.others.join("、")
+                );
+            }
             if o.dry_run {
                 println!(
                     "（预演）校验通过：清单 {} 条，会改到 {} 个节点；没有写文件",

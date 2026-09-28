@@ -102,17 +102,42 @@ pub struct Policy {
     pub force: bool,
     /// 允许操作的目录。空 = 不限制（CLI 沿用进程工作目录）。
     pub roots: Vec<PathBuf>,
+    /// 是否使用本机目录（catalog）。CLI：`XIRANG_INDEX=off` / `--no-index` 时关。
+    pub catalog: bool,
+    /// 只改点名的那个文件、不同步副本（CLI：`--here`；MCP：`here`）。
+    pub here: bool,
 }
 
 impl Policy {
     /// CLI：不限制路径；`--yes` → force。
     pub fn cli(force: bool) -> Self {
-        Policy { force, roots: Vec::new() }
+        Policy { force, roots: Vec::new(), catalog: true, here: false }
     }
 
     /// MCP：路径必须落在允许目录内（roots 非空）。
     pub fn mcp(force: bool, roots: Vec<PathBuf>) -> Self {
-        Policy { force, roots }
+        Policy { force, roots, catalog: true, here: false }
+    }
+
+    /// 本机目录不可用（`XIRANG_INDEX=off` / `--no-index`）。
+    pub fn without_catalog(mut self) -> Self {
+        self.catalog = false;
+        self
+    }
+
+    /// 只改点名的文件、不同步副本。
+    pub fn only_here(mut self) -> Self {
+        self.here = true;
+        self
+    }
+
+    /// 这个路径是否落在允许目录内（roots 空 = 不限制）。
+    pub fn allows(&self, path: &Path) -> bool {
+        if self.roots.is_empty() {
+            return true;
+        }
+        let target = realish(path);
+        self.roots.iter().any(|r| target.starts_with(realish(r)))
     }
 
     /// 把一个用户给的路径字符串解析成实际路径，并做允许目录检查。
@@ -298,36 +323,211 @@ fn mark_append_protocol(store: &mut tree::Store) -> OpResult<()> {
 /// - `Ok(None)`：这条路走不通（没台账 / 台账对不上 / 编号不在这个文件里 /
 ///   写失败），调用方退回「整份载入 → 只追加写」的老路；
 /// - `Err(护栏)`：模板定义被拦下——与老路同一条护栏、同一句提示。
-fn try_direct_edit(
+/// 这次写落到哪些文件、哪些被跳过（配合 `--here` 报告"别处还有副本没跟着改"）。
+#[derive(Clone, Debug, Default)]
+pub struct SyncReport {
+    /// 实际写进去的文件（按路径排序）。
+    pub written: Vec<String>,
+    /// 登记里记着、但实际已经没有这个编号的文件（缓存过期）。
+    pub skipped: Vec<String>,
+    /// 因为 `--here` 而**没有**跟着改的副本。
+    pub others: Vec<String>,
+}
+
+/// 同一个编号还出现在哪些文件里（本机目录 ∪ 当前工作区台账；只读、尽力而为）。
+pub fn copy_files(pol: &Policy, named: &Path, id: Uuid) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if pol.catalog {
+        if let Ok(mut r) = xirang_core::catalog::CatalogReader::open(
+            &xirang_core::catalog::default_path(),
+        ) {
+            if let Ok(paths) = r.lookup_all(id) {
+                for p in paths {
+                    out.push(PathBuf::from(p));
+                }
+            }
+        }
+    }
+    let ws_root = xirang_core::wsidx::workspace_root(named);
+    if let Ok(mut r) = xirang_core::wsidx::Reader::open(&ws_root) {
+        if let Ok(hits) = r.locate(id) {
+            for h in hits {
+                out.push(PathBuf::from(h.file));
+            }
+        }
+    }
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    out.retain(|p| p.is_file() && seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
+    out
+}
+
+/// 「跨文件同步编辑」的快路：点名的文件 + 所有含该编号的副本，一起改；
+/// 失败整体回滚（在 `core::edit::edit_shared` 里）。返回 `None` = 这条路走不通，
+/// 调用方退回整份载入（退回前会检查"会不会只改一份造成不一致"）。
+fn shared_edit(
     pol: &Policy,
     hooks: &dyn Hooks,
-    path: &Path,
+    named: &Path,
     id: Uuid,
     new_name: Option<String>,
     new_value: Option<XValue>,
     history: bool,
-) -> OpResult<Option<()>> {
-    match xirang_core::edit::under_template(path, id) {
-        Ok(false) => {}
-        Ok(true) => {
-            if !pol.force {
-                return Err(OpError::guarded(
-                    "该节点属于模板定义，不能直接编辑",
-                    "模板定义请用 template 操作修改；确需直接改请显式强制（CLI：--yes，MCP：force）",
-                ));
+) -> OpResult<Option<SyncReport>> {
+    let named_key = named.canonicalize().unwrap_or_else(|_| named.to_path_buf());
+    let copies = copy_files(pol, named, id);
+    // 点名的那一个**永远排第一**：它是「用户要改的那个文件」，
+    // 它出问题要直接报；后面那些是副本，出问题只跳过并说明。
+    let mut files: Vec<PathBuf> = vec![named.to_path_buf()];
+    let mut others: Vec<String> = Vec::new();
+    let mut extra: Vec<PathBuf> = Vec::new();
+    for c in &copies {
+        let key = c.canonicalize().unwrap_or_else(|_| c.clone());
+        if key == named_key {
+            continue;
+        }
+        others.push(c.display().to_string());
+        if !pol.here {
+            extra.push(c.clone());
+        }
+    }
+    extra.sort();
+    files.extend(extra);
+    if !pol.here {
+        // MCP：副本在允许目录之外 → 拒绝整次写（同步是硬保证，不静默少写一个文件）
+        let outside: Vec<String> = files
+            .iter()
+            .filter(|p| !pol.allows(p))
+            .map(|p| p.display().to_string())
+            .collect();
+        if !outside.is_empty() {
+            return Err(OpError::path_denied(format!(
+                "这些副本在允许目录之外，无法一起同步：{}",
+                outside.join("、")
+            ))
+            .hint("同步是硬保证，所以整次写被拒绝；只想改点名的那一个文件就加 here"));
+        }
+    }
+    // 去重但保持顺序（点名的那个仍在最前）
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    files.retain(|p| seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
+    match xirang_core::edit::edit_shared(&files, id, new_name, new_value, None, history, pol.force) {
+        Ok(o) => {
+            for f in &o.written {
+                hooks.on_save(f, None); // 没有编号表：目录登记转后台
+                update_index(f);
             }
+            let mut report = SyncReport::default();
+            report.written = o
+                .written
+                .iter()
+                .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()).display().to_string())
+                .collect();
+            report.skipped =
+                o.skipped.iter().map(|(p, why)| format!("{}（{why}）", p.display())).collect();
+            report.others = if pol.here { others } else { Vec::new() };
+            Ok(Some(report))
         }
-        // 台账不可用：护栏留给老路（它会整份载入后判断）
-        Err(_) => return Ok(None),
+        Err(xirang_core::edit::EditError::Guarded(msg)) => Err(OpError::guarded(
+            msg,
+            "模板定义请用 template 操作修改；确需直接改请显式强制（CLI：--yes，MCP：force）",
+        )),
+        Err(xirang_core::edit::EditError::Conflict(msg)) => Err(OpError::guarded(
+            msg,
+            "先裁决再写；只想改点名的这一个文件就加 --here",
+        )),
+        Err(xirang_core::edit::EditError::Unavailable(_)) => Ok(None),
+        Err(xirang_core::edit::EditError::Failed(msg)) => Err(OpError::internal(msg)),
     }
-    match xirang_core::edit::edit_node(path, id, new_name, new_value, history) {
-        Ok(_out) => {
-            hooks.on_save(path, None); // 没有编号表：目录登记转后台
-            update_index(path);
-            Ok(Some(()))
+}
+
+/// 快路走不通时，检查「直接整份改点名的文件」会不会只改一份造成不一致。
+fn refuse_if_copies_exist(pol: &Policy, named: &Path, id: Uuid) -> OpResult<()> {
+    if pol.here {
+        return Ok(());
+    }
+    let named_key = named.canonicalize().unwrap_or_else(|_| named.to_path_buf());
+    let extra: Vec<String> = copy_files(pol, named, id)
+        .into_iter()
+        .filter(|p| p.canonicalize().unwrap_or_else(|_| p.clone()) != named_key)
+        .map(|p| p.display().to_string())
+        .collect();
+    if extra.is_empty() {
+        return Ok(());
+    }
+    Err(OpError::guarded(
+        format!("编号 {id} 在其它文件里也有副本：{}", extra.join("、")),
+        "这次台账这条快路用不了，直接整份改会只改一份、造成两边不一致；\
+         先跑 `xr index update` 再试，或加 `--here` 明确只改点名的文件",
+    ))
+}
+
+/// 点名的目标解析成「具体哪个文件」：文件直接用；词库目录按编号找它所在的分片。
+/// 目录里找不到就返回 `None`（调用方走老路，让老路给出准确报错）。
+fn named_file_for(resolved: &Path, id: Uuid) -> Option<PathBuf> {
+    if !resolved.is_dir() {
+        return Some(resolved.to_path_buf());
+    }
+    let ws_root = xirang_core::wsidx::workspace_root(resolved);
+    let _ = xirang_core::wsidx::update(&ws_root);
+    let mut r = xirang_core::wsidx::Reader::open(&ws_root).ok()?;
+    let dir = resolved.canonicalize().unwrap_or_else(|_| resolved.to_path_buf());
+    r.locate(id)
+        .ok()?
+        .into_iter()
+        .find(|h| Path::new(&h.file).parent().map(|p| p == dir).unwrap_or(false))
+        .map(|h| PathBuf::from(h.file))
+}
+
+/// 批量提交的**安全阀**：清单里某个编号在**本次没涉及**的别的文件里也有副本时，
+/// 默认拒绝整批——批量的同步语义还没做，直接写会只改一份、把两边弄成不一致。
+/// 真只想改这些文件，就加 `--here`（MCP：`here: true`）。
+fn guard_batch_copies(
+    pol: &Policy,
+    involved: &[PathBuf],
+    named: &Path,
+    ops: &[xirang_core::edit::BatchOp],
+) -> OpResult<()> {
+    if pol.here {
+        return Ok(());
+    }
+    // 比「在不在本次涉及的文件里」要按**规范路径**比：命令行给的可能是相对路径，
+    // 而目录/台账里存的是规范路径（macOS 上 /var 与 /private/var 还是两个写法）。
+    let involved_keys: Vec<PathBuf> = involved
+        .iter()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .collect();
+    let mut cache: HashMap<Uuid, Vec<String>> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        let id = op.id();
+        let extra = match cache.get(&id) {
+            Some(v) => v.clone(),
+            None => {
+                let v: Vec<String> = copy_files(pol, named, id)
+                    .into_iter()
+                    // 必须在本次涉及的文件之外，而且**确实还含这个编号**
+                    .filter(|p| {
+                        !involved_keys.contains(&p.canonicalize().unwrap_or_else(|_| p.clone()))
+                    })
+                    .filter(|p| matches!(xirang_core::edit::read_node(p, id), Ok(Some(_))))
+                    .map(|p| p.display().to_string())
+                    .collect();
+                cache.insert(id, v.clone());
+                v
+            }
+        };
+        if !extra.is_empty() {
+            return Err(OpError::guarded(
+                format!(
+                    "第 {} 条：编号 {id} 在别的文件里也有副本：{}",
+                    i + 1,
+                    extra.join("、")
+                ),
+                "批量提交还不会自动同步副本（下一轮做）；现在就改这些文件请加 `--here`，\
+                 或者用 `xr set` 单条改（它会同步到所有副本）",
+            ));
         }
-        Err(_) => Ok(None),
     }
+    Ok(())
 }
 
 /// 数据落盘后的索引维护：台账模式追加日志（侧车模式由 `Store::save` 自己写侧车）。
@@ -1484,6 +1684,8 @@ pub struct SetOutcome {
     pub id: Uuid,
     /// 走的是「按编号直读单节点」快路吗（true = 没有整份载入文件）。
     pub via_index: bool,
+    /// 这次写落到哪些文件（单文件时只有一项）。
+    pub sync: SyncReport,
 }
 
 /// 批量提交：一个进程、一次落盘、一次台账登记。
@@ -1500,6 +1702,7 @@ pub fn batch_edit(
     let path = pol.resolve(target)?;
     // 单文件：整批都落在这一个文件里
     if !path.is_dir() {
+        guard_batch_copies(pol, &[path.clone()], &path, ops)?;
         let out = xirang_core::edit::apply_batch(
             &path,
             ops,
@@ -1575,6 +1778,12 @@ pub fn batch_edit(
     }
 
     // 先整批校验（每个文件都预演一遍）：任何一个文件过不去，就一个字节都不写
+    {
+        let involved: Vec<PathBuf> = groups.iter().map(|(f, _)| f.clone()).collect();
+        for (file, group) in &groups {
+            guard_batch_copies(pol, &involved, file, group)?;
+        }
+    }
     for (file, group) in &groups {
         xirang_core::edit::apply_batch(
             file,
@@ -1639,20 +1848,17 @@ pub fn set_value(
     no_history: bool,
 ) -> OpResult<SetOutcome> {
     let id = parse_uuid("节点 ID", node)?;
-    let raw_path = pol.resolve(file)?;
-    if !raw_path.is_dir()
-        && try_direct_edit(
-            pol,
-            hooks,
-            &raw_path,
-            id,
-            None,
-            Some(value.clone()),
-            !no_history,
-        )?
-        .is_some()
-    {
-        return Ok(SetOutcome { id, via_index: true });
+    let resolved = pol.resolve(file)?;
+    // 词库目录目标：沿用老路（按编号定位到目标分片，只改那一个分片）——
+    // 分片协议保证一个编号只属于一个分片，这一轮不做「跨目录副本同步」。
+    if !resolved.is_dir() {
+        let named = resolved.clone();
+        if let Some(sync) = shared_edit(pol, hooks, &named, id, None, Some(value.clone()), !no_history)?
+        {
+            return Ok(SetOutcome { id, via_index: true, sync });
+        }
+        // 快路走不通（台账用不了）：如果别处还有副本，宁可拒绝，也不只改一份
+        refuse_if_copies_exist(pol, &named, id)?;
     }
     let (mut store, path, in_collection) = load_target(pol, hooks, file, Some(id))?;
     guard_editable(pol, &store, id)?;
@@ -1660,7 +1866,7 @@ pub fn set_value(
     let r = if no_history { store.set_quiet(id, value) } else { store.update(id, value) };
     r.map_err(OpError::internal)?;
     save(hooks, &mut store, &path, in_collection, Some(&before))?;
-    Ok(SetOutcome { id, via_index: false })
+    Ok(SetOutcome { id, via_index: false, sync: SyncReport::default() })
 }
 
 pub struct RenameOutcome {
@@ -1668,6 +1874,8 @@ pub struct RenameOutcome {
     pub name: String,
     /// 走的是「按编号直读单节点」快路吗。
     pub via_index: bool,
+    /// 这次写落到哪些文件。
+    pub sync: SyncReport,
 }
 
 pub fn rename_node(
@@ -1686,20 +1894,26 @@ pub fn rename_node(
         return Err(OpError::invalid("名字超 255 字节"));
     }
     // 快路：普通文件 + 台账可用 → 按编号直读那一条，不整份载入
-    let raw_path = pol.resolve(file)?;
-    if !raw_path.is_dir()
-        && try_direct_edit(
+    let resolved = pol.resolve(file)?;
+    if !resolved.is_dir() {
+        let named = resolved.clone();
+        if let Some(sync) = shared_edit(
             pol,
             hooks,
-            &raw_path,
+            &named,
             id,
             Some(new_name.to_string()),
             None,
             !no_history,
-        )?
-        .is_some()
-    {
-        return Ok(RenameOutcome { id, name: new_name.to_string(), via_index: true });
+        )? {
+            return Ok(RenameOutcome {
+                id,
+                name: new_name.to_string(),
+                via_index: true,
+                sync,
+            });
+        }
+        refuse_if_copies_exist(pol, &named, id)?;
     }
     let (mut store, path, in_collection) = load_target(pol, hooks, file, Some(id))?;
     guard_editable(pol, &store, id)?;
@@ -1711,13 +1925,20 @@ pub fn rename_node(
     };
     r.map_err(OpError::internal)?;
     save(hooks, &mut store, &path, in_collection, Some(&before))?;
-    Ok(RenameOutcome { id, name: new_name.to_string(), via_index: false })
+    Ok(RenameOutcome {
+        id,
+        name: new_name.to_string(),
+        via_index: false,
+        sync: SyncReport::default(),
+    })
 }
 
 pub struct RemoveOutcome {
     pub id: Uuid,
     /// 走的是「按编号直读单节点」快路吗。
     pub via_index: bool,
+    /// 这次写落到哪些文件。
+    pub sync: SyncReport,
 }
 
 pub fn remove_node(
@@ -1728,32 +1949,35 @@ pub fn remove_node(
 ) -> OpResult<RemoveOutcome> {
     let id = parse_uuid("节点 ID", node)?;
     // 快路：普通文件 + 台账可用 → 按编号直读那一条，不整份载入
-    let raw_path = pol.resolve(file)?;
-    if !raw_path.is_dir()
-        && try_direct_edit(
+    let resolved = pol.resolve(file)?;
+    if !resolved.is_dir() {
+        let named = resolved.clone();
+        if let Some(sync) = shared_edit(
             pol,
             hooks,
-            &raw_path,
+            &named,
             id,
             Some(String::new()),
             Some(XValue::Empty),
             true,
-        )?
-        .is_some()
-    {
-        return Ok(RemoveOutcome { id, via_index: true });
+        )? {
+            return Ok(RemoveOutcome { id, via_index: true, sync });
+        }
+        refuse_if_copies_exist(pol, &named, id)?;
     }
     let (mut store, path, in_collection) = load_target(pol, hooks, file, Some(id))?;
     guard_editable(pol, &store, id)?;
     let before = store.clone();
     store.remove(id).map_err(OpError::internal)?;
     save(hooks, &mut store, &path, in_collection, Some(&before))?;
-    Ok(RemoveOutcome { id, via_index: false })
+    Ok(RemoveOutcome { id, via_index: false, sync: SyncReport::default() })
 }
 
 pub struct LinkOutcome {
     pub from: Uuid,
     pub to: Uuid,
+    /// 这次写落到哪些文件。
+    pub sync: SyncReport,
 }
 
 pub fn link_nodes(
@@ -1790,14 +2014,15 @@ pub fn link_nodes(
         };
         r.map_err(OpError::internal)?;
         save(hooks, &mut store, &shard_path, true, Some(&before))?;
-        return Ok(LinkOutcome { from: f, to: t });
+        return Ok(LinkOutcome { from: f, to: t, sync: SyncReport::default() });
     }
 
     // 快路：两端的编号能用台账查到、且这条边落在同文件里 → 不整份载入
     let plain = pol.resolve(file)?;
     if !plain.is_dir() {
-        let f_here = matches!(xirang_core::edit::read_node(&plain, f), Ok(Some(_)));
-        let t_here = matches!(xirang_core::edit::read_node(&plain, t), Ok(Some(_)));
+        let named = plain.clone();
+        let f_here = matches!(xirang_core::edit::read_node(&named, f), Ok(Some(_)));
+        let t_here = matches!(xirang_core::edit::read_node(&named, t), Ok(Some(_)));
         if f_here {
             if !t_here && !pol.force {
                 return Err(OpError::guarded(
@@ -1805,19 +2030,18 @@ pub fn link_nodes(
                     "继续连边会留下 R001 引用断裂；确实要连请显式强制（CLI：--yes，MCP：force）",
                 ));
             }
-            if try_direct_edit(
+            if let Some(sync) = shared_edit(
                 pol,
                 hooks,
-                &plain,
+                &named,
                 f,
                 None,
                 Some(XValue::Reference(t)),
                 !no_history,
-            )?
-            .is_some()
-            {
-                return Ok(LinkOutcome { from: f, to: t });
+            )? {
+                return Ok(LinkOutcome { from: f, to: t, sync });
             }
+            refuse_if_copies_exist(pol, &named, f)?;
         }
     }
 
@@ -1836,7 +2060,7 @@ pub fn link_nodes(
     };
     r.map_err(OpError::internal)?;
     save(hooks, &mut store, &path, false, None)?;
-    Ok(LinkOutcome { from: f, to: t })
+    Ok(LinkOutcome { from: f, to: t, sync: SyncReport::default() })
 }
 
 pub struct CopyOutcome {

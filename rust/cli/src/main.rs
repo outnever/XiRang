@@ -638,11 +638,41 @@ fn cmd_new(
     }
 }
 
-fn cmd_set(file: &str, node: &str, value: &str, no_history: bool, yes: bool) -> i32 {
+/// 写命令共用的策略：`--yes` → force、`--here` → 只改点名文件、
+/// `XIRANG_INDEX=off` → 不用本机目录（那也就找不到别处的副本）。
+fn write_policy(yes: bool, here: bool) -> Policy {
+    let mut p = Policy::cli(yes);
+    if here {
+        p = p.only_here();
+    }
+    if !index_enabled() {
+        p = p.without_catalog();
+    }
+    p
+}
+
+/// 写完之后报一句「这次落到哪些文件」（同步了多个文件 / 跳过了谁 / `--here` 漏了谁）。
+fn report_sync(sync: &ops::SyncReport, here: bool) {
+    if sync.written.len() > 1 {
+        println!("  （同步 {} 个文件：{}）", sync.written.len(), sync.written.join("、"));
+    }
+    for s in &sync.skipped {
+        eprintln!("（跳过：{s}）");
+    }
+    if here && !sync.others.is_empty() {
+        eprintln!(
+            "（提示：别处还有副本没跟着改：{}；去掉 --here 就会一起改）",
+            sync.others.join("、")
+        );
+    }
+}
+
+fn cmd_set(file: &str, node: &str, value: &str, no_history: bool, yes: bool, here: bool) -> i32 {
     let v = ops::parse_value_str(value);
-    match ops::set_value(&Policy::cli(yes), &CliHooks, file, node, v, no_history) {
+    match ops::set_value(&write_policy(yes, here), &CliHooks, file, node, v, no_history) {
         Ok(o) => {
             println!("已更新：{}", o.id);
+            report_sync(&o.sync, here);
             0
         }
         Err(e) => report(&e),
@@ -666,6 +696,7 @@ fn cmd_batch(
     json_out: bool,
     yes: bool,
     allow_missing_target: bool,
+    here: bool,
 ) -> i32 {
     let text = if list == "-" {
         let mut s = String::new();
@@ -692,7 +723,7 @@ fn cmd_batch(
         }
     };
     // 大批量之前先看看台账日志是不是偏大：日志一大，逐条定位会慢很多
-    if let Ok(path) = ops::Policy::cli(yes).resolve(file) {
+    if let Ok(path) = write_policy(yes, here).resolve(file) {
         if let Ok(st) = xirang_core::wsidx::info(&xirang_core::wsidx::workspace_root(&path)) {
             if st.log_bytes > 64 * 1024 * 1024 {
                 eprintln!(
@@ -703,7 +734,7 @@ fn cmd_batch(
         }
     }
     let opts = ops::BatchOptions { no_history, dry_run, allow_missing_target };
-    match ops::batch_edit(&Policy::cli(yes), &CliHooks, file, &parsed, opts) {
+    match ops::batch_edit(&write_policy(yes, here), &CliHooks, file, &parsed, opts) {
         Ok(o) => {
             if json_out {
                 let files: Vec<serde_json::Value> = o
@@ -760,30 +791,54 @@ fn cmd_batch(
     }
 }
 
-fn cmd_rename(file: &str, node: &str, new_name: &str, no_history: bool, yes: bool) -> i32 {
-    match ops::rename_node(&Policy::cli(yes), &CliHooks, file, node, new_name, no_history) {
+fn cmd_rename(
+    file: &str,
+    node: &str,
+    new_name: &str,
+    no_history: bool,
+    yes: bool,
+    here: bool,
+) -> i32 {
+    match ops::rename_node(
+        &write_policy(yes, here),
+        &CliHooks,
+        file,
+        node,
+        new_name,
+        no_history,
+    ) {
         Ok(o) => {
             println!("已改名：{} → {}", o.id, o.name);
+            report_sync(&o.sync, here);
             0
         }
         Err(e) => report(&e),
     }
 }
 
-fn cmd_rm(file: &str, node: &str, yes: bool) -> i32 {
-    match ops::remove_node(&Policy::cli(yes), &CliHooks, file, node) {
+fn cmd_rm(file: &str, node: &str, yes: bool, here: bool) -> i32 {
+    match ops::remove_node(&write_policy(yes, here), &CliHooks, file, node) {
         Ok(o) => {
             println!("已删除（置空）：{}", o.id);
+            report_sync(&o.sync, here);
             0
         }
         Err(e) => report(&e),
     }
 }
 
-fn cmd_link(file: &str, from: &str, to: &str, no_history: bool, yes: bool) -> i32 {
-    match ops::link_nodes(&Policy::cli(yes), &CliHooks, file, from, to, no_history) {
+fn cmd_link(file: &str, from: &str, to: &str, no_history: bool, yes: bool, here: bool) -> i32 {
+    match ops::link_nodes(
+        &write_policy(yes, here),
+        &CliHooks,
+        file,
+        from,
+        to,
+        no_history,
+    ) {
         Ok(o) => {
             println!("已连边：{} → {}", o.from, o.to);
+            report_sync(&o.sync, here);
             0
         }
         Err(e) => report(&e),
@@ -1153,6 +1208,22 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
     }
     let kids = ws.children_union(id);
     let incoming = ws.references_to(id);
+    // 「同一个编号在多个文件里」是正常现象；只有**自身三字段**（父 / 名字 / 值）
+    // 对不上才算冲突——读的人要看得见这件事。
+    let first = &views[0].1;
+    let mut fields: Vec<&str> = Vec::new();
+    for (_, n) in &views {
+        if n.parent != first.parent && !fields.contains(&"父节点") {
+            fields.push("父节点");
+        }
+        if n.name != first.name && !fields.contains(&"名字") {
+            fields.push("名字");
+        }
+        if n.value != first.value && !fields.contains(&"值") {
+            fields.push("值");
+        }
+    }
+    let conflict = !fields.is_empty();
 
     if json_out {
         let node = &views[0].1;
@@ -1161,7 +1232,16 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
             "name": node.name,
             "type": ops::type_name(&node.value),
             "value": value_brief(node),
+            "conflict": conflict,
+            "fields": fields,
             "sources": views.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(),
+            "views": views.iter().map(|(f, n)| json!({
+                "file": f,
+                "name": n.name,
+                "type": ops::type_name(&n.value),
+                "value": value_brief(n),
+                "parent": n.parent.map(|p| p.to_string()),
+            })).collect::<Vec<_>>(),
             "children": kids.iter().map(|(f, n)| json!({
                 "id": n.id.to_string(),
                 "name": n.name,
@@ -1179,7 +1259,21 @@ fn cmd_ws(node_id: &str, files: &[String], only: Option<&str>, json_out: bool) -
         return 0;
     }
 
-    println!("节点 {} <{id}>（{} 处）", label_brief(&views[0].1), views.len());
+    if conflict {
+        println!(
+            "节点 {} <{id}>（{} 处 · **自身不一致：{}**）",
+            label_brief(&views[0].1),
+            views.len(),
+            fields.join("/")
+        );
+        eprintln!(
+            "（提示：这个编号在多个文件里自身不一致（{}）——`xr catalog check` 看详情，\
+             `xr catalog check --sync {id} --base <文件>` 可把别处对齐到基准）",
+            fields.join("/")
+        );
+    } else {
+        println!("节点 {} <{id}>（{} 处）", label_brief(&views[0].1), views.len());
+    }
     for (f, n) in &views {
         println!("  {}  （{f}）", label_brief(n));
     }
@@ -2031,7 +2125,15 @@ fn cmd_catalog_list() -> i32 {
 }
 
 /// 跨文件一致性检查：只看「同编号多文件」里**节点自身（名字 / 值）不一致**的那些编号。
-fn cmd_catalog_check() -> i32 {
+/// `xr catalog check [--json] [--strict]`
+///
+/// 体检「同一个编号出现在多个文件」的那些编号：**只有自身三字段
+/// （父节点 / 名字 / 值）有任一不同**才算冲突（需要人裁决）；
+/// 各文件挂各自的孩子、孩子不同不算冲突。
+/// `--strict`：有冲突时退出码 2（方便脚本/CI 卡口）；默认仍 0（信息性）。
+fn cmd_catalog_check(flags: &[String]) -> i32 {
+    let json_out = flags.iter().any(|f| f == "--json");
+    let strict = flags.iter().any(|f| f == "--strict");
     let cat = match catalog::Catalog::load(&catalog::default_path()) {
         Ok(c) => c,
         Err(e) => {
@@ -2041,7 +2143,11 @@ fn cmd_catalog_check() -> i32 {
     };
     let dup = cat.duplicated();
     if dup.is_empty() {
-        println!("（没有同编号多文件的情况）");
+        if json_out {
+            println!("{}", serde_json::json!({"conflicts": [], "count": 0, "duplicated": 0}));
+        } else {
+            println!("（没有同编号多文件的情况）");
+        }
         return 0;
     }
     let mut all_files: Vec<String> = Vec::new();
@@ -2061,6 +2167,7 @@ fn cmd_catalog_check() -> i32 {
         }
     };
 
+    let mut conflicts: Vec<serde_json::Value> = Vec::new();
     let mut diffs = 0usize;
     for (u, _files) in &dup {
         let views = ws.node_views(*u);
@@ -2068,16 +2175,55 @@ fn cmd_catalog_check() -> i32 {
             continue;
         }
         let first = &views[0].1;
-        let mismatch = views.iter().any(|(_, n)| n.name != first.name || n.value != first.value);
-        if !mismatch {
+        // 冲突 = 除编号外的三字段（父 / 名字 / 值）有任一不同
+        let mut fields: Vec<&str> = Vec::new();
+        for (_, n) in &views {
+            if n.parent != first.parent && !fields.contains(&"父节点") {
+                fields.push("父节点");
+            }
+            if n.name != first.name && !fields.contains(&"名字") {
+                fields.push("名字");
+            }
+            if n.value != first.value && !fields.contains(&"值") {
+                fields.push("值");
+            }
+        }
+        if fields.is_empty() {
             continue; // 自身一致；孩子不同属正常，不算冲突
         }
         diffs += 1;
-        println!("{u}  （同编号，自身内容不一致）");
         let kids = ws.children_union(*u);
+        if json_out {
+            let items: Vec<serde_json::Value> = views
+                .iter()
+                .map(|(path, n)| {
+                    let count = kids.iter().filter(|(kf, _)| kf == path).count();
+                    serde_json::json!({
+                        "file": path,
+                        "name": n.name,
+                        "type": ops::type_name(&n.value),
+                        "value": value_brief(n),
+                        "parent": n.parent.map(|p| p.to_string()),
+                        "children": count,
+                    })
+                })
+                .collect();
+            conflicts.push(serde_json::json!({
+                "id": u.to_string(),
+                "fields": fields,
+                "views": items,
+                "base": views[0].0,
+            }));
+            continue;
+        }
+        println!("{u}  （同编号，自身不一致：{}）", fields.join("/"));
         for (path, n) in &views {
             println!("  - {path}");
-            println!("      自身：{}", label_brief(n));
+            println!(
+                "      自身：{}  （父节点：{}）",
+                label_brief(n),
+                n.parent.map(|p| p.to_string()).unwrap_or_else(|| "（根）".into())
+            );
             let mine: Vec<String> = kids
                 .iter()
                 .filter(|(kf, _)| kf == path)
@@ -2091,12 +2237,23 @@ fn cmd_catalog_check() -> i32 {
         }
         println!("      （如需对齐：xr catalog check --sync {u} --base {}）", views[0].0);
     }
+    if json_out {
+        println!(
+            "{}",
+            serde_json::json!({"conflicts": conflicts, "count": diffs, "duplicated": dup.len()})
+        );
+        return if strict && diffs > 0 { 2 } else { 0 };
+    }
     if diffs == 0 {
         println!("（同编号多文件共 {} 个，但节点自身内容都一致，无需处理）", dup.len());
     } else {
-        println!("共 {} 个编号自身内容不一致。", diffs);
+        println!("共 {} 个编号自身不一致（父节点 / 名字 / 值 有任一不同）。", diffs);
     }
-    0
+    if strict && diffs > 0 {
+        2
+    } else {
+        0
+    }
 }
 
 /// 把基准之外那些文件里的该节点，**只把名字 / 值**改成与基准一致；**孩子一律不动**。
@@ -2139,37 +2296,41 @@ fn cmd_catalog_check_sync(uuid_str: &str, base: &str) -> i32 {
         if f == &base_abs {
             continue;
         }
-        let mut store = match tree::Store::load_view(Path::new(f)) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let cur = match store.get(id) {
-            Some(n) => n.clone(),
-            None => continue,
-        };
-        if cur.name == base_node.name && cur.value == base_node.value {
-            continue; // 已一致
+        // 对齐**三个字段**（父 / 名字 / 值），走共享的同步编辑入口：只追加、失败回滚
+        let target = PathBuf::from(f);
+        if let Err(e) = xirang_core::edit::prepare(&target) {
+            eprintln!("跳过 {f}：{e}");
+            continue;
         }
-        // 只改名字 / 值；孩子（父边指向该编号的节点）保持原样。
-        if cur.name != base_node.name {
-            if let Err(e) = store.rename(id, base_node.name.clone()) {
-                eprintln!("同步失败 {f}：{e}");
-                continue;
+        if let Some(bp) = base_node.parent {
+            // 基准的父节点必须在目标文件里存在，否则宁可不对齐，也不造断父边
+            match xirang_core::edit::read_node(&target, bp) {
+                Ok(Some(_)) => {}
+                _ => {
+                    eprintln!(
+                        "跳过 {f}：基准的父节点 {bp} 在这个文件里不存在（不造断父边；\
+                         先把父节点或这棵树搬过来，或只对齐名字 / 值）"
+                    );
+                    continue;
+                }
             }
         }
-        if cur.value != base_node.value {
-            if let Err(e) = store.update(id, base_node.value.clone()) {
-                eprintln!("同步失败 {f}：{e}");
-                continue;
+        match xirang_core::edit::edit_shared(
+            &[target.clone()],
+            id,
+            Some(base_node.name.clone()),
+            Some(base_node.value.clone()),
+            Some(base_node.parent),
+            true, // 留痕：这次对齐也留下可回滚的快照
+            true, // force：这是裁决之后的修复动作
+        ) {
+            Ok(_) => {
+                ops::update_index(&target); // 写完了就重新跟上台账
+                println!("已同步 {f}（自身 → {}）", label_brief(&base_node));
+                changed += 1;
             }
+            Err(e) => eprintln!("同步失败 {f}：{}", e.message()),
         }
-        if let Err(e) = save_store(&store, Path::new(f)) {
-            eprintln!("写回失败 {f}：{e}");
-            return 2;
-        }
-        ops::update_index(Path::new(f)); // 写回了就重新跟上台账
-        println!("已同步 {f}（自身 → {}）", label_brief(&base_node));
-        changed += 1;
     }
     if changed == 0 {
         println!("无需同步：其它文件里该编号的自身内容已与基准一致（或不存在）。");
@@ -2260,7 +2421,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--no-history", "--no-index", "--yes", "--blank", "--all", "--root", "--shape-of",
     "--template", "--where", "--subtree", "--append", "--under", "--from-json", "--rule",
     "--out", "--only", "--sync", "--base", "--depth", "--no-pager", "--force",
-    "--dry-run", "--allow-missing-target",
+    "--dry-run", "--allow-missing-target", "--here", "--strict",
 ];
 
 fn is_known_flag(s: &str) -> bool {
@@ -2293,10 +2454,12 @@ fn usage() {
     println!("  xr cat <file> [--head N] [--ids] [--skip-aux] [--force]   扁平视图：一行一个节点，按存放顺序（像看文本）");
     println!("  xr validate <file>                  校验（E/R）");
     println!("  xr new <file> <parent|nil> <name> [value] [--no-history]   新增节点");
-    println!("  xr set <file> <node-id> <value> [--no-history]   改值");
-    println!("  xr rename <file> <node-id> <新名字> [--no-history]   改名（编号不变、引用不断；旧名字进 @history）");
-    println!("  xr rm <file> <node-id>              删除（置空）");
-    println!("  xr link <file> <from-id> <to-id> [--no-history]   建引用边");
+    println!("  xr set <file> <node-id> <value> [--no-history] [--here]   改值");
+    println!("  xr rename <file> <node-id> <新名字> [--no-history] [--here]   改名（编号不变、引用不断；旧名字进 @history）");
+    println!("  xr rm <file> <node-id> [--here]     删除（置空）");
+    println!("  xr link <file> <from-id> <to-id> [--no-history] [--here]   建引用边");
+    println!("       （写命令默认**同步到所有含该编号的文件**；--here = 只改点名的这个文件，");
+    println!("         并在别处有副本时提示「没跟着改」。副本自身三字段不一致时会拒绝，先裁决再写）");
     println!("  xr copy <file> <node-id> <parent|nil> [--blank] [--no-history]  复制子树");
     println!("  xr fill <file> <root-id> <名/路径=值>... [--no-history]  按名字/路径映射赋值");
     println!("  xr batch <file> <清单文件|-> [--no-history] [--dry-run] [--json] [--yes]");
@@ -2338,8 +2501,10 @@ fn usage() {
     println!("                                      --dry-run 只预演（折叠不改变读得到的结果，无 --yes）");
     println!("  xr catalog scan [路径...]           扫描文件/目录进本机目录");
     println!("  xr catalog list                     列出本机目录的文件");
-    println!("  xr catalog check                    列出同编号但自身名字/值不一致的编号（附两边孩子）");
-    println!("  xr catalog check --sync <uuid> --base <文件>   以某文件为准，同步其它文件里该节点的名字/值（孩子不动）");
+    println!("  xr catalog check [--json] [--strict]");
+    println!("      列出同编号但**自身三字段（父/名字/值）**不一致的编号（附两边孩子与父节点）；");
+    println!("      --strict 时「有冲突」退出码 2（方便脚本卡口），默认 0（信息性）");
+    println!("  xr catalog check --sync <uuid> --base <文件>   以某文件为准，把别处对齐成基准的三字段（孩子一律不动）");
     println!("  xr catalog forget <路径>            从本机目录移除一个文件");
     println!("  xr catalog trash <路径>             移文件到回收站并从目录移除");
     println!("  （读命令默认维护本机目录；--no-index 或 XIRANG_INDEX=off 关闭）");
@@ -2444,7 +2609,14 @@ fn main() {
                 usage();
                 2
             } else {
-                cmd_set(file, &args[3], &args[4], has_flag(&args, "--no-history"), yes)
+                cmd_set(
+                    file,
+                    &args[3],
+                    &args[4],
+                    has_flag(&args, "--no-history"),
+                    yes,
+                    has_flag(&args, "--here"),
+                )
             }
         }
         "batch" => {
@@ -2461,6 +2633,7 @@ fn main() {
                     has_flag(&args, "--json"),
                     yes,
                     has_flag(&args, "--allow-missing-target"),
+                    has_flag(&args, "--here"),
                 )
             }
         }
@@ -2469,7 +2642,14 @@ fn main() {
                 usage();
                 2
             } else {
-                cmd_rename(file, &args[3], &args[4], has_flag(&args, "--no-history"), yes)
+                cmd_rename(
+                    file,
+                    &args[3],
+                    &args[4],
+                    has_flag(&args, "--no-history"),
+                    yes,
+                    has_flag(&args, "--here"),
+                )
             }
         }
         "rm" => {
@@ -2477,7 +2657,7 @@ fn main() {
                 usage();
                 2
             } else {
-                cmd_rm(file, &args[3], yes)
+                cmd_rm(file, &args[3], yes, has_flag(&args, "--here"))
             }
         }
         "link" => {
@@ -2485,7 +2665,14 @@ fn main() {
                 usage();
                 2
             } else {
-                cmd_link(file, &args[3], &args[4], has_flag(&args, "--no-history"), yes)
+                cmd_link(
+                    file,
+                    &args[3],
+                    &args[4],
+                    has_flag(&args, "--no-history"),
+                    yes,
+                    has_flag(&args, "--here"),
+                )
             }
         }
         "copy" => {
@@ -2801,7 +2988,7 @@ fn main() {
                             eprintln!("错误：--sync 需要一并给出 --base <文件>");
                             2
                         }
-                        (None, _) => cmd_catalog_check(),
+                        (None, _) => cmd_catalog_check(&args[3..]),
                     }
                 }
                 "forget" => match args.get(3) {

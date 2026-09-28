@@ -5,7 +5,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use xirang_core::index::Backend as _;
-use xirang_core::{fixture, index, wsidx};
+use xirang_core::{edit, fixture, index, wsidx};
 
 fn tmp_dir(tag: &str) -> PathBuf {
     let n = std::time::SystemTime::now()
@@ -123,6 +123,34 @@ fn old_index_format_is_loud_not_silent() {
     assert!(wsidx::Reader::open(&dir).is_ok(), "重建后应能打开");
     assert!(consistent(&dir, &info));
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+/// 重建之后必须**立刻**能定位：旧日志里那些过期的「文件记录」不许盖掉 manifest 里
+/// 新鲜的那条——盖掉了就会「定位全部落空」，表现是
+/// 「报未登记 / 台账里没有它的位置，但 `index files` 显示已同步」。
+fn rebuild_clears_stale_logs_so_lookups_still_work() {
+    let dir = tmp_dir("rebuildlog");
+    let info = build(&dir);
+    // 先制造日志：改一个节点（写路径会往日志里写一条文件记录）
+    let word = info.word_ids[0];
+    let path = info.files[0].clone();
+    edit::edit_node(
+        &path,
+        word,
+        None,
+        Some(xirang_core::codec::Value::Text("新".into())),
+        false,
+        false,
+    )
+    .unwrap();
+    wsidx::rebuild(&dir, &[]).unwrap();
+
+    let mut r = wsidx::Reader::open(&dir).unwrap();
+    assert!(!r.locate(word).unwrap().is_empty(), "重建之后应当立刻定位得到：{word}");
+    assert!(consistent(&dir, &info));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
 }
 
 #[test]

@@ -96,7 +96,21 @@ fn parse_args() -> Result<Config, String> {
 
 fn policy(cfg: &Config, args: &Value) -> Policy {
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    Policy::mcp(force, cfg.roots.clone())
+    let mut pol = Policy::mcp(force, cfg.roots.clone());
+    // `here: true` = 只改点名的文件，不同步其它副本（与 CLI 的 `--here` 同一个开关）
+    if args.get("here").and_then(|v| v.as_bool()).unwrap_or(false) {
+        pol = pol.only_here();
+    }
+    pol
+}
+
+/// 把「这次写落到哪些文件」编成 JSON（与 CLI 的同步报告同一份信息）。
+fn sync_json(sync: &ops::SyncReport) -> Value {
+    json!({
+        "written": sync.written,
+        "skipped": sync.skipped,
+        "others": sync.others,
+    })
 }
 
 fn str_arg(args: &Value, key: &str) -> Result<String, OpError> {
@@ -293,7 +307,7 @@ fn tool_node(cfg: &Config, args: &Value) -> Result<Value, OpError> {
             }
             let value = ops::value_from_json(args.get("value"));
             let o = ops::set_value(&pol, &ops::NoHooks, &file, &node, value, no_history)?;
-            Ok(json!({"updated": o.id.to_string()}))
+            Ok(json!({"updated": o.id.to_string(), "sync": sync_json(&o.sync)}))
         }
         // 批量提交：一次请求改一批（几十万条迁移用；`ops` 数组或 `batch` 文本都收）
         "batch" => {
@@ -344,18 +358,21 @@ fn tool_node(cfg: &Config, args: &Value) -> Result<Value, OpError> {
             let node = str_arg(args, "node")?;
             let name = str_arg(args, "name")?;
             let o = ops::rename_node(&pol, &ops::NoHooks, &file, &node, &name, no_history)?;
-            Ok(json!({"renamed": o.id.to_string(), "name": o.name}))
+            Ok(json!({"renamed": o.id.to_string(), "name": o.name, "sync": sync_json(&o.sync)}))
         }
         "remove" => {
             let node = str_arg(args, "node")?;
             let o = ops::remove_node(&pol, &ops::NoHooks, &file, &node)?;
-            Ok(json!({"removed": o.id.to_string(), "emptied": true}))
+            Ok(json!({"removed": o.id.to_string(), "emptied": true, "sync": sync_json(&o.sync)}))
         }
         "link" => {
             let from = str_arg(args, "from")?;
             let to = str_arg(args, "to")?;
             let o = ops::link_nodes(&pol, &ops::NoHooks, &file, &from, &to, no_history)?;
-            Ok(json!({"linked": {"from": o.from.to_string(), "to": o.to.to_string()}}))
+            Ok(json!({
+                "linked": {"from": o.from.to_string(), "to": o.to.to_string()},
+                "sync": sync_json(&o.sync),
+            }))
         }
         "copy" => {
             let node = str_arg(args, "node")?;

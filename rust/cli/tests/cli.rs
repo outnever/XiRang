@@ -344,7 +344,11 @@ fn collection_write_commands_target_shard() {
 
     // set：只改 词形 所在分片
     let out = xr().args(["set", dir.to_str().unwrap(), &xing.id.to_string(), "火"]).output().unwrap();
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "set stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let shard_path = dir.join(format!("{}.xirang", e1.id));
     let folded = shard::fold(&Store::load(&shard_path).unwrap());
     assert_eq!(folded.get(xing.id).unwrap().value, Value::Text("火".into()));
@@ -394,15 +398,18 @@ fn catalog_same_uuid_is_normal_union_and_only() {
         value: Value::Text(v.to_string()),
     };
 
+    // 两份文件里都用**同一个根编号**：这样「共享」节点的父节点也一致，
+    // 属于「同编号多文件、自身三字段都一致」的正常情况（只有孩子不同）。
+    let root_id = Uuid::random_v4();
     let mut s1 = Store::new();
-    let r1 = s1.create(None, "甲", Value::Empty, false);
-    s1.add(node(shared, r1.id, "共享", "同"));
+    s1.add(Node { id: root_id, parent: None, name: "甲".into(), value: Value::Empty });
+    s1.add(node(shared, root_id, "共享", "同"));
     s1.create(Some(shared), "形态", Value::Text("甲库的孩子".into()), false);
     s1.save(&f1).unwrap();
 
     let mut s2 = Store::new();
-    let r2 = s2.create(None, "乙", Value::Empty, false);
-    s2.add(node(shared, r2.id, "共享", "同"));
+    s2.add(Node { id: root_id, parent: None, name: "甲".into(), value: Value::Empty });
+    s2.add(node(shared, root_id, "共享", "同"));
     s2.create(Some(shared), "形态", Value::Text("乙库的孩子".into()), false);
     s2.save(&f2).unwrap();
 
@@ -524,19 +531,22 @@ fn catalog_check_self_diff_and_sync_keeps_children() {
     let diff = Uuid::random_v4(); // 自身不同 → 应被列出
     let same = Uuid::random_v4(); // 自身相同、孩子不同 → 不应被列出
 
+    // 「同编号、自身三字段一致、只有孩子不同」的那个节点，两份文件里父节点也要一样：
+    // 用同一个根编号，它才不算冲突（冲突只看父节点 / 名字 / 值）。
+    let root_id = Uuid::random_v4();
     let mut s1 = Store::new();
-    let r1 = s1.create(None, "甲", Value::Empty, false);
-    s1.add(Node { id: diff, parent: Some(r1.id), name: "甲称".into(), value: Value::Text("x".into()) });
+    s1.add(Node { id: root_id, parent: None, name: "甲".into(), value: Value::Empty });
+    s1.add(Node { id: diff, parent: Some(root_id), name: "甲称".into(), value: Value::Text("x".into()) });
     s1.create(Some(diff), "甲孩子", Value::Text("A".into()), false);
-    s1.add(Node { id: same, parent: Some(r1.id), name: "同称".into(), value: Value::Text("s".into()) });
+    s1.add(Node { id: same, parent: Some(root_id), name: "同称".into(), value: Value::Text("s".into()) });
     s1.create(Some(same), "甲孩子", Value::Text("A".into()), false);
     s1.save(&f1).unwrap();
 
     let mut s2 = Store::new();
-    let r2 = s2.create(None, "乙", Value::Empty, false);
-    s2.add(Node { id: diff, parent: Some(r2.id), name: "乙称".into(), value: Value::Text("y".into()) });
+    s2.add(Node { id: root_id, parent: None, name: "甲".into(), value: Value::Empty });
+    s2.add(Node { id: diff, parent: Some(root_id), name: "乙称".into(), value: Value::Text("y".into()) });
     let keep = s2.create(Some(diff), "乙孩子", Value::Text("B".into()), false);
-    s2.add(Node { id: same, parent: Some(r2.id), name: "同称".into(), value: Value::Text("s".into()) });
+    s2.add(Node { id: same, parent: Some(root_id), name: "同称".into(), value: Value::Text("s".into()) });
     s2.create(Some(same), "乙孩子", Value::Text("B".into()), false);
     s2.save(&f2).unwrap();
 

@@ -134,7 +134,7 @@ fn set_uses_the_direct_path_once_the_ledger_is_ready() {
     assert!(out.via_index, "台账可用就该直读，不整份载入");
     assert_eq!(idv, out.id);
 
-    // 把台账删掉：快路走不通 → 退回整份载入，并且顺手把台账建回来
+    // 把台账删掉：`prepare` 会就地整份登记一次，所以**仍然走直读**（不再退回整份载入）
     std::fs::remove_dir_all(xirang_core::wsidx::index_dir(&root)).unwrap();
     let out = xirang_cli::ops::set_value(
         &pol,
@@ -145,9 +145,11 @@ fn set_uses_the_direct_path_once_the_ledger_is_ready() {
         false,
     )
     .unwrap();
-    assert!(!out.via_index, "没有台账时应当退回整份载入");
+    assert!(out.via_index, "没登记过应当就地整份登记后继续直读（不再退回整份载入）");
+    let st = xirang_core::wsidx::files_status(&root).unwrap();
+    assert!(st.iter().any(|f| f.fresh), "顺带要把台账建回来：{st:?}");
 
-    // 台账回来了 → 又走快路；两条路写出来的结果一致
+    // 再改一次：仍然直读，值也读得回来
     let out = xirang_cli::ops::set_value(
         &pol,
         &xirang_cli::ops::NoHooks,

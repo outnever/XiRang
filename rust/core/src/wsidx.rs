@@ -816,6 +816,15 @@ pub fn rebuild(ws_root: &Path, files: &[PathBuf]) -> Result<Stats, String> {
     if targets.is_empty() && files.is_empty() {
         targets = collect_data_files(ws_root);
     }
+    // **先把旧日志清空**：块马上要按当前内容重建，旧日志里那些过期的
+    // 「文件记录」（老指纹 / 老代号）会在 `Reader::open` 读日志时**盖掉**
+    // manifest 里新鲜的那条，于是 `file_fresh` 判false、定位全部落空——
+    // 表现就是「报未登记 / 台账里没有它的位置，但 index files 显示已同步」。
+    for kind in [KIND_LOC, KIND_REL, KIND_REV] {
+        let mut o = Vec::new();
+        write_prefix(&mut o, kind, PART_LOG);
+        write_file_atomic(&log_path(&dir, kind), &o).map_err(|e| e.to_string())?;
+    }
     let generation = read_manifest(&dir).map(|m| m.generation + 1).unwrap_or(1);
     let (prepared, changed) = build_ledgers(&dir, &targets, generation, true)?;
     if !changed.is_empty() {

@@ -70,7 +70,7 @@ fn direct_edit_matches_full_load_edit() {
 
     wsidx::rebuild(&dir, &[]).unwrap();
 
-    let out = edit::edit_node(&a, a_word, None, Some(Value::Text("火".into())), true).unwrap();
+    let out = edit::edit_node(&a, a_word, None, Some(Value::Text("火".into())), true, false).unwrap();
     assert_eq!(out.before.value, Value::Text("灯".into()));
     assert_eq!(out.after.value, Value::Text("火".into()));
     assert!(
@@ -101,18 +101,19 @@ fn direct_edit_matches_full_load_edit() {
     std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
 }
 
-/// 没有台账（或台账对不上）必须拒绝——调用方据此退回整份载入。
+/// 文件还没登记过（典型：复制到干净目录）→ **就地整份登记一次**，别把流程卡住。
 #[test]
-fn direct_edit_refuses_without_a_ledger() {
+fn direct_edit_auto_registers_when_unregistered() {
     let dir = tmp_dir("noledger");
     let (path, _root) = make_file(&dir, "无台账.xirang");
     let word = child_id(&path, "词形");
-    assert!(
-        edit::edit_node(&path, word, None, Some(Value::Text("火".into())), true).is_err(),
-        "没建台账就该拒绝，而不是猜"
+    assert!(edit::edit_node(&path, word, None, Some(Value::Text("火".into())), true, false).is_ok());
+    assert_eq!(
+        tree::Store::load_view(&path).unwrap().get(word).unwrap().value,
+        Value::Text("火".into())
     );
-    wsidx::rebuild(&dir, &[]).unwrap();
-    assert!(edit::edit_node(&path, word, None, Some(Value::Text("火".into())), true).is_ok());
+    let st = wsidx::files_status(&dir).unwrap();
+    assert!(st.iter().any(|f| f.fresh), "顺带要把台账建回来：{st:?}");
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
 }
@@ -127,7 +128,7 @@ fn direct_edit_keeps_marker_and_index_in_sync() {
 
     let size_before = std::fs::metadata(&path).unwrap().len();
     for i in 0..5 {
-        edit::edit_node(&path, word, None, Some(Value::Text(format!("第{i}次"))), true).unwrap();
+        edit::edit_node(&path, word, None, Some(Value::Text(format!("第{i}次"))), true, false).unwrap();
     }
     let size_after = std::fs::metadata(&path).unwrap().len();
     assert!(size_after > size_before);
@@ -176,6 +177,149 @@ fn direct_edit_recognises_template_definitions() {
 // ============================================================================
 // 批量提交（`edit::apply_batch`）
 // ============================================================================
+
+// ============================================================================
+// 跨文件同步编辑（`edit::edit_shared`）
+// ============================================================================
+
+/// 建两份「同一个编号、三个字段都一样」的文件（只是各自挂的孩子不同）。
+fn two_files_same_node(dir: &Path, n: usize) -> (Vec<PathBuf>, Uuid, Vec<Uuid>) {
+    let mut paths = Vec::new();
+    // 两份文件用**同一个根编号、同一个「词形」编号**：三个字段（父 / 名字 / 值）都一致，
+    // 属于「同编号多文件、自身三字段一致」的正常情况（只有孩子不同）。
+    let root_id = Uuid::random_v4();
+    let word_id = Uuid::random_v4();
+    for (i, name) in ["甲.xirang", "乙.xirang"].iter().enumerate().take(n) {
+        let p = dir.join(name);
+        let mut s = Store::new();
+        s.add(Node { id: root_id, parent: None, name: "根".into(), value: Value::Empty });
+        s.add(Node {
+            id: word_id,
+            parent: Some(root_id),
+            name: "词形".into(),
+            value: Value::Text("灯".into()),
+        });
+        s.create(Some(word_id), &format!("{i} 号库的孩子"), Value::Text("x".into()), false);
+        s.save(&p).unwrap();
+        paths.push(p);
+    }
+    (paths, word_id, vec![root_id])
+}
+
+/// 同步编辑：两份都改到，而且各自留下自己的 `@history` 快照。
+#[test]
+fn shared_edit_writes_every_file() {
+    let dir = tmp_dir("shared");
+    let (paths, word, _) = two_files_same_node(&dir, 2);
+    for p in &paths {
+        wsidx::rebuild(&dir, &[]).unwrap();
+        let _ = p;
+    }
+    let out = edit::edit_shared(
+        &paths,
+        word,
+        None,
+        Some(Value::Text("火".into())),
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(out.written.len(), 2, "两份都要写到");
+    for p in &paths {
+        let view = tree::Store::load_view(p).unwrap();
+        let n = view.get(word).unwrap();
+        assert_eq!(n.value, Value::Text("火".into()), "{} 没改到", p.display());
+        let kids = view.children(view.get(view.root_of(word).unwrap()).unwrap());
+        assert!(
+            kids.iter().any(|k| k.name == "@protocol"),
+            "{} 应当补上协议声明",
+            p.display()
+        );
+        assert!(
+            view.children(n).iter().any(|k| k.name == "@history"),
+            "{} 应当留下自己的留痕",
+            p.display()
+        );
+    }
+    for p in &paths {
+        std::fs::remove_file(p).ok();
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
+/// 三字段不一致 → 拒绝，而且一个字节都不写。
+#[test]
+fn shared_edit_refuses_on_conflict() {
+    let dir = tmp_dir("sharedconflict");
+    let (paths, word, _) = two_files_same_node(&dir, 2);
+    wsidx::rebuild(&dir, &[]).unwrap();
+    // 只把乙文件里那份的名字改掉（--here 的效果）
+    edit::edit_node(&paths[1], word, Some("词形改".into()), None, false, false).unwrap();
+    wsidx::rebuild(&dir, &[]).unwrap();
+
+    let before: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let err = edit::edit_shared(
+        &paths,
+        word,
+        None,
+        Some(Value::Text("火".into())),
+        None,
+        false,
+        false,
+    )
+    .unwrap_err();
+    match &err {
+        edit::EditError::Conflict(m) => assert!(m.contains("名字"), "要说清是哪个字段：{m}"),
+        other => panic!("应当是冲突：{other:?}"),
+    }
+    for (p, b) in paths.iter().zip(before.iter()) {
+        assert_eq!(&std::fs::read(p).unwrap(), b, "{} 不许被写", p.display());
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
+/// 中途写失败 → 已写的那些全部截回原长度（整体回滚）。
+#[test]
+fn shared_edit_rolls_back_when_one_file_fails() {
+    let dir = tmp_dir("sharedrollback");
+    let (paths, word, _) = two_files_same_node(&dir, 2);
+    wsidx::rebuild(&dir, &[]).unwrap();
+    let before: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+    // 把第二份设成只读：追加会失败（非 root 用户）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&paths[1]).unwrap().permissions();
+        perm.set_mode(0o444);
+        std::fs::set_permissions(&paths[1], perm).unwrap();
+
+        let r = edit::edit_shared(
+            &paths,
+            word,
+            None,
+            Some(Value::Text("火".into())),
+            None,
+            false,
+            false,
+        );
+        // 只读文件写不进去 → 整体失败，并且第一份要回滚
+        assert!(r.is_err(), "第二份写不进去就该整体失败");
+        assert_eq!(
+            std::fs::read(&paths[0]).unwrap(),
+            before[0],
+            "第一份必须被截回原长度"
+        );
+        let mut perm = std::fs::metadata(&paths[1]).unwrap().permissions();
+        perm.set_mode(0o644);
+        std::fs::set_permissions(&paths[1], perm).unwrap();
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
 
 /// 建一个有一批普通节点的文件：根 → 子 0..n-1（每个子节点都真存在）。
 fn make_wide_file(dir: &Path, name: &str, n: usize) -> (PathBuf, Vec<Uuid>) {

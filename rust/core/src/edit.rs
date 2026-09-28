@@ -30,6 +30,48 @@ pub struct EditOutcome {
     pub appended: usize,
 }
 
+/// 「跨文件同步编辑」的错误分类：调用方据此决定**报错**还是**退回别的路**。
+#[derive(Clone, Debug)]
+pub enum EditError {
+    /// 护栏拦下（模板定义）：直接报给用户，不要静默换一条路。
+    Guarded(String),
+    /// 同一个编号在多个文件里的三个字段（父 / 名字 / 值）对不上：先裁决再写。
+    Conflict(String),
+    /// 这条路走不通（台账不可用、编号不在这个文件里）：调用方可以退回整份载入。
+    Unavailable(String),
+    /// 真出错了（写入失败、文件读不出来等）。
+    Failed(String),
+}
+
+impl EditError {
+    pub fn message(&self) -> &str {
+        match self {
+            EditError::Guarded(m)
+            | EditError::Conflict(m)
+            | EditError::Unavailable(m)
+            | EditError::Failed(m) => m,
+        }
+    }
+    fn unavailable(e: String) -> EditError {
+        EditError::Unavailable(e)
+    }
+}
+
+/// 一次「跨文件同步编辑」的结果。
+#[derive(Debug)]
+pub struct SharedEditOutcome {
+    /// 改动前的记录（各文件一致，取第一份）。
+    pub before: Node,
+    /// 改动后的记录（写进每个文件的都是这一份内容）。
+    pub after: Node,
+    /// 实际写入了哪些文件（按路径排序）。
+    pub written: Vec<PathBuf>,
+    /// 一共追加了多少条记录（含留痕与协议声明）。
+    pub appended: usize,
+    /// 登记里记着、但实际已经没有这个编号的文件（缓存过期）：跳过并说明。
+    pub skipped: Vec<(PathBuf, String)>,
+}
+
 fn canon(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -89,21 +131,6 @@ fn children_in_file(
         }
     }
     Ok(out)
-}
-
-/// 沿父链走到树根（父链必须都在这个文件里，否则 `Err`）。
-fn root_of(r: &mut wsidx::Reader, path: &Path, id: Uuid) -> Result<Uuid, String> {
-    let want = canon(path);
-    let mut cur = id;
-    for _ in 0..4_096 {
-        let h = locate_here(r, &want, cur)?;
-        let n = wsidx::read_node_at_hit(&h)?;
-        match n.parent {
-            None => return Ok(n.id),
-            Some(p) => cur = p,
-        }
-    }
-    Err("父链太长（可能成环）：需要整份载入处理".into())
 }
 
 /// 该树根下是否已经声明了某个协议（幂等判断，读的是文件里的真实内容）。
@@ -167,88 +194,264 @@ pub fn prepare(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 单节点编辑：改名字 / 改值（至少给一个），**只追加**，不整份载入。
+/// 一个文件在这次编辑里的「计划」：第一遍算好，第二遍照着写。
+struct FilePlan {
+    path: PathBuf,
+    before: Node,
+    after: Node,
+    root: Uuid,
+    hist: Option<Uuid>,
+    needs_marker: bool,
+    /// 写之前的文件长度（回滚用：截回去就等于没发生）。
+    len: u64,
+}
+
+/// 算一个文件在这次编辑里的计划（**只读**，一个字节都不写）。
+fn plan_file(
+    path: &Path,
+    id: Uuid,
+    new_name: &Option<String>,
+    new_value: &Option<Value>,
+    parent: &Option<Option<Uuid>>,
+    history: bool,
+    force: bool,
+) -> Result<FilePlan, EditError> {
+    // 台账先跟文件对齐（文件没登记过会就地整份登记一次）
+    prepare(path).map_err(EditError::unavailable)?;
+    let ws_root = wsidx::workspace_root(path);
+    let want = canon(path);
+    let mut r = wsidx::Reader::open(&ws_root).map_err(EditError::unavailable)?;
+    let hit = locate_here(&mut r, &want, id).map_err(EditError::unavailable)?;
+    let before = wsidx::read_node_at_hit(&hit).map_err(EditError::Failed)?;
+    // 模板定义护栏（与 `Store::is_editable` 同一套判断）
+    let protected = protected_in(
+        &mut r,
+        &want,
+        id,
+        Some(&before),
+        &mut std::collections::HashMap::new(),
+        0,
+    )
+    .map_err(EditError::Failed)?;
+    if protected && !force {
+        return Err(EditError::Guarded(format!(
+            "编号 {id} 属于模板定义，不能直接编辑（确要改请用 --yes）"
+        )));
+    }
+    let after = Node {
+        id,
+        parent: parent.clone().unwrap_or(before.parent),
+        name: new_name.clone().unwrap_or_else(|| before.name.clone()),
+        value: new_value.clone().unwrap_or_else(|| before.value.clone()),
+    };
+    let root = cached_root(&mut r, &want, id, &mut std::collections::HashMap::new(), 0)
+        .map_err(EditError::Failed)?;
+    let needs_marker = !declares_protocol_in(&mut r, &want, root, tree::PROTOCOL_APPEND)
+        .map_err(EditError::Failed)?;
+    let hist = if history {
+        children_in_file(&mut r, &want, id)
+            .map_err(EditError::Failed)?
+            .into_iter()
+            .find(|k| k.name == "@history")
+            .map(|k| k.id)
+    } else {
+        None
+    };
+    let len = fs::metadata(path).map_err(|e| EditError::Failed(e.to_string()))?.len();
+    Ok(FilePlan { path: path.to_path_buf(), before, after, root, hist, needs_marker, len })
+}
+
+/// 三个字段（父 / 名字 / 值）里哪些对不上——用来说清「哪里冲突了」。
+fn differing_fields(a: &Node, b: &Node) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if a.parent != b.parent {
+        out.push("父节点");
+    }
+    if a.name != b.name {
+        out.push("名字");
+    }
+    if a.value != b.value {
+        out.push("值");
+    }
+    out
+}
+
+/// **跨文件同步编辑**：把一个编号的（父 / 名字 / 值）改动写进所有含它的文件。
 ///
-/// `history = true` 按 CLI 的语义留痕：先确保有 `@history` 子节点，
-/// 追加一条「旧名字 + 旧值」的快照，再在快照下挂 `@replaced = 现在`；
-/// 与 `Store::update` 写出来的形状一致（桌面端用自己的撤销栈，传 `false`）。
+/// 三段走（与批量提交同一套路）：
+/// 1. **校验**：逐个文件读出该编号当前记录、比对三个字段——不一致就是
+///    「同编号信息冲突」，直接拒绝（说明哪个文件、哪个字段不同）；模板护栏逐文件判断；
+///    记下每个文件的原始长度。
+/// 2. **落盘**：逐个文件只追加（新记录 + 该文件自己的 `@history` 快照 + 幂等补协议声明）；
+///    **任何一个文件写失败，就把已经写过的文件全部截回原长度**（只追加，截回等于没发生）。
+/// 3. **登记**：全部写成功之后才逐个文件让台账登记新增的那一段。
 ///
-/// 值没变、名字也没变 → 一条记录都不写（`appended = 0`）。
+/// `parent`：`Some(None)` = 变成根、`Some(Some(p))` = 换父、`None` = 不动。
+/// `force`：放行模板定义（与单节点写的 `--yes` 同一条护栏）。
+pub fn edit_shared(
+    paths: &[PathBuf],
+    id: Uuid,
+    new_name: Option<String>,
+    new_value: Option<Value>,
+    parent: Option<Option<Uuid>>,
+    history: bool,
+    force: bool,
+) -> Result<SharedEditOutcome, EditError> {
+    if paths.is_empty() {
+        return Err(EditError::Unavailable("没有要改的文件".into()));
+    }
+
+    // —— 第一遍：校验（一个字节都不写）——
+    let mut plans: Vec<FilePlan> = Vec::new();
+    let mut skipped: Vec<(PathBuf, String)> = Vec::new();
+    let mut first_err: Option<EditError> = None;
+    for path in paths {
+        if !path.is_file() {
+            skipped.push((path.clone(), "文件不存在".into()));
+            continue;
+        }
+        match plan_file(path, id, &new_name, &new_value, &parent, history, force) {
+            Ok(p) => plans.push(p),
+            Err(e) => {
+                // 第一个文件（用户点名的那一个）出错就直接报；
+                // 后面那些（目录/台账里记着的副本）出错就跳过并说明——缓存过期不该挡路。
+                if plans.is_empty() && first_err.is_none() {
+                    first_err = Some(e);
+                } else {
+                    skipped.push((path.clone(), e.message().to_string()));
+                }
+            }
+        }
+    }
+    if plans.is_empty() {
+        return Err(first_err.unwrap_or_else(|| {
+            EditError::Unavailable(format!("编号 {id} 在这些文件里都找不到"))
+        }));
+    }
+    // 三个字段必须一致，否则先裁决再写
+    let reference = plans[0].before.clone();
+    for p in plans.iter().skip(1) {
+        let diff = differing_fields(&reference, &p.before);
+        if !diff.is_empty() {
+            return Err(EditError::Conflict(format!(
+                "编号 {id} 在多个文件里的{}不一样（{} vs {}）——先裁决再写：\
+                 xr catalog check 看详情，xr catalog check --sync {id} --base <文件> 把别处对齐到基准",
+                diff.join(" / "),
+                plans[0].path.display(),
+                p.path.display()
+            )));
+        }
+    }
+    // 三个字段都没变 → 一条记录都不写
+    let nothing = plans.iter().all(|p| {
+        p.after.name == p.before.name
+            && p.after.value == p.before.value
+            && p.after.parent == p.before.parent
+    });
+    if nothing {
+        return Ok(SharedEditOutcome {
+            before: plans[0].before.clone(),
+            after: plans[0].after.clone(),
+            written: Vec::new(),
+            appended: 0,
+            skipped,
+        });
+    }
+
+    // —— 第二遍：逐个文件只追加；失败就整体回滚 ——
+    let now = Utc::now().to_rfc3339();
+    let mut written: Vec<PathBuf> = Vec::new();
+    let mut appended = 0usize;
+    for plan in &plans {
+        let mut recs: Vec<Node> = Vec::new();
+        if plan.needs_marker {
+            recs.push(Node {
+                id: Uuid::random_v4(),
+                parent: Some(plan.root),
+                name: "@protocol".into(),
+                value: Value::Text(tree::PROTOCOL_APPEND.into()),
+            });
+        }
+        if history {
+            let hist_id = match plan.hist {
+                Some(h) => h,
+                None => {
+                    let h = Node {
+                        id: Uuid::random_v4(),
+                        parent: Some(id),
+                        name: "@history".into(),
+                        value: Value::Empty,
+                    };
+                    recs.push(h.clone());
+                    h.id
+                }
+            };
+            let snap = Node {
+                id: Uuid::random_v4(),
+                parent: Some(hist_id),
+                name: plan.before.name.clone(),
+                value: plan.before.value.clone(),
+            };
+            recs.push(snap.clone());
+            recs.push(Node {
+                id: Uuid::random_v4(),
+                parent: Some(snap.id),
+                name: "@replaced".into(),
+                value: Value::Text(now.clone()),
+            });
+        }
+        recs.push(plan.after.clone());
+
+        if let Err(e) = append_records(&plan.path, &recs) {
+            // 回滚：把写过的（含这个可能写了一半的）截回原长度，再让台账重新对一遍
+            let mut rolled = Vec::new();
+            for p in &plans {
+                if p.path == plan.path || written.contains(&p.path) {
+                    if let Ok(f) = fs::OpenOptions::new().write(true).open(&p.path) {
+                        let _ = f.set_len(p.len);
+                    }
+                    let _ = wsidx::append_tail(&wsidx::workspace_root(&p.path), &p.path);
+                    rolled.push(p.path.display().to_string());
+                }
+            }
+            return Err(EditError::Failed(format!(
+                "{} 写入失败：{e}（已把本次改动整体回滚：{}）",
+                plan.path.display(),
+                rolled.join("、")
+            )));
+        }
+        written.push(plan.path.clone());
+        appended += recs.len();
+    }
+
+    // —— 第三遍：登记（此时文件都已经写完）——
+    for plan in &plans {
+        let _ = wsidx::append_tail(&wsidx::workspace_root(&plan.path), &plan.path);
+    }
+    for (p, _) in &skipped {
+        let _ = wsidx::append_tail(&wsidx::workspace_root(p), p);
+    }
+    Ok(SharedEditOutcome {
+        before: plans[0].before.clone(),
+        after: plans[0].after.clone(),
+        written,
+        appended,
+        skipped,
+    })
+}
+
+/// 单节点编辑（一个文件的特例；桌面端与测试用）。
 pub fn edit_node(
     path: &Path,
     id: Uuid,
     new_name: Option<String>,
     new_value: Option<Value>,
     history: bool,
+    force: bool,
 ) -> Result<EditOutcome, String> {
-    let ws_root = wsidx::workspace_root(path);
-    // 台账先跟文件对齐：追加写之后台账可能还差一段，这里顺手补上；
-    // 对不上（没登记过 / 文件变小 / 前缀被改写）就 Err → 调用方退回整份载入。
-    wsidx::append_tail(&ws_root, path)?;
-    let mut r = wsidx::Reader::open(&ws_root)?;
-    let want = canon(path);
-    let hit = locate_here(&mut r, &want, id)?;
-    let before = wsidx::read_node_at_hit(&hit)?;
-    let after = Node {
-        id,
-        parent: before.parent,
-        name: new_name.unwrap_or_else(|| before.name.clone()),
-        value: new_value.unwrap_or_else(|| before.value.clone()),
-    };
-    if after.name == before.name && after.value == before.value {
-        return Ok(EditOutcome { before, after, appended: 0 });
-    }
-
-    let mut recs: Vec<Node> = Vec::new();
-    if history {
-        let hist_id = match children_in_file(&mut r, path, id)?
-            .into_iter()
-            .find(|c| c.name == "@history")
-        {
-            Some(h) => h.id,
-            None => {
-                let h = Node {
-                    id: Uuid::random_v4(),
-                    parent: Some(id),
-                    name: "@history".into(),
-                    value: Value::Empty,
-                };
-                recs.push(h.clone());
-                h.id
-            }
-        };
-        let snap = Node {
-            id: Uuid::random_v4(),
-            parent: Some(hist_id),
-            name: before.name.clone(),
-            value: before.value.clone(),
-        };
-        recs.push(snap.clone());
-        recs.push(Node {
-            id: Uuid::random_v4(),
-            parent: Some(snap.id),
-            name: "@replaced".into(),
-            value: Value::Text(Utc::now().to_rfc3339()),
-        });
-    }
-    recs.push(after.clone());
-
-    // 幂等补 `@protocol = append-v1`：追加写之后同一个编号会有多份记录，
-    // 声明了协议，`xr validate` 才不会把这种正常的重复编号报成 E002。
-    let root = root_of(&mut r, path, id)?;
-    if !declares_protocol(path, root, tree::PROTOCOL_APPEND)? {
-        recs.push(Node {
-            id: Uuid::random_v4(),
-            parent: Some(root),
-            name: "@protocol".into(),
-            value: Value::Text(tree::PROTOCOL_APPEND.into()),
-        });
-    }
-
-    let appended = append_records(path, &recs)?;
-    // 只登记新增的那一段（毫秒级）
-    wsidx::append_tail(&ws_root, path)?;
-    Ok(EditOutcome { before, after, appended })
+    let out = edit_shared(&[path.to_path_buf()], id, new_name, new_value, None, history, force)
+        .map_err(|e| e.message().to_string())?;
+    Ok(EditOutcome { before: out.before, after: out.after, appended: out.appended })
 }
 
 /// 单节点编辑的「护栏」：这个节点是不是**模板定义**（模板定义受保护）。

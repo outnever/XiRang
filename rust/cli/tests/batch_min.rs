@@ -143,6 +143,7 @@ fn batch_dry_run_then_apply_then_refuse_a_bad_line() {
 }
 
 /// 复制到干净目录（文件还没登记）→ 批量照样能跑，不该把迁移卡在第一步。
+/// 注意：副本在原件（已登记）里也有同一个编号，所以要用 `--here` 明确「只改这个副本」。
 #[test]
 fn batch_on_an_unregistered_copy_works() {
     let root = tmp_root("unreg");
@@ -155,7 +156,7 @@ fn batch_on_an_unregistered_copy_works() {
 
     let (code, out, err) = run(
         &root,
-        &["batch", "干净/副本.xirang", "干净/l.jsonl", "--no-history"],
+        &["batch", "干净/副本.xirang", "干净/l.jsonl", "--no-history", "--here"],
         None,
     );
     assert_eq!(code, 0, "没登记过也应当能跑：{err}");
@@ -190,14 +191,18 @@ fn batch_over_a_shard_directory() {
     );
     std::fs::write(root.join("跨.jsonl"), &list).unwrap();
 
+    // 注意：拆分之后原件 `词库.xirang` 还在、也还含这些编号，所以它是「别处的副本」；
+    // 只想改分片目录就加 `--here`（不然命令会拒绝，怕两边不一致）。
     // 预演：两个分片都要校验过，且不写文件
-    let (code, out, err) = run(&root, &["batch", "分片", "跨.jsonl", "--dry-run"], None);
+    let (code, out, err) =
+        run(&root, &["batch", "分片", "跨.jsonl", "--dry-run", "--here"], None);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("会改到 2 个节点"), "{out}");
     assert_eq!(out.matches(".xirang →").count(), 2, "逐分片报账：{out}");
 
     // 真跑
-    let (code, out, err) = run(&root, &["batch", "分片", "跨.jsonl", "--no-history"], None);
+    let (code, out, err) =
+        run(&root, &["batch", "分片", "跨.jsonl", "--no-history", "--here"], None);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("已批量提交") && out.contains("改到 2 个节点"), "{out}");
     assert_eq!(out.matches(".xirang →").count(), 2, "逐分片报账：{out}");

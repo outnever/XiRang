@@ -193,6 +193,19 @@ Three things you will notice:
 
 Exceptions: whole-file `import`, `history prune` and `tmpl rm` still rewrite the whole file — they are supposed to make it actually smaller, or need to express "the record is really gone" (which appending cannot express). `--no-history` only affects history recording, not this rule.
 
+### When one node id appears in several files (cross-file identity)
+
+The same id in several files is **not a duplicate and not a master/copy relationship**: it is the same node seen from different angles (a lexicon keeps its own "cat", the biology library keeps its own). Therefore:
+
+- **Reads**: `xr ws <id> <files…>` lists every copy (with its source file) and takes the **union of children**; conflicts are shown too — flagged as "self-inconsistent: which field" with a one-line hint.
+- **What counts as a conflict**: only when the **three non-id fields (parent / name / value) differ**. Different children per file are normal and **not** a conflict.
+- **Single-node writes (`xr set` / `rename` / `rm` / `link`) sync by default**: changing one copy changes **every file that contains the id** (each file keeps its own history and protocol marker). If any file cannot be written, everything already written is **truncated back to its original length** (quasi-atomic; a hard kill does not roll back).
+- **Conflicts refuse the write**: resolve first — `xr catalog check` for details, `xr catalog check --sync <id> --base <file>` to align the other copies to the base's three fields (**children are never touched**; if the base's parent does not exist in the target file, the parent is left alone with a note).
+- **`--here`**: write only the file you named, and say that other copies were left behind (MCP: `here: true`). Writes into a shard-collection directory still land only in the target shard.
+- The search scope is "files that have been opened (registered)": local catalog ∪ current workspace ledger ∪ the file you named. Re-run `xr catalog scan` after moving to another machine or directory.
+
+> Deliberately **not** done in this round: ① merging happens in the **display layer only** — the children of two files are never physically merged into one file; ② adding a child still targets one file at a time; a batch that touches an id which also exists elsewhere is refused, telling you to use `xr set` (which syncs) or to add `--here`.
+
 ### `xr batch <file|collection-dir> <list-file|-> [--no-history] [--dry-run] [--json] [--yes] [--allow-missing-target]`
 
 Submit **a batch** of changes at once (for migrations of hundreds of thousands of records). The list is **JSONL**: one change per line; blank lines and `#` comments are skipped; a whole-file JSON array works too; `-` reads from stdin.
@@ -327,6 +340,8 @@ xr set lexicon.shards <nodeID> newValue
 ## Local catalog
 
 A user-level single-file index (default `~/.config/xirang/catalog.idx`, overridable with `XIRANG_CATALOG`) mapping `UUID → file path`, for cross-library lookup. **Read commands also maintain it by default** (disable with `--no-index` or `XIRANG_INDEX=off`); it only writes the catalog file, never the `.xirang`, and write failures are skipped silently.
+
+`xr catalog check` reports ids that appear in several files whose **three non-id fields (parent / name / value) differ** (per-file children are fine); `--json` gives structured details and `--strict` exits with code 2 when conflicts exist.
 
 ### `xr catalog scan [paths...]`
 Scan files/directories (default: current directory) into the catalog.

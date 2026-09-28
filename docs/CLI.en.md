@@ -204,7 +204,7 @@ The same id in several files is **not a duplicate and not a master/copy relation
 - **`--here`**: write only the file you named, and say that other copies were left behind (MCP: `here: true`). Writes into a shard-collection directory still land only in the target shard.
 - The search scope is "files that have been opened (registered)": local catalog ∪ current workspace ledger ∪ the file you named. Re-run `xr catalog scan` after moving to another machine or directory.
 
-> Deliberately **not** done in this round: merging happens in the **display layer only** — the children of two files are never physically merged into one file, and adding a child still targets one file at a time. **Batches follow the same rule as single-node writes**: every entry is synced into all files containing that id (with a cross-file rollback on failure); `--here` narrows it to the named file.
+> Merging happens in the **display layer only** — the children of two files are never physically merged into one file. To make a **new** id appear in several files at once, use `xr new … --files a.xirang,b.xirang` (create once, the **same id** into every file; each file then keeps its own children). **Batches follow the same rule as single-node writes**: every entry is synced into all files containing that id (with a cross-file rollback on failure); `--here` narrows it to the named file.
 
 ### `xr batch <file|collection-dir> <list-file|-> [--no-history] [--dry-run] [--json] [--yes] [--allow-missing-target]`
 
@@ -235,7 +235,7 @@ Measured (187 MB / 3.47 million nodes, release): **400,000 reference changes in 
 
 > **Before a large batch, check the ledger log**: when it is large (say over 64 MB) the command prints a hint — run `xr index compact` first and the batch will be much faster (a large log never changes results, it only costs extra reads when locating nodes).
 
-### `xr new <file> <parent|nil> <name> [value] [--no-history]`
+### `xr new <file> <parent|nil> <name> [value] [--no-history] [--files a,b]`
 Add a node. `parent` = `nil` to create a root. Creates a new file if it does not exist.
 
 ```bash
@@ -243,6 +243,13 @@ xr new data.xirang nil root
 xr new data.xirang <parentNodeID> lamp 2046
 ```
 > Adding under a non-aux parent changes that subtree's "shape code" (affects structure search); a soft note is printed; `--yes` suppresses it.
+
+**`--files a.xirang,b.xirang`: create once, write into several files** — the official entry point for "one node id in several files" (cross-file identity): the **same id**, same parent / name / value is written into every named file; afterwards each file keeps its own children, and later edits to the node's own fields are synced to every file that has it (see "cross-file identity"). The parent must exist in each of these files or the guard refuses (use `--yes` to force); a target file that does not exist is written from scratch (a brand-new file may only hold the root, so `parent` must be `nil`).
+
+```bash
+xr new a.xirang <parentNodeID> sharedEntry lamp --files a.xirang,b.xirang   # one id into two files
+xr new c.xirang nil newLib --files c.xirang                                 # write a new file from scratch
+```
 
 ### `xr set <file> <node-id> <value> [--no-history]`
 Change a value (records an `@history` snapshot).

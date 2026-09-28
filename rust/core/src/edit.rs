@@ -440,6 +440,205 @@ pub fn edit_shared(
     })
 }
 
+/// 一次「跨文件新建」的结果。
+#[derive(Debug)]
+pub struct SharedCreateOutcome {
+    /// 新节点的编号（**同一个编号**写进每个目标文件）。
+    pub id: Uuid,
+    /// 实际写进去了哪些文件。
+    pub written: Vec<PathBuf>,
+    /// 一共追加了多少条记录（含 `@created` 与协议声明）。
+    pub appended: usize,
+}
+
+/// **在多个文件里同时新建同一个节点**（同一个编号、同一个父 / 名字 / 值）。
+///
+/// 这正是「同一个编号出现在多个文件里」的来源：一次新建、写进你指定的几个文件，
+/// 之后每个文件各挂自己关心的孩子（再改这个节点自身信息时按 [`edit_shared`]
+/// 的规则同步到所有文件）。
+///
+/// 规矩：
+/// - 父节点必须**在每个目标文件里都存在**（否则那个文件会留下 E011 断父边，要显式 `force` 放行）；
+/// - 目标文件不存在 → 按「新建文件」整份写出（带文件头），只允许新建根节点（`parent = None`）；
+/// - 已有的文件只**追加**；任何一个文件写失败 → 把已经写过的全部回退（截回原长度 / 删掉新建的）。
+pub fn create_shared(
+    paths: &[PathBuf],
+    parent: Option<Uuid>,
+    name: &str,
+    value: Value,
+    history: bool,
+    force: bool,
+) -> Result<SharedCreateOutcome, EditError> {
+    if paths.is_empty() {
+        return Err(EditError::Unavailable("没有要写进去的文件".into()));
+    }
+    let id = Uuid::random_v4();
+
+    struct Target {
+        path: PathBuf,
+        /// 目标文件本来不存在（整份新建）。
+        new_file: bool,
+        /// 写之前的长度（回退用）。
+        len: u64,
+        /// 协议声明挂哪个根下（新节点自己是根时就是它自己）。
+        marker_root: Uuid,
+        needs_marker: bool,
+    }
+
+    // —— 第一遍：逐个文件校验（一个字节都不写）——
+    let mut targets: Vec<Target> = Vec::new();
+    let mut first_err: Option<EditError> = None;
+    for path in paths {
+        if !path.exists() {
+            if parent.is_some() && !force {
+                let e = EditError::Guarded(format!(
+                    "{} 还不存在，没法把新节点挂到父节点下——先建这个文件，或从 --files 里去掉它",
+                    path.display()
+                ));
+                if targets.is_empty() && first_err.is_none() {
+                    first_err = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
+            targets.push(Target {
+                path: path.clone(),
+                new_file: true,
+                len: 0,
+                marker_root: id,
+                needs_marker: true,
+            });
+            continue;
+        }
+        let plan = (|| -> Result<(u64, Uuid, bool), EditError> {
+            prepare(path).map_err(EditError::unavailable)?;
+            let ws_root = wsidx::workspace_root(path);
+            let want = canon(path);
+            let mut r = wsidx::Reader::open(&ws_root).map_err(EditError::unavailable)?;
+            let (marker_root, needs_marker) = match parent {
+                // 新节点自己就是根：声明挂在它自己下面
+                None => (id, true),
+                Some(p) => {
+                    let exists = locate_here(&mut r, &want, p).is_ok();
+                    if !exists {
+                        if !force {
+                            return Err(EditError::Guarded(format!(
+                                "父节点 {p} 不在 {} 里——写进去会留下 E011 断父边；\
+                                 确要这样建请加 --yes，或者把父节点在这几个文件里都建上",
+                                path.display()
+                            )));
+                        }
+                        // 强制：父节点不在，那就在这个文件里把新节点当根处理（不挂 @protocol 到不存在的根上）
+                        (id, true)
+                    } else {
+                        let root = cached_root(&mut r, &want, p, &mut std::collections::HashMap::new(), 0)
+                            .map_err(EditError::Failed)?;
+                        let needs = !declares_protocol_in(&mut r, &want, root, tree::PROTOCOL_APPEND)
+                            .map_err(EditError::Failed)?;
+                        (root, needs)
+                    }
+                }
+            };
+            let len = fs::metadata(path).map_err(|e| EditError::Failed(e.to_string()))?.len();
+            Ok((len, marker_root, needs_marker))
+        })();
+        match plan {
+            Ok((len, marker_root, needs_marker)) => targets.push(Target {
+                path: path.clone(),
+                new_file: false,
+                len,
+                marker_root,
+                needs_marker,
+            }),
+            Err(e) => {
+                if targets.is_empty() && first_err.is_none() {
+                    first_err = Some(e);
+                } else {
+                    if let EditError::Guarded(m) = &e {
+                        return Err(EditError::Guarded(m.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Err(first_err.unwrap_or_else(|| EditError::Unavailable("没有可写的文件".into())));
+    }
+
+    // —— 第二遍：逐个文件写；失败就把写过的全部退回去 ——
+    let now = Utc::now().to_rfc3339();
+    let node = Node { id, parent, name: name.to_string(), value };
+    let created = if history {
+        Some(Node {
+            id: Uuid::random_v4(),
+            parent: Some(id),
+            name: "@created".into(),
+            value: Value::Text(now),
+        })
+    } else {
+        None
+    };
+    let mut written: Vec<PathBuf> = Vec::new();
+    let mut appended = 0usize;
+    for t in &targets {
+        let mut recs: Vec<Node> = Vec::new();
+        recs.push(node.clone());
+        if let Some(c) = &created {
+            recs.push(c.clone());
+        }
+        if t.needs_marker {
+            recs.push(Node {
+                id: Uuid::random_v4(),
+                parent: Some(t.marker_root),
+                name: "@protocol".into(),
+                value: Value::Text(tree::PROTOCOL_APPEND.into()),
+            });
+        }
+        let res: Result<(), String> = if t.new_file {
+            let mut s = tree::Store::new();
+            for n in &recs {
+                s.add(n.clone());
+            }
+            s.save(&t.path).map_err(|e| e.to_string())
+        } else {
+            append_records(&t.path, &recs).map(|_| ())
+        };
+        if let Err(e) = res {
+            // 回退：写过的（含这个可能写了一半的）截回原长度；新建的直接删掉
+            let mut rolled: Vec<String> = Vec::new();
+            let mut all: Vec<(PathBuf, u64, bool)> = Vec::new();
+            for p in &written {
+                if let Some(t) = targets.iter().find(|t| t.path == *p) {
+                    all.push((p.clone(), t.len, t.new_file));
+                }
+            }
+            all.push((t.path.clone(), t.len, t.new_file));
+            for (p, len, new_file) in all {
+                if new_file {
+                    let _ = fs::remove_file(&p);
+                } else if let Ok(f) = fs::OpenOptions::new().write(true).open(&p) {
+                    let _ = f.set_len(len);
+                    let _ = wsidx::append_tail(&wsidx::workspace_root(&p), &p);
+                }
+                rolled.push(p.display().to_string());
+            }
+            return Err(EditError::Failed(format!(
+                "{} 写入失败：{e}（已把本次新建整体回退：{}）",
+                t.path.display(),
+                rolled.join("、")
+            )));
+        }
+        written.push(t.path.clone());
+        appended += recs.len();
+    }
+
+    // —— 第三遍：登记 ——
+    for t in &targets {
+        let _ = wsidx::append_tail(&wsidx::workspace_root(&t.path), &t.path);
+    }
+    Ok(SharedCreateOutcome { id, written, appended })
+}
+
 /// 单节点编辑（一个文件的特例；桌面端与测试用）。
 pub fn edit_node(
     path: &Path,

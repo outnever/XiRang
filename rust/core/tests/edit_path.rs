@@ -105,6 +105,90 @@ fn direct_edit_matches_full_load_edit() {
 // 跨文件批量（`edit::apply_batch_shared`）：一批改动同步写进多个文件
 // ============================================================================
 
+// ============================================================================
+// 跨文件新建（`edit::create_shared`）：同一个编号一次写进多个文件
+// ============================================================================
+
+/// 一次新建、写进两个文件：两边是**同一个编号**（跨文件身份的正式入口）。
+#[test]
+fn create_shared_writes_one_identity_into_every_file() {
+    let dir = tmp_dir("createshared");
+    let (paths, _, roots) = two_files_same_node(&dir, 2);
+    wsidx::rebuild(&dir, &[]).unwrap();
+
+    let out = edit::create_shared(
+        &paths,
+        Some(roots[0]),
+        "共享词条",
+        Value::Text("灯".into()),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(out.written.len(), 2, "两份都要写");
+    for p in &paths {
+        let view = tree::Store::load_view(p).unwrap();
+        let n = view.get(out.id).unwrap_or_else(|| panic!("{} 里应当有这个编号", p.display()));
+        assert_eq!(n.name, "共享词条");
+        assert_eq!(n.parent, Some(roots[0]), "两边的父节点必须一样");
+    }
+    // 两边三字段一致 → 之后按「同步编辑」改它也不会被当成冲突
+    edit::edit_shared(&paths, out.id, None, Some(Value::Text("火".into())), None, false, false)
+        .unwrap();
+    for p in &paths {
+        assert_eq!(
+            tree::Store::load_view(p).unwrap().get(out.id).unwrap().value,
+            Value::Text("火".into())
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
+/// 新节点能写进一个**还不存在**的文件（整份新建，带文件头）。
+#[test]
+fn create_shared_can_create_a_new_file() {
+    let dir = tmp_dir("createnewfile");
+    let fresh = dir.join("新的.xirang");
+    let out = edit::create_shared(&[fresh.clone()], None, "根", Value::Empty, true, false).unwrap();
+    assert_eq!(out.written.len(), 1);
+    let view = tree::Store::load_view(&fresh).unwrap();
+    assert!(view.get(out.id).is_some(), "新文件里应当有这个根节点");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
+/// 父节点只在其中一个文件里 → 拒绝（要显式 force 才放行），且一个字节都不写。
+#[test]
+fn create_shared_refuses_when_parent_is_missing_in_one_file() {
+    let dir = tmp_dir("createparent");
+    let a = dir.join("甲.xirang");
+    let b = dir.join("乙.xirang");
+    let mut s1 = Store::new();
+    let ra = s1.create(None, "甲库", Value::Empty, false).id;
+    s1.save(&a).unwrap();
+    let mut s2 = Store::new();
+    s2.create(None, "乙库", Value::Empty, false);
+    s2.save(&b).unwrap();
+    wsidx::rebuild(&dir, &[]).unwrap();
+
+    let before_a = std::fs::read(&a).unwrap();
+    let before_b = std::fs::read(&b).unwrap();
+    let err =
+        edit::create_shared(&[a.clone(), b.clone()], Some(ra), "词", Value::Empty, false, false)
+            .unwrap_err();
+    assert!(matches!(err, edit::EditError::Guarded(_)), "应当被护栏拦下：{err:?}");
+    assert_eq!(std::fs::read(&a).unwrap(), before_a, "甲不许被写");
+    assert_eq!(std::fs::read(&b).unwrap(), before_b, "乙不许被写");
+    // 显式 force 才放行
+    assert!(
+        edit::create_shared(&[a.clone(), b.clone()], Some(ra), "词", Value::Empty, false, true)
+            .is_ok()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}
+
 /// 同一批改动写进两个文件（同一编号在两份里的三个字段一致）。
 #[test]
 fn batch_shared_writes_every_file() {

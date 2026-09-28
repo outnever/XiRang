@@ -284,20 +284,39 @@ fn tool_node(cfg: &Config, args: &Value) -> Result<Value, OpError> {
             let name = str_arg(args, "name")?;
             let parent = opt_str(args, "parent");
             let value = ops::value_from_json(args.get("value"));
-            let o = ops::create_node(
-                &pol,
-                &ops::NoHooks,
-                &file,
-                parent.as_deref(),
-                &name,
-                value,
-                no_history,
-            )?;
+            // `files: ["a.xirang", "b.xirang"]`：同一个编号一次写进这几个文件
+            let files: Vec<String> = args
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+            let o = if files.is_empty() {
+                ops::create_node(
+                    &pol,
+                    &ops::NoHooks,
+                    &file,
+                    parent.as_deref(),
+                    &name,
+                    value,
+                    no_history,
+                )?
+            } else {
+                ops::create_node_in_files(
+                    &pol,
+                    &ops::NoHooks,
+                    &files,
+                    parent.as_deref(),
+                    &name,
+                    value,
+                    no_history,
+                )?
+            };
             Ok(json!({
                 "created": o.id.to_string(),
                 "name": o.name,
                 "newShard": o.new_shard,
                 "warnings": o.warnings,
+                "files": o.files,
             }))
         }
         "set" => {

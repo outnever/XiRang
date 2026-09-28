@@ -1444,6 +1444,60 @@ pub struct CreateOutcome {
     /// 是否新开了一个分片（词库目录模式下）。
     pub new_shard: bool,
     pub warnings: Vec<String>,
+    /// 这次写进了哪些文件（`--files` 多选时有多个）。
+    pub files: Vec<String>,
+}
+
+/// 在**多个文件里同时新建同一个节点**（同一个编号、同一个父 / 名字 / 值）。
+///
+/// 这是「同一个编号出现在多个文件里」的正规入口：一次新建、写进你指定的几个文件，
+/// 之后各文件各挂自己关心的孩子。父节点必须在这几个文件里都存在（否则要 `--yes` 硬来）。
+pub fn create_node_in_files(
+    pol: &Policy,
+    hooks: &dyn Hooks,
+    files: &[String],
+    parent: Option<&str>,
+    name: &str,
+    value: XValue,
+    no_history: bool,
+) -> OpResult<CreateOutcome> {
+    let p = parse_parent(parent)?;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for f in files {
+        let path = pol.resolve(f)?; // 允许目录检查（MCP）
+        if path.is_dir() {
+            return Err(OpError::invalid(format!(
+                "{f} 是词库目录：多选写文件只接受 `.xirang` 文件；目录里的新节点请单独 `xr new <目录> …`"
+            )));
+        }
+        paths.push(path);
+    }
+    if paths.is_empty() {
+        return Err(OpError::invalid("--files 至少要给一个文件"));
+    }
+    let out = xirang_core::edit::create_shared(&paths, p, name, value, !no_history, pol.force)
+        .map_err(|e| match e {
+            xirang_core::edit::EditError::Guarded(m) => OpError::guarded(
+                m,
+                "确要这样建请显式强制（CLI：--yes，MCP：force）",
+            ),
+            other => OpError::internal(other.message().to_string()),
+        })?;
+    for f in &out.written {
+        hooks.on_save(f, None); // 没有编号表：目录登记转后台
+        update_index(f);
+    }
+    Ok(CreateOutcome {
+        id: out.id,
+        name: name.to_string(),
+        new_shard: false,
+        warnings: Vec::new(),
+        files: out
+            .written
+            .iter()
+            .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()).display().to_string())
+            .collect(),
+    })
 }
 
 pub fn create_node(
@@ -1481,6 +1535,7 @@ pub fn create_node(
                     name: name.to_string(),
                     new_shard: true,
                     warnings: Vec::new(),
+                    files: vec![shard_path.display().to_string()],
                 })
             }
             Some(pid) => {
@@ -1493,6 +1548,7 @@ pub fn create_node(
                     name: name.to_string(),
                     new_shard: false,
                     warnings: Vec::new(),
+                    files: vec![shard_path.display().to_string()],
                 })
             }
         };
@@ -1530,7 +1586,13 @@ pub fn create_node(
     }
     let n = store.create(p, name, value, !no_history);
     save(hooks, &mut store, &path, false, None)?;
-    Ok(CreateOutcome { id: n.id, name: name.to_string(), new_shard: false, warnings })
+    Ok(CreateOutcome {
+        id: n.id,
+        name: name.to_string(),
+        new_shard: false,
+        warnings,
+        files: vec![path.display().to_string()],
+    })
 }
 
 // ============================================================================

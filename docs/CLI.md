@@ -189,11 +189,12 @@ xr diff 旧.xirang 新.xirang --json
 xr ws <编号> a.xirang b.xirang     # 两份都列出来、孩子取并集；冲突时标注
 xr set a.xirang <编号> 新值        # 默认：两份都改
 xr set a.xirang <编号> 新值 --here # 只改 a.xirang（并提示别处没跟着改）
+xr new a.xirang <父编号> 新词条 值 --files a.xirang,b.xirang   # 一次新建，同一个编号写进两份
 xr catalog check --strict          # 体检：有「自身三字段不一致」时退出码 2（方便脚本卡口）
 xr catalog check --sync <编号> --base a.xirang   # 以 a.xirang 为准对齐别处（孩子不动）
 ```
 
-> 刻意**不做**的一件事（这一轮）：合并只发生在**显示层**，不会把两个文件的孩子物理合并到一个文件里；在节点下**新增**子节点仍然一次写一个文件（想写进哪几个文件，就指定那几个）。**批量提交与单节点同规则**：清单里每条改动都会同步到所有含该编号的文件（跨文件失败整体回滚），加 `--here` 才只改点名的文件。
+> 合并只发生在**显示层**，不会把两个文件的孩子物理合并到一个文件里。想让一个**新**编号同时出现在几个文件里，用 `xr new … --files a.xirang,b.xirang`（一次新建、**同一个编号**写进每个文件，之后各文件各挂自己的孩子）。**批量提交与单节点同规则**：清单里每条改动都会同步到所有含该编号的文件（跨文件失败整体回滚），加 `--here` 才只改点名的文件。
 
 ### `xr batch <文件|词库目录> <清单文件|-> [--no-history] [--dry-run] [--json] [--yes] [--allow-missing-target]`
 
@@ -238,7 +239,7 @@ xr index compact          # 一次大批量之后，把台账日志并回块
 
 > **实测**（release 构建）：187 MB / 347 万节点的文件上 **40 万条改引用 = 105 秒**（此前「一条一个命令」要按小时算），文件只增长约 27 MB，跑完 `xr validate` 0 错误、`xr index compact` 4.4 秒；CiBase 的 18 MB / 22.6 万节点文件上 **10 万条改引用 = 48 秒**（debug 构建，两台机器一致）。耗时约与「改动条数 + 涉及的祖先节点数」成正比；四十万条量级建议先 `--dry-run`，跑完补一次 `xr index compact`。
 
-### `xr new <file> <parent|nil> <name> [value] [--no-history]`
+### `xr new <file> <parent|nil> <name> [value] [--no-history] [--files a,b]`
 新增节点。`parent` 为 `nil` 表示建根。文件不存在时自动新建。
 
 ```bash
@@ -246,6 +247,13 @@ xr new 数据.xirang nil 根
 xr new 数据.xirang <父节点ID> 灯 2046
 ```
 > 在非辅助父节点下新增会改变该子树「形状码」（影响按结构检索），会有一行软提示；`--yes` 跳过。
+
+**`--files a.xirang,b.xirang`：一次新建、写进你点名的这几个文件**——这是「同一个编号出现在多个文件里」（跨文件身份）的**正式入口**：**同一个编号**、同一个父 / 名字 / 值同时落到每个文件；之后各文件各挂自己关心的孩子，再改这个节点自身信息时按「跨文件身份」规则同步到所有含它的文件。父节点必须在这几个文件里都存在，否则会被护栏拦下（确要这样请 `--yes`）；目标文件不存在则整份新建（新文件只允许建根节点，`parent` 用 `nil`）。
+
+```bash
+xr new a.xirang <父节点ID> 共享词条 灯 --files a.xirang,b.xirang   # 同一个编号写进两份
+xr new c.xirang nil 新库 --files c.xirang                        # 新建一份文件（整份写出）
+```
 
 ### `xr set <file> <node-id> <value> [--no-history]`
 改值（写 `@history` 快照）。

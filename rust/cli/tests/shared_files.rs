@@ -156,3 +156,50 @@ fn batch_syncs_all_copies_and_here_opts_out() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// `xr new --files a,b`：**同一个编号**一次写进两个文件；之后改它两份一起改。
+#[test]
+fn new_with_files_creates_one_identity_in_several_files() {
+    let root = tmp_root("newfiles");
+    let (code, out, err) = run(&root, &["new", "a.xirang", "nil", "根"]);
+    assert_eq!(code, 0, "{err}");
+    let root_id = grab(&out);
+    std::fs::copy(root.join("a.xirang"), root.join("b.xirang")).unwrap();
+    let (code, _, err) = run(&root, &["index", "rebuild", "a.xirang", "b.xirang"]);
+    assert_eq!(code, 0, "{err}");
+
+    // 一次新建、写进两份（同一个编号）
+    let (code, out, err) = run(
+        &root,
+        &["new", "a.xirang", &root_id, "共享词条", "灯", "--files", "a.xirang,b.xirang"],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("写进 2 个文件"), "{out}");
+    let new_id = grab(&out);
+
+    let (code, out, err) = run(&root, &["ws", &new_id, "a.xirang", "b.xirang"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("2 处"), "两份里应当是同一个编号：{out}");
+
+    // 之后改它 → 两份一起改（沿用同步规则）
+    let (code, _, err) = run(&root, &["set", "a.xirang", &new_id, "火"]);
+    assert_eq!(code, 0, "{err}");
+    let (_, out, _) = run(&root, &["find", "b.xirang", "火"]);
+    assert!(out.contains(&new_id), "b 应当也改成「火」：{out}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `--files` 指向一个还不存在的文件 → 整份新建（带文件头）。
+#[test]
+fn new_with_files_can_create_a_new_file() {
+    let root = tmp_root("newfilecreate");
+    let (code, out, err) =
+        run(&root, &["new", "a.xirang", "nil", "新根", "--files", "a.xirang"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("已创建"), "{out}");
+    let (code, out, err) = run(&root, &["info", "a.xirang"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("节点数: 1"), "新文件应当只有这个根节点：{out}");
+    std::fs::remove_dir_all(&root).ok();
+}

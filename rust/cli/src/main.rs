@@ -618,10 +618,34 @@ fn cmd_new(
     parent: &str,
     name: &str,
     value: Option<&str>,
+    files: &[String],
     no_history: bool,
     yes: bool,
 ) -> i32 {
     let v = value.map(ops::parse_value_str).unwrap_or(xirang_core::codec::Value::Empty);
+    // `--files a,b`：**同一个编号**一次写进这几个文件（跨文件身份的正式入口）
+    if !files.is_empty() {
+        return match ops::create_node_in_files(
+            &write_policy(yes, false),
+            &CliHooks,
+            files,
+            Some(parent),
+            name,
+            v,
+            no_history,
+        ) {
+            Ok(o) => {
+                println!("已创建：{} <{}>", o.name, o.id);
+                if o.files.len() > 1 {
+                    println!("  （写进 {} 个文件：{}）", o.files.len(), o.files.join("、"));
+                } else if let Some(f) = o.files.first() {
+                    println!("  （写进：{f}）");
+                }
+                0
+            }
+            Err(e) => report(&e),
+        };
+    }
     match ops::create_node(&Policy::cli(yes), &CliHooks, file, Some(parent), name, v, no_history) {
         Ok(o) => {
             for w in &o.warnings {
@@ -2428,7 +2452,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--no-history", "--no-index", "--yes", "--blank", "--all", "--root", "--shape-of",
     "--template", "--where", "--subtree", "--append", "--under", "--from-json", "--rule",
     "--out", "--only", "--sync", "--base", "--depth", "--no-pager", "--force",
-    "--dry-run", "--allow-missing-target", "--here", "--strict",
+    "--dry-run", "--allow-missing-target", "--here", "--strict", "--files",
 ];
 
 fn is_known_flag(s: &str) -> bool {
@@ -2461,6 +2485,7 @@ fn usage() {
     println!("  xr cat <file> [--head N] [--ids] [--skip-aux] [--force]   扁平视图：一行一个节点，按存放顺序（像看文本）");
     println!("  xr validate <file>                  校验（E/R）");
     println!("  xr new <file> <parent|nil> <name> [value] [--no-history]   新增节点");
+    println!("       --files a.xirang,b.xirang   同一个编号一次写进这几个文件（跨文件身份的正式入口）");
     println!("  xr set <file> <node-id> <value> [--no-history] [--here]   改值");
     println!("  xr rename <file> <node-id> <新名字> [--no-history] [--here]   改名（编号不变、引用不断；旧名字进 @history）");
     println!("  xr rm <file> <node-id> [--here]     删除（置空）");
@@ -2602,13 +2627,45 @@ fn main() {
         }
         "validate" => cmd_validate(file),
         "new" => {
-            if args.len() < 5 {
+            // 位置参数：<parent|nil> <name> [value]；可选 `--files a,b`（同一个编号写进多个文件）
+            let mut positional: Vec<&str> = Vec::new();
+            let mut files: Vec<String> = Vec::new();
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--files" => {
+                        if let Some(v) = args.get(i + 1) {
+                            for f in v.split(',') {
+                                let f = f.trim();
+                                if !f.is_empty() {
+                                    files.push(f.to_string());
+                                }
+                            }
+                        }
+                        i += 2;
+                    }
+                    // 只把「已知标志」当标志；`--待办` 这类文本值要保留。
+                    a if is_known_flag(a) => i += 1,
+                    a => {
+                        positional.push(a);
+                        i += 1;
+                    }
+                }
+            }
+            if positional.len() < 2 {
                 usage();
                 2
             } else {
-                // 只把「已知标志」当标志；`--待办` 这类文本值要保留。
-                let value = args.get(5).map(|s| s.as_str()).filter(|v| !is_known_flag(v));
-                cmd_new(file, &args[3], &args[4], value, has_flag(&args, "--no-history"), yes)
+                let value = positional.get(2).copied();
+                cmd_new(
+                    file,
+                    positional[0],
+                    positional[1],
+                    value,
+                    &files,
+                    has_flag(&args, "--no-history"),
+                    yes,
+                )
             }
         }
         "set" => {

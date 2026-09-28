@@ -1,5 +1,6 @@
 //! xr CLI 集成测试：进程级运行 `xr` 二进制，验证 info / tree / validate / 编辑 / 导出往返。
 
+use std::cell::RefCell;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,17 +8,42 @@ use xirang_core::codec::{Node, Uuid, Value};
 use xirang_core::shard;
 use xirang_core::tree::Store;
 
+thread_local! {
+    /// 每个测试（每个线程）一个**独立**的工作区目录。
+    ///
+    /// 之前所有测试都把文件直接放在 `/tmp` 下，于是工作区台账都落在同一个
+    /// `/tmp/.xirang-index`：测试并行跑时会互相抢那把写者锁（报 F014），
+    /// 其中一个用例还会顺手删掉 `/tmp/.xirang-index`，把别的用例一起带崩。
+    /// 每个测试自己一个目录后，这类相互干扰就没了。
+    static TEST_WS: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+}
+
+fn test_ws() -> std::path::PathBuf {
+    TEST_WS.with(|w| {
+        if let Some(p) = w.borrow().as_ref() {
+            return p.clone();
+        }
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let d = std::env::temp_dir().join(format!("xr-cli-ws-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        *w.borrow_mut() = Some(d.clone());
+        d
+    })
+}
+
 fn xr() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_xr"));
-    // 隔离本机目录，避免测试污染真实 ~/.config
-    let cat = std::env::temp_dir().join(format!("xr-test-catalog-{}.idx", std::process::id()));
-    c.env("XIRANG_CATALOG", cat);
+    // 隔离本机目录与工作区台账：本测试独享一个目录，避免污染真实 ~/.config、
+    // 也避免和其他并行测试抢同一把索引锁（F014）。
+    let ws = test_ws();
+    c.env("XIRANG_CATALOG", ws.join("catalog.idx"));
+    c.env("XIRANG_WORKSPACE", &ws);
     c
 }
 
 fn tmp_xirang(tag: &str) -> std::path::PathBuf {
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    std::env::temp_dir().join(format!("xr-cli-{tag}-{}-{n}.xirang", std::process::id()))
+    // 同一个测试里的文件都落在同一个工作区目录里（跨文件用例需要 a 与 b 同目录）。
+    test_ws().join(format!("{tag}.xirang"))
 }
 
 #[test]

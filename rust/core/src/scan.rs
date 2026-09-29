@@ -185,15 +185,35 @@ pub struct Issue {
 /// 流式校验：只用「编号 → 父节点」一张表 + 声明了 `append-v1` 的根集合。
 ///
 /// 与 `validator::validate_view` 语义一致：声明了修订协议的根下重复编号是修订，不报 E002。
+/// 一次校验的产出：`issues` 是错误（影响退出码），`warnings` 是只读提示（不影响退出码）。
+#[derive(Clone, Debug, Default)]
+pub struct ScanReport {
+    pub issues: Vec<Issue>,
+    pub warnings: Vec<Issue>,
+}
+
+/// 流式校验（只查本文件；引用目标只在本文件里找）。
 pub fn validate_stream(
     path: &Path,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64),
 ) -> Result<Vec<Issue>, String> {
+    Ok(validate_stream_ext(path, cancel, progress, &mut |_| false)?.issues)
+}
+
+/// 流式校验，带一个「跨文件存在性」的口径：本文件查不到的引用目标，交给 `external` 再问一次
+/// （`true` = 目标在别处存在，不算断裂）。校验层不管别的文件长什么样，只问「存不存在」。
+pub fn validate_stream_ext(
+    path: &Path,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64),
+    external: &mut dyn FnMut(Uuid) -> bool,
+) -> Result<ScanReport, String> {
     // 第一遍：编号表 + 重复编号 + 声明了 append-v1 的根 + E001/E005
     let mut parents: HashMap<Uuid, Option<Uuid>> = HashMap::new();
     let mut counts: HashMap<Uuid, u32> = HashMap::new();
     let mut declared: HashSet<Uuid> = HashSet::new();
+    let mut tpl_markers: HashSet<Uuid> = HashSet::new();
     let mut issues = Vec::new();
     scan_file(path, cancel, |node| {
         if node.id.is_nil() {
@@ -216,12 +236,16 @@ pub fn validate_stream(
                 declared.insert(root);
             }
         }
+        // `@模板`(空) 是「我是模板定义」的标记，本该是叶子；记下来，后面查有没有被当容器用。
+        if node.name == "@模板" && node.value == Value::Empty {
+            tpl_markers.insert(node.id);
+        }
         parents.insert(node.id, node.parent);
         progress(parents.len() as u64);
         true
     })?;
     if cancel.load(Ordering::Relaxed) {
-        return Ok(Vec::new());
+        return Ok(ScanReport::default());
     }
 
     // 父节点成环（E006）：沿父链走，走过的点做标记，避免重复报
@@ -267,9 +291,13 @@ pub fn validate_stream(
         }
     }
 
-    // 第二遍：父边 / 引用是否断裂
+    // 第二遍：父边 / 引用是否断裂；顺手查「`@模板` 被当容器用」
+    let mut warnings = Vec::new();
+    let mut warned_container: HashSet<Uuid> = HashSet::new();
     scan_file(path, cancel, |node| {
         if let Some(Some(p)) = parents.get(&node.id) {
+            // 注意：父边**只在本文件里**判定（E011 的定义就是「本文件里没有这个父节点」）。
+            // 跨文件口径只用在**引用**上（引用目标本来就可以指向别的文件）。
             if !parents.contains_key(p) {
                 issues.push(Issue {
                     code: "E011",
@@ -279,18 +307,35 @@ pub fn validate_stream(
             }
         }
         if let Value::Reference(t) = &node.value {
-            if !parents.contains_key(t) {
+            if !parents.contains_key(t) && !external(*t) {
                 issues.push(Issue {
                     code: "R001",
                     node_id: node.id,
-                    message: format!("引用断裂：目标 {t} 不存在"),
+                    message: format!("引用断裂：目标 {t} 在本文件与已登记的工作区里都找不到"),
                 });
+            }
+        }
+        // `@模板`(空) 下面还挂着普通子节点 → 多半是把 `@模板` 当模板容器用了（应叫 `模板集`）
+        if !node.name.starts_with('@') {
+            if let Some(Some(p)) = parents.get(&node.id) {
+                if tpl_markers.contains(p) && warned_container.insert(*p) {
+                    warnings.push(Issue {
+                        code: "提示",
+                        node_id: *p,
+                        message: format!(
+                            "`@模板`(空) 下面还挂着普通子节点（如「{}」）：像是把 `@模板` 当容器用了；\
+                             统一存放模板请把容器改名为 `模板集`，否则它所在的整棵树都会被当成模板定义、无法直接编辑",
+                            node.name
+                        ),
+                    });
+                }
             }
         }
         true
     })?;
     issues.sort_by(|a, b| a.code.cmp(b.code).then_with(|| a.node_id.0.cmp(&b.node_id.0)));
-    Ok(issues)
+    warnings.sort_by(|a, b| a.node_id.0.cmp(&b.node_id.0));
+    Ok(ScanReport { issues, warnings })
 }
 
 fn root_of(parents: &HashMap<Uuid, Option<Uuid>>, id: Uuid) -> Uuid {

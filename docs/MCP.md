@@ -40,9 +40,9 @@ rust/target/debug/xr-mcp --root /你的数据目录
 |---|---|---|
 | `context` | — | 先看这里：允许目录、版本、各工具支持的动作清单 |
 | `file_info` | — | 文件摘要（格式版本 / 节点数 / 根数） |
-| `file_validate` | — | 结构校验（E/R 错误） |
+| `file_validate` | — | 结构校验（E/R 错误）。**引用按跨文件口径**（目标在本文件 ∪ 已登记工作区 ∪ 本机目录里能找到就算通过）；返回里另有 `warnings`（只读提示，如「`@模板` 当容器用了」），不影响结果 |
 | `file_diff` | — | 两文件对比（增/删/改，按节点编号） |
-| `tree` | `layout=tree\|flat` | 树视图；可给 `node`/`depth`/`limit`/`skip_aux`；`limit` 默认 200 |
+| `tree` | `layout=tree\|flat` | 树视图；可给 `node`/`depth`/`limit`/`skip_aux`；`limit` 默认 200。引用在 `value` 里显示成**可读路径**（如 `词条>01`；跨文件带上库名） |
 | `query` | `find` / `match` / `instances` / `refs` / `history` | 搜索、按结构/名字/模板匹配、实例、引用边、`@history` 快照 |
 | `node` | `create` / `set` / `rename` / `remove` / `link` / `copy` / `fill` / `revert` / `prune_history` / `batch` | 改节点；`batch` 一次提交一批改动（`ops` 数组，或 `batch` 的 JSONL 文本；可带 `dry_run`）。`create` 可带 `files: ["a.xirang","b.xirang"]`：**同一个编号**一次写进这几个文件（跨文件身份的正式入口，父节点须在每个文件里都存在）。写动作与 CLI 同规则：某编号在多个文件里都有时**同步改到所有含它的文件**（冲突先裁决；`here: true` 只改点名的文件） |
 | `template` | `define` / `list` / `instantiate` / `remove` | 建模板、列模板、按模板批量建实例（可 `under` 挂到某父下）、删模板 |

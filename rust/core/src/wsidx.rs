@@ -1247,9 +1247,17 @@ fn root_of_new(
             if parents.contains_key(p) {
                 root_of_new(*p, parents, roots, r, file_id, depth + 1)?
             } else {
-                r.root_in_file(*p, file_id)?.ok_or_else(|| {
-                    format!("新记录 {id} 的父节点 {p} 在台账里查不到：需要整份登记")
-                })?
+                match r.root_in_file(*p, file_id)? {
+                    Some(root) => root,
+                    // 父节点在**别的**文件里（跨文件父链）：本文件里当前这条就是它这棵树的根，
+                    // 与 `core::edit` 的护栏判定同一口径。哪儿都查不到时才是台账过期。
+                    None if r.located_in_other_file(*p, file_id)? => id,
+                    None => {
+                        return Err(format!(
+                            "新记录 {id} 的父节点 {p} 在台账里查不到：需要整份登记"
+                        ))
+                    }
+                }
             }
         }
         None => r
@@ -2023,6 +2031,25 @@ impl Reader {
     /// 某个编号**在指定文件里**的所属树根。
     fn root_in_file(&mut self, id: Uuid, file_id: u32) -> Result<Option<Uuid>, String> {
         Ok(self.loc_in_file(id, file_id)?.map(|e| e.root))
+    }
+
+    /// 这个编号在**别的**文件里登记过吗？用于区分两种「本文件里查不到父节点」：
+    /// 父节点在别的文件（跨文件父链，正常）→ 当前记录在本文件里就是树根；
+    /// 哪儿都查不到 → 台账过期，仍然要求整份登记。
+    fn located_in_other_file(&mut self, id: Uuid, file_id: u32) -> Result<bool, String> {
+        let key = key_uuid(id);
+        for raw in self.collect_match(KIND_LOC, &key, 16)? {
+            let e = dec_loc(&raw);
+            if e.file_id != file_id && self.block_valid(e.file_id) && self.file_fresh(e.file_id) {
+                return Ok(true);
+            }
+        }
+        for fid in self.loc_ids.get(&id).cloned().unwrap_or_default() {
+            if fid != file_id && self.file_fresh(fid) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// 该编号所属的树根（同编号多文件 → 可能有多个）。

@@ -685,3 +685,40 @@ fn batch_rm_subtree_empties_every_node_in_the_subtree() {
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
 }
+
+/// 父节点在**别的文件**里（跨文件父链）时，护栏与写操作都要能降级完成、不崩。
+///
+/// 这一条来自真实担忧：在一个文件里看起来是「根」的节点，将来可能有父节点、且父节点在别的文件。
+/// 以前护栏沿父链往上时要求每一步的父节点都在本文件里，跨文件就报内部错误。
+#[test]
+fn edit_survives_a_parent_that_lives_in_another_file() {
+    let dir = tmp_dir("xfileparent");
+    let a = dir.join("甲.xirang");
+    let mut sa = Store::new();
+    let ra = sa.create(None, "甲库", Value::Empty, false).id;
+    sa.save(&a).unwrap();
+
+    let b = dir.join("乙.xirang");
+    let mut sb = Store::new();
+    let child = Uuid::random_v4();
+    sb.add(Node {
+        id: child,
+        parent: Some(ra), // 父只在甲里
+        name: "借父之子".into(),
+        value: Value::Text("值".into()),
+    });
+    sb.save(&b).unwrap();
+
+    wsidx::rebuild(&dir, &[]).unwrap();
+
+    // 护栏不能因为「父节点不在本文件」就报错（跨文件父链到此为止 → 不算模板定义）
+    assert!(!edit::under_template(&b, child).unwrap());
+    // 写也能完成
+    edit::edit_node(&b, child, None, Some(Value::Text("新值".into())), false, false).unwrap();
+    assert_eq!(
+        tree::Store::load_view(&b).unwrap().get(child).unwrap().value,
+        Value::Text("新值".into())
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(wsidx::index_dir(&dir)).ok();
+}

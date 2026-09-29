@@ -203,3 +203,42 @@ fn new_with_files_can_create_a_new_file() {
     assert!(out.contains("节点数: 1"), "新文件应当只有这个根节点：{out}");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// 跨文件引用：连边不该被拦，校验要认（别处有就算通过），真悬空的仍要报。
+#[test]
+fn validate_and_link_accept_cross_file_references() {
+    let root = tmp_root("xvalidate");
+    // 乙：目标
+    let (_, out, _) = run(&root, &["new", "b.xirang", "nil", "通用词库"]);
+    let b_root = grab(&out);
+    let (_, out, _) = run(&root, &["new", "b.xirang", &b_root, "一不做二不休"]);
+    let target = grab(&out);
+    // 甲：引用指向乙里的目标
+    let (_, out, _) = run(&root, &["new", "a.xirang", "nil", "成语词库"]);
+    let a_root = grab(&out);
+    let (_, out, _) = run(&root, &["new", "a.xirang", &a_root, "典故"]);
+    let r = grab(&out);
+
+    // 目标在别的文件里，连边也不该被拦（不加 --yes）
+    let (code, _, err) = run(&root, &["link", "a.xirang", &r, &target]);
+    assert_eq!(code, 0, "跨文件连边不该被拦：{err}");
+    let (code, _, err) = run(&root, &["index", "rebuild", "a.xirang", "b.xirang"]);
+    assert_eq!(code, 0, "{err}");
+
+    let (code, out, err) = run(&root, &["validate", "a.xirang"]);
+    assert_eq!(code, 0, "跨文件引用不该报断裂：{out}{err}");
+    assert!(out.contains("0 错误"), "{out}");
+
+    // 真·悬空引用仍要报 R001
+    let (_, out, _) = run(&root, &["new", "a.xirang", &a_root, "假引用"]);
+    let bogus = grab(&out);
+    let _ = run(
+        &root,
+        &["link", "a.xirang", &bogus, "99999999-1111-4222-8333-444444444444", "--yes"],
+    );
+    let (code, out, _) = run(&root, &["validate", "a.xirang"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("R001"), "真悬空引用仍要报：{out}");
+
+    std::fs::remove_dir_all(&root).ok();
+}

@@ -390,8 +390,16 @@ fn cmd_cat(file: &str, opts: &ViewOpts, force: bool, no_pager: bool) -> i32 {
 }
 
 fn cmd_validate(file: &str) -> i32 {
-    match ops::validate(&Policy::cli(false), &CliHooks, file) {
+    // `--no-index` / `XIRANG_INDEX=off`：本机目录那一层关掉（引用只按本文件 ∪ 工作区台账判定）
+    let mut pol = Policy::cli(false);
+    if !index_enabled() {
+        pol = pol.without_catalog();
+    }
+    match ops::validate(&pol, &CliHooks, file) {
         Ok(v) => {
+            for w in &v.warnings {
+                eprintln!("提示：{}", w.message);
+            }
             if v.errors.is_empty() {
                 println!("校验通过：0 错误");
                 return 0;

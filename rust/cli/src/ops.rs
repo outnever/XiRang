@@ -664,25 +664,127 @@ pub fn type_name(v: &XValue) -> &'static str {
     }
 }
 
+/// 引用目标的「可读路径」解析器：把 `→ <编号>` 显示成 `→ 词条>01`。
+///
+/// 先在本文件的树里找；不在本文件时查工作区台账（跨文件身份）——路径自然带上目标
+/// 所在那棵树的根名（跨文件时就是「库名>…」）。台账开不出来就退回显示编号。
+pub struct RefNamer {
+    ws_root: Option<PathBuf>,
+    /// `None` = 还没开（避免用不上时白读一次台账）；`Some(None)` = 开不出来。
+    reader: Option<Option<xirang_core::wsidx::Reader>>,
+    cache: HashMap<Uuid, String>,
+}
+
+impl RefNamer {
+    pub fn new(ws_root: Option<PathBuf>) -> Self {
+        RefNamer { ws_root, reader: None, cache: HashMap::new() }
+    }
+
+    fn reader(&mut self) -> Option<&mut xirang_core::wsidx::Reader> {
+        if self.reader.is_none() {
+            let open = self.ws_root.clone().and_then(|d| xirang_core::wsidx::Reader::open(&d).ok());
+            self.reader = Some(open);
+        }
+        self.reader.as_mut().and_then(|o| o.as_mut())
+    }
+
+    /// 引用目标的显示串（可读路径；解析不出来就退回编号）。
+    pub fn display(&mut self, store: &tree::Store, id: Uuid) -> String {
+        if let Some(v) = self.cache.get(&id) {
+            return v.clone();
+        }
+        let s = if let Some(p) = convert::node_path(store, id) {
+            p
+        } else if let Some((file, p)) = self.ledger_path(id) {
+            // 跨文件：路径的第一段是那棵树根的**名字**；名字为空时才用文件名兜底。
+            if p.starts_with('∅') {
+                format!("{}>{p}", short_file(&file))
+            } else {
+                p
+            }
+        } else {
+            id.to_string()
+        };
+        self.cache.insert(id, s.clone());
+        s
+    }
+
+    /// 台账里从目标往上拼路径（跨文件）；返回 `(目标所在文件, 路径)`。
+    fn ledger_path(&mut self, id: Uuid) -> Option<(String, String)> {
+        let r = self.reader()?;
+        let mut names: Vec<String> = Vec::new();
+        let mut cur = id;
+        let mut file: Option<String> = None;
+        for _ in 0..4096 {
+            let hits = r.locate(cur).ok()?;
+            let idx = match file.as_deref() {
+                Some(f) => hits.iter().position(|h| h.file == f),
+                None => (!hits.is_empty()).then_some(0),
+            };
+            let h = match idx {
+                Some(i) => &hits[i],
+                None => break,
+            };
+            if file.is_none() {
+                file = Some(h.file.clone());
+            }
+            let n = xirang_core::wsidx::read_node_at_hit(h).ok()?;
+            names.push(if n.name.is_empty() { "∅".to_string() } else { n.name.clone() });
+            match n.parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        if names.is_empty() {
+            return None;
+        }
+        names.reverse();
+        Some((file.unwrap_or_default(), names.join(">")))
+    }
+}
+
+fn short_file(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
 /// 值的显示形式（引用解析成目标名字）。
 pub fn display_value(store: &tree::Store, node: &Node) -> Option<String> {
+    display_value_named(store, node, None)
+}
+
+/// 同上，但可以带一个跨文件路径解析器（`xr tree` / `xr cat` 用）。
+pub fn display_value_named(
+    store: &tree::Store,
+    node: &Node,
+    namer: Option<&mut RefNamer>,
+) -> Option<String> {
     match &node.value {
         XValue::Empty => None,
         XValue::Int(n) => Some(n.to_string()),
         XValue::Float(f) => Some(f.to_string()),
         XValue::Bool(b) => Some(if *b { "true" } else { "false" }.to_string()),
         XValue::Text(s) => Some(s.clone()),
-        XValue::Reference(u) => Some(format!(
-            "→ {}",
-            store.get(*u).map(|t| t.name.as_str()).unwrap_or(&u.to_string())
-        )),
+        XValue::Reference(u) => Some(match namer {
+            Some(nm) => format!("→ {}", nm.display(store, *u)),
+            None => format!(
+                "→ {}",
+                convert::node_path(store, *u).unwrap_or_else(|| u.to_string())
+            ),
+        }),
         XValue::Blob(b) => Some(format!("[blob {} 字节]", b.len())),
     }
 }
 
 /// 一行文本标签：`名字 = 值` / `名字` / `值` / `(空节点)`。
 pub fn label(store: &tree::Store, node: &Node) -> String {
-    match display_value(store, node) {
+    label_named(store, node, None)
+}
+
+pub fn label_named(store: &tree::Store, node: &Node, namer: Option<&mut RefNamer>) -> String {
+    match display_value_named(store, node, namer) {
         None => {
             if node.name.is_empty() {
                 "(空节点)".to_string()
@@ -714,14 +816,16 @@ pub struct NodeView {
 }
 
 impl NodeView {
-    fn new(store: &tree::Store, node: &Node) -> Self {
+    fn new(store: &tree::Store, node: &Node, mut namer: Option<&mut RefNamer>) -> Self {
+        let value = display_value_named(store, node, namer.as_deref_mut());
+        let label = label_named(store, node, namer.as_deref_mut());
         NodeView {
             id: node.id,
             parent: node.parent,
             name: node.name.clone(),
             type_name: type_name(&node.value),
-            value: display_value(store, node),
-            label: label(store, node),
+            value,
+            label,
             is_aux: node.name.starts_with('@'),
             children: Vec::new(),
         }
@@ -863,7 +967,7 @@ pub fn view(
     layout: Layout,
     unbounded_guard: Option<usize>,
 ) -> OpResult<ViewOutcome> {
-    let (store, _path) = load(pol, hooks, file)?;
+    let (store, path) = load(pol, hooks, file)?;
     let total = store.len();
     if let Some(g) = unbounded_guard {
         // `--force` / `force: true` 明确表示「我知道会刷屏，照样打」
@@ -878,6 +982,8 @@ pub fn view(
     }
     let mut budget = opts.limit.unwrap_or(usize::MAX);
     let mut seen: HashSet<Uuid> = HashSet::new();
+    // 引用显示成可读路径（跨文件时走工作区台账）；解析不出来就退回编号。
+    let mut namer = Some(RefNamer::new(Some(xirang_core::wsidx::workspace_root(&path))));
 
     if layout == Layout::Flat {
         let mut items = Vec::new();
@@ -888,7 +994,7 @@ pub fn view(
             if opts.skip_aux && nd.name.starts_with('@') {
                 continue;
             }
-            items.push(NodeView::new(&store, nd));
+            items.push(NodeView::new(&store, nd, namer.as_mut()));
             budget -= 1;
         }
         let printed = items.len();
@@ -912,6 +1018,7 @@ pub fn view(
                     &mut budget,
                     &mut printed,
                     &mut seen,
+                    &mut namer,
                 ));
             }
         }
@@ -920,7 +1027,16 @@ pub fn view(
                 if budget == 0 {
                     break;
                 }
-                roots.push(build_view(&store, r, opts, 1, &mut budget, &mut printed, &mut seen));
+                roots.push(build_view(
+                    &store,
+                    r,
+                    opts,
+                    1,
+                    &mut budget,
+                    &mut printed,
+                    &mut seen,
+                    &mut namer,
+                ));
             }
         }
     }
@@ -936,10 +1052,11 @@ fn build_view(
     budget: &mut usize,
     printed: &mut usize,
     seen: &mut HashSet<Uuid>,
+    namer: &mut Option<RefNamer>,
 ) -> NodeView {
     *budget -= 1;
     *printed += 1;
-    let mut v = NodeView::new(store, node);
+    let mut v = NodeView::new(store, node, namer.as_mut());
     // 父边成环（E006）时兜底：同一节点只展开一次，避免无限递归。
     if !seen.insert(node.id) {
         return v;
@@ -953,7 +1070,7 @@ fn build_view(
         if *budget == 0 {
             break;
         }
-        v.children.push(build_view(store, c, opts, depth + 1, budget, printed, seen));
+        v.children.push(build_view(store, c, opts, depth + 1, budget, printed, seen, namer));
     }
     v
 }
@@ -966,6 +1083,8 @@ pub struct ValidationItem {
 
 pub struct ValidationOutcome {
     pub errors: Vec<ValidationItem>,
+    /// 只读提示（不影响退出码）：例如「`@模板` 被当容器用」这类用法提醒。
+    pub warnings: Vec<ValidationItem>,
 }
 
 impl ValidationOutcome {
@@ -973,6 +1092,11 @@ impl ValidationOutcome {
         json!({
             "count": self.errors.len(),
             "errors": self.errors.iter().map(|e| json!({
+                "code": e.code,
+                "node": e.node_id.to_string(),
+                "message": e.message,
+            })).collect::<Vec<_>>(),
+            "warnings": self.warnings.iter().map(|e| json!({
                 "code": e.code,
                 "node": e.node_id.to_string(),
                 "message": e.message,
@@ -991,17 +1115,47 @@ pub fn validate(pol: &Policy, hooks: &dyn Hooks, file: &str) -> OpResult<Validat
     let _ = hooks;
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let mut progress = |_: u64| {};
-    let issues = xirang_core::scan::validate_stream(&path, &cancel, &mut progress)
-        .map_err(OpError::internal)?;
-    let errors = issues
-        .into_iter()
-        .map(|e| ValidationItem {
-            code: e.code,
-            node_id: e.node_id,
-            message: e.message,
-        })
-        .collect();
-    Ok(ValidationOutcome { errors })
+    // 跨文件口径：本文件里查不到的引用目标，问一次「工作区台账 ∪ 本机目录」——
+    // 与 `xr batch` 的引用目标校验同一口径（引用本来就可以指向别的文件）。
+    // 校验是只读的：不登记、不写盘。
+    let ws_root = xirang_core::wsidx::workspace_root(&path);
+    let mut reader = xirang_core::wsidx::Reader::open(&ws_root).ok();
+    let mut cat = if pol.catalog {
+        xirang_core::catalog::CatalogReader::open(&xirang_core::catalog::default_path()).ok()
+    } else {
+        None
+    };
+    let mut seen: HashMap<Uuid, bool> = HashMap::new();
+    let mut external = |t: Uuid| -> bool {
+        if let Some(v) = seen.get(&t) {
+            return *v;
+        }
+        let mut ok = reader
+            .as_mut()
+            .and_then(|r| r.locate(t).ok())
+            .map(|h| !h.is_empty())
+            .unwrap_or(false);
+        if !ok {
+            if let Some(c) = cat.as_mut() {
+                ok = c.lookup_all(t).map(|p| !p.is_empty()).unwrap_or(false);
+            }
+        }
+        seen.insert(t, ok);
+        ok
+    };
+    let report =
+        xirang_core::scan::validate_stream_ext(&path, &cancel, &mut progress, &mut external)
+            .map_err(OpError::internal)?;
+    let conv = |v: Vec<xirang_core::scan::Issue>| {
+        v.into_iter()
+            .map(|e| ValidationItem {
+                code: e.code,
+                node_id: e.node_id,
+                message: e.message,
+            })
+            .collect::<Vec<_>>()
+    };
+    Ok(ValidationOutcome { errors: conv(report.issues), warnings: conv(report.warnings) })
 }
 
 pub struct DiffItem {
@@ -1182,8 +1336,9 @@ pub fn search(
     file: &str,
     q: &MatchQuery,
 ) -> OpResult<MatchOutcome> {
-    let (store, _) = load(pol, hooks, file)?;
+    let (store, path) = load(pol, hooks, file)?;
     let sindex = query::ShapeIndex::build(&store);
+    let mut namer = Some(RefNamer::new(Some(xirang_core::wsidx::workspace_root(&path))));
     let cands: Vec<usize> = if let Some(name) = &q.template {
         let tid = resolve_template(&store, name)?;
         find_instances_of(&store, tid)
@@ -1211,7 +1366,7 @@ pub fn search(
                 id: nd.id,
                 name: nd.name.clone(),
                 type_name: type_name(&nd.value),
-                value: display_value(&store, nd),
+                value: display_value_named(&store, nd, namer.as_mut()),
                 tree: if q.with_tree {
                     let mut budget = usize::MAX;
                     let mut printed = 0usize;
@@ -1225,6 +1380,7 @@ pub fn search(
                             &mut budget,
                             &mut printed,
                             &mut seen,
+                            &mut namer,
                         )
                         .to_json(),
                     )
@@ -1260,10 +1416,11 @@ pub fn instances(
     file: &str,
     template: &str,
 ) -> OpResult<InstancesOutcome> {
-    let (store, _) = load(pol, hooks, file)?;
+    let (store, path) = load(pol, hooks, file)?;
     let tid = resolve_template(&store, template)?;
     let tname = store.get(tid).map(|n| n.name.clone()).unwrap_or_default();
     let mut out = Vec::new();
+    let mut namer = Some(RefNamer::new(Some(xirang_core::wsidx::workspace_root(&path))));
     for i in find_instances_of(&store, tid) {
         let mut budget = usize::MAX;
         let mut printed = 0usize;
@@ -1276,6 +1433,7 @@ pub fn instances(
             &mut budget,
             &mut printed,
             &mut seen,
+            &mut namer,
         ));
     }
     Ok(InstancesOutcome { template_id: tid, template_name: tname, instances: out })
@@ -2106,6 +2264,28 @@ pub struct LinkOutcome {
     pub sync: SyncReport,
 }
 
+/// 引用目标「存在吗」的跨文件口径：本文件里没有时，再看工作区台账（∪ 本机目录）。
+/// 与 `xr validate` 的 R001 判定、`xr batch` 的引用目标校验**同一套口径**。
+fn target_exists_anywhere(pol: &Policy, path: &Path, id: Uuid) -> bool {
+    if matches!(xirang_core::edit::read_node(path, id), Ok(Some(_))) {
+        return true;
+    }
+    let ws_root = xirang_core::wsidx::workspace_root(path);
+    let mut ok = xirang_core::wsidx::Reader::open(&ws_root)
+        .ok()
+        .and_then(|mut r| r.locate(id).ok())
+        .map(|h| !h.is_empty())
+        .unwrap_or(false);
+    if !ok && pol.catalog {
+        ok = xirang_core::catalog::CatalogReader::open(&xirang_core::catalog::default_path())
+            .ok()
+            .and_then(|mut c| c.lookup_all(id).ok())
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+    }
+    ok
+}
+
 pub fn link_nodes(
     pol: &Policy,
     hooks: &dyn Hooks,
@@ -2150,7 +2330,7 @@ pub fn link_nodes(
         let f_here = matches!(xirang_core::edit::read_node(&named, f), Ok(Some(_)));
         let t_here = matches!(xirang_core::edit::read_node(&named, t), Ok(Some(_)));
         if f_here {
-            if !t_here && !pol.force {
+            if !t_here && !target_exists_anywhere(pol, &named, t) && !pol.force {
                 return Err(OpError::guarded(
                     "from 或 to 节点不存在",
                     "继续连边会留下 R001 引用断裂；确实要连请显式强制（CLI：--yes，MCP：force）",
@@ -2173,7 +2353,8 @@ pub fn link_nodes(
 
     let (mut store, path) = load(pol, hooks, file)?;
     guard_editable(pol, &store, f)?;
-    if (store.get(f).is_none() || store.get(t).is_none()) && !pol.force {
+    let t_ok = store.get(t).is_some() || target_exists_anywhere(pol, &path, t);
+    if (store.get(f).is_none() || !t_ok) && !pol.force {
         return Err(OpError::guarded(
             "from 或 to 节点不存在",
             "继续连边会留下 R001 引用断裂；确实要连请显式强制（CLI：--yes，MCP：force）",
@@ -2537,17 +2718,54 @@ pub fn instantiate(
 }
 
 /// 把一个 JSON 值建为节点。含 `{"@ref": "目标"}` → 建引用边（目标不存在则建同名占位）。
+/// `@ref` 的目标可以写成：编号 / 名字 / 可读路径（`词条>01`）。
+fn resolve_ref(store: &tree::Store, tgt: &str) -> Option<Uuid> {
+    if let Some(u) = Uuid::parse(tgt) {
+        return Some(u);
+    }
+    if tgt.contains('>') {
+        let segs: Vec<&str> = tgt.split('>').collect();
+        // 第一段可以是任何名字相符的节点（不要求是自由根：`--append` 进来的一整棵会挂在父下）。
+        for first in store.nodes().iter().filter(|n| name_is(n, segs[0])) {
+            if let Some(id) = descend(store, first.id, &segs[1..]) {
+                return Some(id);
+            }
+        }
+    }
+    store.nodes().iter().find(|n| n.name == tgt).map(|n| n.id)
+}
+
+fn name_is(n: &Node, s: &str) -> bool {
+    if s == "∅" {
+        n.name.is_empty()
+    } else {
+        n.name == s
+    }
+}
+
+/// 从 `start` 开始，按名字逐段往下走；某一段找不到就返回 `None`。
+fn descend(store: &tree::Store, start: Uuid, rest: &[&str]) -> Option<Uuid> {
+    let mut cur = start;
+    for s in rest {
+        cur = store.nodes().iter().find(|n| n.parent == Some(cur) && name_is(n, s))?.id;
+    }
+    Some(cur)
+}
+
 fn json_value_node(
     store: &mut tree::Store,
     parent: Option<Uuid>,
     name: &str,
     v: &JsonValue,
+    pending: &mut Vec<(Uuid, String, Option<Uuid>)>,
 ) -> Result<Uuid, String> {
     if let Some(tgt) = v.get("@ref").and_then(|t| t.as_str()) {
-        let tid = Uuid::parse(tgt)
-            .or_else(|| store.nodes().iter().find(|n| n.name == tgt).map(|n| n.id))
-            .unwrap_or_else(|| store.create(parent, tgt, XValue::Empty, false).id);
-        return Ok(store.create(parent, name, XValue::Reference(tid), false).id);
+        // `@ref` 认三种写法：编号 / 名字 / 可读路径（`词条>01`，与 export 显示的那种一致）
+        // 先建一个空壳，等整棵树建完（第二遍）再连引用 —— 这样 `@ref` 可以指向
+        // 「后面才出现」的节点（JSON 键序不保证目标在前）。
+        let id = store.create(parent, name, XValue::Empty, false).id;
+        pending.push((id, tgt.to_string(), parent));
+        return Ok(id);
     }
     // 标量 → 值；对象/数组 → 空容器（子节点由递归建）。前导 0 字符串用 JSON 原样文本。
     Ok(store.create(parent, name, value_from_json(Some(v)), false).id)
@@ -2560,20 +2778,38 @@ pub fn build_json_tree(
     parent: Option<Uuid>,
     val: &JsonValue,
 ) -> Result<(), String> {
+    // 第一遍：建出所有节点，把 `@ref` 记下来（此刻先连不了，目标可能还没建出来）
+    let mut pending: Vec<(Uuid, String, Option<Uuid>)> = Vec::new();
+    build_json_pass(store, parent, val, &mut pending)?;
+    // 第二遍：连引用；目标整棵树里都没有才建一个同名占位
+    for (node, spec, par) in pending {
+        let tid = resolve_ref(store, &spec)
+            .unwrap_or_else(|| store.create(par, &spec, XValue::Empty, false).id);
+        let _ = store.set_quiet(node, XValue::Reference(tid));
+    }
+    Ok(())
+}
+
+fn build_json_pass(
+    store: &mut tree::Store,
+    parent: Option<Uuid>,
+    val: &JsonValue,
+    pending: &mut Vec<(Uuid, String, Option<Uuid>)>,
+) -> Result<(), String> {
     match val {
         JsonValue::Object(m) => {
             for (k, v) in m {
-                let node = json_value_node(store, parent, k, v)?;
+                let node = json_value_node(store, parent, k, v, pending)?;
                 if v.get("@ref").is_none() && (v.is_object() || v.is_array()) {
-                    build_json_tree(store, Some(node), v)?;
+                    build_json_pass(store, Some(node), v, pending)?;
                 }
             }
         }
         JsonValue::Array(a) => {
             for (i, v) in a.iter().enumerate() {
-                let node = json_value_node(store, parent, &i.to_string(), v)?;
+                let node = json_value_node(store, parent, &i.to_string(), v, pending)?;
                 if v.get("@ref").is_none() && (v.is_object() || v.is_array()) {
-                    build_json_tree(store, Some(node), v)?;
+                    build_json_pass(store, Some(node), v, pending)?;
                 }
             }
         }
@@ -2777,7 +3013,7 @@ pub fn export_data(
     format: &str,
     subtree: Option<&str>,
 ) -> OpResult<ExportOutcome> {
-    let (store, _) = load(pol, hooks, file)?;
+    let (store, path) = load(pol, hooks, file)?;
     let store = match subtree {
         None => store,
         Some(id_str) => {
@@ -2795,7 +3031,12 @@ pub fn export_data(
         "json" => convert::to_json(&store),
         "yaml" => convert::to_yaml(&store),
         "xml" => convert::to_xml(&store),
-        "md" | "markdown" => convert::to_md(&store),
+        "md" | "markdown" => {
+            // 引用显示成可读路径；跨文件的走工作区台账，带上目标那棵树的根名。
+            let mut namer =
+                RefNamer::new(Some(xirang_core::wsidx::workspace_root(&path)));
+            convert::to_md_with(&store, &mut |u| Some(namer.display(&store, u)))
+        }
         _ => {
             return Err(OpError::invalid(format!(
                 "未知格式：{format}（支持 json / yaml / xml / md）"

@@ -606,3 +606,94 @@ fn catalog_check_self_diff_and_sync_keeps_children() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `xr tree` / `xr cat` 显示引用时给「目标的可读路径」，不是光秃秃的名字（如 `01`）。
+#[test]
+fn tree_and_cat_show_reference_as_a_readable_path() {
+    let path = tmp_xirang("refpath");
+    let mut s = Store::new();
+    let root = s.create(None, "通用词库", Value::Empty, false).id;
+    let e = s.create(Some(root), "词条", Value::Empty, false).id;
+    let yi = s.create(Some(e), "01", Value::Empty, false).id;
+    s.create(Some(root), "名词语义下的父类", Value::Reference(yi), false);
+    s.save(&path).unwrap();
+
+    let out = xr().args(["tree", path.to_str().unwrap(), "--no-pager"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("→ 通用词库>词条>01"), "引用应显示成可读路径：{stdout}");
+
+    let out = xr().args(["cat", path.to_str().unwrap(), "--no-pager"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("→ 通用词库>词条>01"), "cat 也应显示路径：{stdout}");
+}
+
+/// 无损 JSON 导出：引用值仍是编号（可无损导回），另给一个给人看的 refPath。
+#[test]
+fn json_export_adds_refpath_and_roundtrips() {
+    let path = tmp_xirang("refjson");
+    let mut s = Store::new();
+    let root = s.create(None, "通用词库", Value::Empty, false).id;
+    let e = s.create(Some(root), "词条", Value::Empty, false).id;
+    let yi = s.create(Some(e), "01", Value::Empty, false).id;
+    let h = s.create(Some(root), "指向", Value::Reference(yi), false).id;
+    s.save(&path).unwrap();
+
+    let out = xr().args(["export", path.to_str().unwrap(), "json"]).output().unwrap();
+    assert!(out.status.success());
+    let json = String::from_utf8(out.stdout).unwrap();
+    assert!(json.contains("\"refPath\": \"通用词库>词条>01\""), "json 应带 refPath：{json}");
+    assert!(json.contains("\"type\": \"reference\""));
+
+    // 导回：引用仍指向同一个编号（无损）
+    let jpath = tmp_xirang("refjson.src");
+    std::fs::write(&jpath, &json).unwrap();
+    let back = tmp_xirang("refjson.back");
+    let out = xr()
+        .args(["import", back.to_str().unwrap(), "json", jpath.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        Store::load(&back).unwrap().get(h).unwrap().value,
+        Value::Reference(yi),
+        "导回后引用仍指向同一个编号"
+    );
+
+    // Markdown（有损）也显示路径
+    let out = xr().args(["export", path.to_str().unwrap(), "md"]).output().unwrap();
+    assert!(String::from_utf8(out.stdout).unwrap().contains("→ 通用词库>词条>01"));
+}
+
+/// `@模板`(空) 是叶子标记；被当容器用 → 只读提示改用 `模板集`；改名后整库可编辑。
+#[test]
+fn template_marker_container_hint_and_template_set() {
+    // 误用：`@模板`(空) 当容器（下面挂普通子节点）
+    let bad = tmp_xirang("tplbad");
+    let mut s = Store::new();
+    let root = s.create(None, "词库", Value::Empty, false).id;
+    let tpl = s.create(Some(root), "@模板", Value::Empty, false).id;
+    s.create(Some(tpl), "词条模板", Value::Empty, false);
+    s.create(Some(root), "普通词条", Value::Text("灯".into()), false);
+    s.save(&bad).unwrap();
+    let out = xr().args(["validate", bad.to_str().unwrap()]).output().unwrap();
+    assert!(out.status.success(), "只读提示不该让校验失败");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("模板集"), "应当提示改用 模板集：{stderr}");
+
+    // 正规：统一存放模板的容器叫 `模板集` → 整库可编辑
+    let good = tmp_xirang("tplset");
+    let mut s = Store::new();
+    let root = s.create(None, "词库", Value::Empty, false).id;
+    let set = s.create(Some(root), "模板集", Value::Empty, false).id;
+    s.create(Some(set), "词条模板", Value::Empty, false);
+    let e = s.create(Some(root), "普通词条", Value::Text("灯".into()), false).id;
+    s.save(&good).unwrap();
+    let out = xr().args(["set", good.to_str().unwrap(), &e.to_string(), "火"]).output().unwrap();
+    assert!(out.status.success(), "模板集 下应当可编辑：{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        shard::fold(&Store::load(&good).unwrap()).get(e).unwrap().value,
+        Value::Text("火".into())
+    );
+}

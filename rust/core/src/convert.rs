@@ -96,14 +96,44 @@ fn flat_nodes(store: &Store) -> Vec<Json> {
         .nodes()
         .iter()
         .map(|n| {
+            let mut value = value_to_json(&n.value);
+            // 引用额外给一个「给人看」的字段：目标的可读路径（`词条>01`）。
+            // 真正的值仍是编号（`value`），所以导出导回仍然无损；`refPath` 只是注释。
+            if let Value::Reference(u) = &n.value {
+                if let Some(p) = node_path(store, *u) {
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("refPath".to_string(), json!(p));
+                    }
+                }
+            }
             json!({
                 "id": n.id.to_string(),
                 "parent": n.parent.map(|p| p.to_string()),
                 "name": n.name,
-                "value": value_to_json(&n.value),
+                "value": value,
             })
         })
         .collect()
+}
+
+/// 引用目标的**可读路径**：从目标往上拼到它所在那棵树的根，用 `>` 连接（如 `词条>01`）。
+/// 目标不在这棵树里就返回 `None`。
+pub fn node_path(store: &Store, id: Uuid) -> Option<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut cur = Some(id);
+    for _ in 0..4096 {
+        let n = match cur.and_then(|c| store.get(c)) {
+            Some(n) => n,
+            None => break,
+        };
+        names.push(if n.name.is_empty() { "∅".to_string() } else { n.name.clone() });
+        cur = n.parent;
+    }
+    if names.is_empty() {
+        return None;
+    }
+    names.reverse();
+    Some(names.join(">"))
 }
 
 /// 扁平节点数组 → Store。字段缺失报 C005，UUID 非法报 C002。
@@ -161,15 +191,18 @@ pub fn from_yaml(text: &str) -> Result<Store, String> {
 
 // —— Markdown（有损，只导出）——
 
-fn md_value(store: &Store, node: &Node) -> String {
+fn md_value(
+    node: &Node,
+    resolve: &mut dyn FnMut(Uuid) -> Option<String>,
+) -> String {
     match &node.value {
         Value::Empty => String::new(),
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Text(s) => s.clone(),
-        Value::Reference(u) => match store.get(*u) {
-            Some(t) => format!("→ {}", t.name),
+        Value::Reference(u) => match resolve(*u) {
+            Some(p) => format!("→ {p}"),
             None => format!("→ {u}"),
         },
         Value::Blob(b) => format!("[二进制块] {} 字节", b.len()),
@@ -182,6 +215,7 @@ fn md_node(
     lines: &mut Vec<String>,
     level: usize,
     seen: &mut std::collections::HashSet<crate::codec::Uuid>,
+    resolve: &mut dyn FnMut(Uuid) -> Option<String>,
 ) {
     lines.push(String::new());
     // 父边成环（E006）时兜底：同一节点只展开一次。
@@ -192,7 +226,7 @@ fn md_node(
     }
     let name = if node.name.is_empty() { "(未命名)" } else { node.name.as_str() };
     lines.push(format!("{} {}", "#".repeat(level), name));
-    let v = md_value(store, node);
+    let v = md_value(node, resolve);
     if !v.is_empty() {
         lines.push(String::new());
         lines.push(v);
@@ -202,22 +236,27 @@ fn md_node(
         lines.push(String::new());
         for c in children {
             if !store.children(c).is_empty() {
-                md_node(store, c, lines, level + 1, seen);
+                md_node(store, c, lines, level + 1, seen, resolve);
             } else {
                 let cname = if c.name.is_empty() { "(未命名)" } else { c.name.as_str() };
-                lines.push(format!("- **{cname}**: {}", md_value(store, c)));
+                lines.push(format!("- **{cname}**: {}", md_value(c, resolve)));
             }
         }
     }
     lines.push(String::new());
 }
 
-/// 有损导出：整库 → Markdown（名字当键、引用退化成名字）。
+/// 有损导出：整库 → Markdown（名字当键、引用显示成目标的可读路径，如 `词条>01`）。
 pub fn to_md(store: &Store) -> String {
+    to_md_with(store, &mut |u| node_path(store, u))
+}
+
+/// 同上，但引用目标可以由调用方解析（CLI 用它把跨文件的引用也显示成路径）。
+pub fn to_md_with(store: &Store, resolve: &mut dyn FnMut(Uuid) -> Option<String>) -> String {
     let mut lines = vec!["# 息壤树".to_string()];
     let mut seen = std::collections::HashSet::new();
     for root in store.roots() {
-        md_node(store, root, &mut lines, 2, &mut seen);
+        md_node(store, root, &mut lines, 2, &mut seen, resolve);
     }
     format!("{}\n", lines.join("\n").trim_end())
 }
@@ -262,6 +301,12 @@ pub fn to_xml(store: &Store) -> String {
         out.push_str("</name><value type=\"");
         out.push_str(tag_to_name(n.value.tag()));
         out.push('"');
+        // 引用加一个给人看的 refPath 属性（导入时忽略，仍按 value 里的编号还原 → 无损）
+        if let Value::Reference(u) = &n.value {
+            if let Some(p) = node_path(store, *u) {
+                out.push_str(&format!(" refPath=\"{}\"", xml_escape(&p)));
+            }
+        }
         match &n.value {
             Value::Blob(b) => {
                 out.push_str(" encoding=\"base64\">");
@@ -430,6 +475,9 @@ mod tests {
         let text = to_json(&s);
         assert!(text.contains("\"kernel\": \"1.0\""));
         assert!(text.contains("\"type\": \"reference\""));
+        // 引用额外带一个给人看的 refPath（真正的值仍是编号 → 仍然无损）
+        assert!(text.contains("\"refPath\": \"root>num\""));
+        assert_eq!(from_json(&text).unwrap().nodes()[3].value, Value::Reference(u(3)));
     }
 
     #[test]
@@ -466,7 +514,7 @@ mod tests {
         assert!(md.starts_with("# 息壤树"));
         assert!(md.contains("## root"));
         assert!(md.contains("**text**: 灯"));
-        assert!(md.contains("→ num")); // 引用退化成目标名
+        assert!(md.contains("→ root>num")); // 引用显示成目标的可读路径
     }
 
     #[test]

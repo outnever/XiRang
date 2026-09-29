@@ -75,6 +75,8 @@ xr cat data.xirang --ids                  # append each node's ID
 
 > **Auto-paging**: `tree` / `cat` page through `$PAGER` (default `less -R`) when writing to a terminal and the output is long. Pipes and redirections are unaffected (script-friendly). Use `--no-pager` to turn it off for one run.
 
+> **References show a readable path**: when a node's value is a reference it is shown as `→ root-of-target>…>target` (e.g. `→ entry>01`, no longer a bare `01`). If the target lives in another file (cross-file identity) the path is assembled via the workspace ledger and naturally starts with that tree's root name, e.g. `→ biology>cat`; if it cannot be resolved it falls back to the id.
+
 ### `xr find <file> <pattern> [--json]`
 Search by node name / text value (substring match).
 
@@ -279,6 +281,8 @@ Create a reference edge (from's value points to to).
 xr link graph.xirang <aID> <bID>
 ```
 
+> A target that lives in **another file** (already registered) counts as existing and is not blocked; only a target that cannot be found in this file, the registered workspace, or the local catalog requires `--yes` to write a dangling reference.
+
 ### `xr copy <file> <node-id> <parent|nil> [--blank] [--no-history]`
 Copy a subtree (new UUIDs); references inside are re-pointed to the copy, references outside keep the original target.
 
@@ -394,6 +398,8 @@ xr tmpl add lexicon.xirang entry --from-json sample.json
 # sample.json: {"word":"lamp","freq":2046,"sense":{"def":"an object","pos":"noun"}}
 ```
 
+> **`@模板`(empty) is a marker, not a container**: it means "**the node carrying it** is a template definition" — exactly one meaning; the protection covers that node's whole subtree (`xr set/batch` onto it is stopped unless `--yes`). To **group** several templates, name the collecting container **`模板集`** (an ordinary name, triggering nothing), never `@模板` — otherwise the container's whole tree is taken as one template definition and the library becomes uneditable. When `xr validate` sees an `@模板`(empty) with ordinary children (i.e. used as a container) it prints a **hint on stderr** to rename it to `模板集` (the hint never changes the exit code).
+
 ### `xr tmpl list <file>`
 List all templates (`@模板`(empty)-annotated roots) and their instance count.
 
@@ -456,6 +462,9 @@ Structural validation (E/R errors). Exit code: `0` = pass, `1` = errors.
 xr validate data.xirang     # 校验通过：0 错误
 ```
 
+> **References are judged cross-file**: a reference (`R001`) passes whenever the target can be found in "this file ∪ registered workspace files ∪ local catalog" — a reference may legitimately point into another file, so splitting a library across files no longer produces false "broken reference" errors. A truly dangling reference (found nowhere) is still reported as `R001`. Use `--no-index` to keep it to this file plus the workspace ledger (no catalog layer).
+> Parent edges (`E011`) are still judged **within this file** (by definition: "this file has no such parent node"); validation is **read-only** — it never writes or registers.
+
 ## Format conversion
 
 ### `xr export <file> <json|yaml|xml|md> [--subtree <id>]`
@@ -466,6 +475,8 @@ xr export data.xirang json
 xr export data.xirang json --subtree <nodeID>    # export only a subtree
 ```
 
+> **How references are represented**: `json` / `yaml` / `xml` are **lossless**, so a reference stores the **target id** (only the id round-trips exactly), but each reference also gets a **human-readable** `refPath` field (e.g. `"refPath": "entry>01"`) — machines read `value`, humans read `refPath`; import ignores `refPath`, so it stays lossless. `md` is lossy text and shows references as readable paths directly (cross-file ones include the library name).
+
 ### `xr import <file> <json|yaml|xml> <source>`
 Import. `json` must be the `xr export json` format; for an array of records, use `--template` (see above).
 
@@ -473,4 +484,12 @@ This **replaces the whole file**: if the target already holds nodes you'll be st
 
 ```bash
 xr import data.xirang yaml data.yaml
+```
+
+### `xr import <file> --append <parent|nil> <source-json>`
+Append a **nested JSON** tree (object → child nodes, array → children `0,1,2`, `{"@ref":"…"}` → reference edge). An `@ref` target may be written as an **id / name / readable path** (e.g. `entry>01`, the same form `xr tree` shows). Reference nodes are created first and wired after the whole tree is built, so an `@ref` **may point to a node that appears later**; a target found nowhere in the tree gets a same-named placeholder (the previous behaviour).
+
+```bash
+echo '{"entry":{"word":"lamp","sense":{"@ref":"entry>basic"}}}' > tree.json
+xr import lexicon.xirang --append nil tree.json
 ```

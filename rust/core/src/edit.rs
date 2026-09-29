@@ -133,6 +133,18 @@ fn children_in_file(
     Ok(out)
 }
 
+/// 按编号在本文件的台账里取节点；**不在本文件时返回 `Ok(None)`**。
+///
+/// 与 [`locate_here`] 的区别：`locate_here` 把「不在本文件」当错误（并给整改提示），
+/// 适合「我就是要改这个节点」的起点；这里用于**沿父链往上走**——父节点完全可能在
+/// 别的文件里（跨文件节点），走到那儿就该停，不是错误。
+fn node_in_file(r: &mut wsidx::Reader, want: &Path, id: Uuid) -> Result<Option<Node>, String> {
+    match r.locate(id)?.into_iter().find(|h| same_file(h, want)) {
+        Some(h) => Ok(Some(wsidx::read_node_at_hit(&h)?)),
+        None => Ok(None),
+    }
+}
+
 /// 该树根下是否已经声明了某个协议（幂等判断，读的是文件里的真实内容）。
 pub fn declares_protocol(path: &Path, root: Uuid, protocol: &str) -> Result<bool, String> {
     let ws_root = wsidx::workspace_root(path);
@@ -666,7 +678,8 @@ pub fn under_template(path: &Path, id: Uuid) -> Result<bool, String> {
     let mut cur = Some(id);
     for _ in 0..4_096 {
         let Some(c) = cur else { return Ok(false) };
-        let hit = locate_here(&mut r, &want, c)?;
+        // 父节点可能不在本文件（跨文件父链）：走到那儿就停，不算模板定义。
+        let Some(n) = node_in_file(&mut r, &want, c)? else { return Ok(false) };
         let kids = children_in_file(&mut r, path, c)?;
         if kids.iter().any(|k| k.name == "@模板" && k.value == Value::Empty) {
             return Ok(true); // 模板定义 → 受保护
@@ -674,7 +687,6 @@ pub fn under_template(path: &Path, id: Uuid) -> Result<bool, String> {
         if kids.iter().any(|k| k.name == "@实例") {
             return Ok(false); // 实例 → 可编辑
         }
-        let n = wsidx::read_node_at_hit(&hit)?;
         cur = n.parent;
     }
     Err("父链太长（可能成环）：需要整份载入处理".into())
@@ -1202,10 +1214,14 @@ fn protected_in(
     } else {
         let parent = match known {
             Some(n) => n.parent,
-            None => {
-                let hit = locate_here(r, want, id)?;
-                wsidx::read_node_at_hit(&hit)?.parent
-            }
+            None => match node_in_file(r, want, id)? {
+                Some(n) => n.parent,
+                // 父节点不在本文件（跨文件父链）：本文件这条链到此为止，不算模板定义。
+                None => {
+                    cache.insert(id, false);
+                    return Ok(false);
+                }
+            },
         };
         match parent {
             Some(p) => protected_in(r, want, p, None, cache, depth + 1)?,
@@ -1230,11 +1246,15 @@ fn cached_root(
     if depth > 4_096 {
         return Err("父链太长（可能成环）：需要整份载入处理".into());
     }
-    let hit = locate_here(r, want, id)?;
-    let n = wsidx::read_node_at_hit(&hit)?;
+    let n = node_in_file(r, want, id)?
+        .ok_or_else(|| format!("编号 {id} 不在这个文件（{}）的台账里", want.display()))?;
     let root = match n.parent {
         None => n.id,
-        Some(p) => cached_root(r, want, p, cache, depth + 1)?,
+        // 父节点不在本文件（跨文件父链）：本文件里这个节点就是最高点，当作它这棵树的根。
+        Some(p) => match node_in_file(r, want, p)? {
+            Some(_) => cached_root(r, want, p, cache, depth + 1)?,
+            None => n.id,
+        },
     };
     cache.insert(id, root);
     Ok(root)
